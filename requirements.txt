@@ -1,0 +1,20 @@
+# Core GPU stack (torch fornito dal base image cu128; warp compila kernel a
+# runtime per la GPU presente -> stesso image gira su 4080 e 5080).
+torch>=2.7
+warp-lang>=1.7
+
+# Map I/O & host-side prep
+numpy
+scikit-image
+Pillow
+imageio
+
+# Config & logging
+omegaconf
+tensorboard
+
+# Utils
+einops
+tqdm
+rich
+matplotlib

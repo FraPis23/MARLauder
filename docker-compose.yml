@@ -1,0 +1,30 @@
+services:
+  marlauder:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: marlauder:latest
+    container_name: marlauder
+    # Monta l'intero Thesis_Project: il container vede sia MARLauder
+    # sia IR2-Multi-Robot-RL-Exploration (per le DungeonMaps / benchmark).
+    volumes:
+      - ..:/workspace
+      - warp-cache:/root/.cache/warp
+    working_dir: /workspace/MARLauder
+    # GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # shared memory ampia per torch dataloader / multiprocessing
+    ipc: host
+    shm_size: "8gb"
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+
+volumes:
+  warp-cache:
