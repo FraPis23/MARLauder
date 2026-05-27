@@ -1,249 +1,392 @@
-"""Grafo gerarchico a lattice fisso, su GPU (Warp + torch).
+"""GPU-vectorized 8-neighbor lattice graph (replaces TOM NodeManager + QuadTree).
 
-Due livelli (vedi ROADMAP):
-  - BASSO: lattice ego-centrico K x K, denso, ancorato al robot (si muove con lui).
-  - ALTO : anchor globali sparsi in coord assolute (centri di frontiera, capped+padded).
+Lattice
+-------
+Nodes live on a regular grid spaced by `NR` pixels. For canvas (H, W):
+    LH = H // NR,  LW = W // NR
+    flat node idx  k = li * LW + lj   (li = row in lattice, lj = col)
+    world (x, y) = ((lj + 0.5) * NR, (li + 0.5) * NR)
 
-Per il livello basso si calcolano su GPU:
-  - validita nodi (in-bounds + cella FREE nella belief)
-  - edge-mask 8-vicini collision-free (LOS solo su celle FREE nella belief)
-  - utility nodo (n. raggi che vedono una frontiera entro R) -> proxy di IR2 observable_frontiers
+Active mask per env per step:
+    node_valid[k] = occupancy at world(k) is FREE  AND  k is reachable from the
+                    robot through 8-connected FREE lattice cells.
 
-Convenzioni: belief 0=unknown,1=free,2=ostacolo. Coord = (x=col, y=row). Griglia [N,H,W].
+Edges: between a node and any of its 8 lattice neighbors, valid iff both
+endpoints are active AND the straight segment is collision-free in `occupancy`
+(sampled at S points). Edges stored per source as `[N_max, K=8]` in canonical
+order matching the action space:
+    0:NW  1:N  2:NE  3:W  4:E  5:SW  6:S  7:SE
+
+Edge lengths (precomputed [K]):
+    axial = NR,  diagonal = NR·√2 — used by `build_guidepost` for true Dijkstra.
+
+Per-step compute is O(LH * LW * K) plus a flood-fill (~diameter conv2d iters)
+plus an optional Bellman-Ford for guidepost. All ops batched over n_envs.
+
+Public API
+----------
+    GraphLattice(canvas, nr=8, sensor_range_px=60, utility_range_px=30,
+                 collision_samples=5, device=...)
+    graph.build(occupancy, frontier, robot_xy_world, visited_step, current_step)
+        -> info dict (see return at end of build)
+    graph.build_guidepost(info)
+        -> augments info in-place with guidepost_mask, guidepost_target,
+           guidepost_path_idx, guidepost_path_valid, guidepost_path_xy
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
-import warp as wp
 
-FREE = wp.uint8(1)
-OBSTACLE = wp.uint8(2)
-UNKNOWN_U8 = wp.uint8(0)
+UNKNOWN = 0
+FREE = 1
+OBSTACLE = 2
 
-# 8 direzioni nel grid-index (di riga, dj colonna)
-_DIRS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-N_DIR = 8
-
-
-@wp.func
-def _los_free(belief: wp.array3d(dtype=wp.uint8), e: wp.int32,
-              x0: wp.float32, y0: wp.float32, x1: wp.float32, y1: wp.float32) -> wp.int32:
-    """1 se il segmento (x0,y0)->(x1,y1) attraversa solo celle FREE nella belief, 0 altrimenti."""
-    H = belief.shape[1]
-    W = belief.shape[2]
-    dx = x1 - x0
-    dy = y1 - y0
-    dist = wp.sqrt(dx * dx + dy * dy)
-    n = wp.int32(dist) + 1
-    inv = 1.0 / wp.float32(n)
-    for s in range(1, n + 1):
-        t = wp.float32(s) * inv
-        ix = wp.int32(x0 + dx * t + 0.5)
-        iy = wp.int32(y0 + dy * t + 0.5)
-        if ix < 0 or iy < 0 or ix >= W or iy >= H:
-            return 0
-        if belief[e, iy, ix] != FREE:
-            return 0
-    return 1
+# Lattice neighbor offsets in (dr, dc) canonical order — also the action space.
+NBR_OFFSETS = (
+    (-1, -1), (-1, 0), (-1, 1),
+    ( 0, -1),          ( 0, 1),
+    ( 1, -1), ( 1, 0), ( 1, 1),
+)
+K = 8
 
 
-@wp.kernel
-def _node_valid(belief: wp.array3d(dtype=wp.uint8),
-                env_idx: wp.array(dtype=wp.int32),    # [L] lattice -> mondo
-                coords: wp.array2d(dtype=wp.vec2),    # [L, KK]
-                valid: wp.array2d(dtype=wp.uint8)):
-    e, k = wp.tid()
-    b = env_idx[e]
-    H = belief.shape[1]
-    W = belief.shape[2]
-    p = coords[e, k]
-    ix = wp.int32(p[0] + 0.5)
-    iy = wp.int32(p[1] + 0.5)
-    if ix < 0 or iy < 0 or ix >= W or iy >= H:
-        valid[e, k] = wp.uint8(0)
-    elif belief[b, iy, ix] == FREE:
-        valid[e, k] = wp.uint8(1)
-    else:
-        valid[e, k] = wp.uint8(0)
-
-
-@wp.kernel
-def _edge_mask(belief: wp.array3d(dtype=wp.uint8),
-               env_idx: wp.array(dtype=wp.int32),
-               coords: wp.array2d(dtype=wp.vec2),
-               valid: wp.array2d(dtype=wp.uint8),
-               diy: wp.array(dtype=wp.int32),
-               dix: wp.array(dtype=wp.int32),
-               K: wp.int32,
-               edges: wp.array3d(dtype=wp.uint8)):    # [L, KK, N_DIR]
-    e, k, d = wp.tid()
-    b = env_idx[e]
-    gi = k / K
-    gj = k % K
-    ni = gi + diy[d]
-    nj = gj + dix[d]
-    if ni < 0 or nj < 0 or ni >= K or nj >= K:
-        edges[e, k, d] = wp.uint8(0)
-        return
-    nk = ni * K + nj
-    if valid[e, k] == wp.uint8(0) or valid[e, nk] == wp.uint8(0):
-        edges[e, k, d] = wp.uint8(0)
-        return
-    pa = coords[e, k]
-    pb = coords[e, nk]
-    edges[e, k, d] = wp.uint8(_los_free(belief, b, pa[0], pa[1], pb[0], pb[1]))
-
-
-@wp.kernel
-def _node_utility(belief: wp.array3d(dtype=wp.uint8),
-                  frontier: wp.array3d(dtype=wp.uint8),   # [N,hc,wc] coarse (res = fscale)
-                  env_idx: wp.array(dtype=wp.int32),
-                  coords: wp.array2d(dtype=wp.vec2),
-                  valid: wp.array2d(dtype=wp.uint8),
-                  util_range: wp.float32,
-                  n_uray: wp.int32,
-                  fscale: wp.int32,
-                  utility: wp.array2d(dtype=wp.int32)):
-    e, k, r = wp.tid()
-    if valid[e, k] == wp.uint8(0):
-        return
-    b = env_idx[e]
-    H = belief.shape[1]
-    W = belief.shape[2]
-    HC = frontier.shape[1]
-    WC = frontier.shape[2]
-    p = coords[e, k]
-    ang = 2.0 * wp.pi * wp.float32(r) / wp.float32(n_uray)
-    dx = wp.cos(ang)
-    dy = wp.sin(ang)
-    t = wp.float32(1.0)
-    while t <= util_range:
-        ix = wp.int32(p[0] + dx * t + 0.5)
-        iy = wp.int32(p[1] + dy * t + 0.5)
-        if ix < 0 or iy < 0 or ix >= W or iy >= H:
-            return
-        fy = iy / fscale
-        fx = ix / fscale
-        if fy >= 0 and fx >= 0 and fy < HC and fx < WC:
-            if frontier[b, fy, fx] == wp.uint8(1):
-                wp.atomic_add(utility, e, k, 1)
-                return
-        if belief[b, iy, ix] != FREE:    # ostacolo o ignoto -> occluso
-            return
-        t += 1.0
-
-
-@wp.kernel
-def _frontier_coarse(belief: wp.array3d(dtype=wp.uint8), scale: wp.int32,
-                     out: wp.array3d(dtype=wp.uint8)):
-    """Vera frontiera full-res (cella FREE con vicino-4 UNKNOWN), output ridotto in coarse (OR).
-    NON trapassa i muri: l'ostacolo tra free e unknown impedisce l'adiacenza diretta. out pre-azzerato."""
-    e, y, x = wp.tid()
-    if belief[e, y, x] != FREE:
-        return
-    H = belief.shape[1]
-    W = belief.shape[2]
-    is_f = False
-    if y > 0 and belief[e, y - 1, x] == UNKNOWN_U8:
-        is_f = True
-    if y < H - 1 and belief[e, y + 1, x] == UNKNOWN_U8:
-        is_f = True
-    if x > 0 and belief[e, y, x - 1] == UNKNOWN_U8:
-        is_f = True
-    if x < W - 1 and belief[e, y, x + 1] == UNKNOWN_U8:
-        is_f = True
-    if is_f:
-        out[e, y / scale, x / scale] = wp.uint8(1)
-
-
-def frontier_coarse_warp(belief: torch.Tensor, scale: int = 4) -> torch.Tensor:
-    """Frontier coarse [N,H//scale,W//scale] bool: vera adiacenza full-res ridotta a coarse (OR).
-    Kernel Warp, niente bleed sui muri (a differenza del pooling coarse)."""
-    wp.init()
-    n, h, w = belief.shape
-    hc, wc = h // scale, w // scale
-    dev = belief.device
-    out = torch.zeros((n, hc, wc), dtype=torch.uint8, device=dev)
-    bel = wp.from_torch(belief.contiguous(), dtype=wp.uint8)
-    wp.launch(_frontier_coarse, dim=(n, h, w),
-              inputs=[bel, int(scale), wp.from_torch(out, dtype=wp.uint8)], device=str(dev))
-    wp.synchronize()
-    return out > 0
-
-
-class EgoLattice:
-    """Lattice ego-centrico K x K con edge-mask e utility su GPU.
-
-    Gestisce L lattici (es. N mondi x M agenti). `env_idx[l]` mappa il lattice l al
-    mondo (indice della belief condivisa). Per M=1, L=N e env_idx = identita'.
-    """
-
-    def __init__(self, n_lat: int, env_idx: torch.Tensor | None = None,
-                 K: int = 21, spacing: float = 20.0,
-                 util_range: float = 70.0, n_uray: int = 60, device: str = "cuda:0"):
-        wp.init()
-        self.n, self.K, self.KK = n_lat, K, K * K   # self.n = numero lattici L
-        self.spacing = float(spacing)
-        self.util_range = float(util_range)
-        self.n_uray = int(n_uray)
+class GraphLattice:
+    def __init__(
+        self,
+        canvas: tuple[int, int],
+        nr: int = 8,
+        sensor_range_px: float = 60.0,
+        utility_range_px: int = 30,
+        collision_samples: int = 5,
+        flood_max_iters: int = 200,
+        guidepost_iters: int | None = None,
+        guidepost_path_max: int | None = None,
+        device: str = "cuda:0",
+    ) -> None:
         self.device = device
+        self.H, self.W = canvas
+        self.NR = int(nr)
+        self.LH = self.H // self.NR
+        self.LW = self.W // self.NR
+        self.N_max = self.LH * self.LW
+        self.UR = int(utility_range_px)
+        self.S = int(collision_samples)
+        self.flood_max_iters = int(flood_max_iters)
+        self.SR = float(sensor_range_px)
+        # Bellman-Ford iteration upper bound: Manhattan diameter ~ LH+LW; pad a bit.
+        self.guidepost_iters = int(guidepost_iters) if guidepost_iters else int(self.LH + self.LW + 8)
+        # Path-reconstruction length cap (number of edges on a path).
+        self.guidepost_path_max = int(guidepost_path_max) if guidepost_path_max else int(self.LH + self.LW + 4)
 
-        if env_idx is None:
-            env_idx = torch.arange(n_lat, dtype=torch.int32, device=device)
-        self.env_idx_t = env_idx.to(device, torch.int32).contiguous()
-        self._env_idx = wp.from_torch(self.env_idx_t, dtype=wp.int32)
+        dev = device
+        # Lattice indices (li, lj) per flat node.
+        li = torch.arange(self.LH, device=dev).view(self.LH, 1).expand(self.LH, self.LW)
+        lj = torch.arange(self.LW, device=dev).view(1, self.LW).expand(self.LH, self.LW)
+        self.li_flat = li.reshape(-1)                  # [N_max]
+        self.lj_flat = lj.reshape(-1)                  # [N_max]
+        # World coordinates of each node, centered in lattice cell.
+        nx = (self.lj_flat.float() + 0.5) * self.NR    # [N_max]
+        ny = (self.li_flat.float() + 0.5) * self.NR    # [N_max]
+        self.node_xy = torch.stack([nx, ny], dim=-1)   # [N_max, 2]  (x=col, y=row)
 
-        gi = torch.arange(K, device=device).repeat_interleave(K)
-        gj = torch.arange(K, device=device).repeat(K)
-        c = (K - 1) / 2.0
-        self.offsets = torch.stack([(gj - c) * spacing, (gi - c) * spacing], dim=-1)  # [KK,2] (x,y)
+        # Edge target flat-index (regardless of validity), -1 if out of bounds.
+        edge_idx_flat = torch.full((self.N_max, K), -1, dtype=torch.long, device=dev)
+        for k, (dr, dc) in enumerate(NBR_OFFSETS):
+            tgt_li = self.li_flat + dr
+            tgt_lj = self.lj_flat + dc
+            in_bounds = (tgt_li >= 0) & (tgt_li < self.LH) & (tgt_lj >= 0) & (tgt_lj < self.LW)
+            edge_idx_flat[:, k] = torch.where(
+                in_bounds,
+                tgt_li * self.LW + tgt_lj,
+                torch.full_like(tgt_li, -1),
+            )
+        self.edge_idx_static = edge_idx_flat            # [N_max, K]
 
-        self.coords_t = torch.zeros((n_lat, self.KK, 2), dtype=torch.float32, device=device)
-        self.valid_t = torch.zeros((n_lat, self.KK), dtype=torch.uint8, device=device)
-        self.edges_t = torch.zeros((n_lat, self.KK, N_DIR), dtype=torch.uint8, device=device)
-        self.util_t = torch.zeros((n_lat, self.KK), dtype=torch.int32, device=device)
-        self._diy = wp.array([d[0] for d in _DIRS], dtype=wp.int32, device=device)
-        self._dix = wp.array([d[1] for d in _DIRS], dtype=wp.int32, device=device)
+        # Collision-sample offsets along each edge in world coords, S samples.
+        # For sample s in [0, S), point = node + (s+1)/(S+1) * (dx, dy)  (endpoints excluded).
+        nbr_dx = torch.tensor([dc * self.NR for (dr, dc) in NBR_OFFSETS], dtype=torch.float32, device=dev)
+        nbr_dy = torch.tensor([dr * self.NR for (dr, dc) in NBR_OFFSETS], dtype=torch.float32, device=dev)
+        t = torch.arange(1, self.S + 1, dtype=torch.float32, device=dev) / (self.S + 1.0)  # [S]
+        self.sample_dx = nbr_dx.view(K, 1) * t.view(1, self.S)  # [K, S]
+        self.sample_dy = nbr_dy.view(K, 1) * t.view(1, self.S)  # [K, S]
+        # Precomputed edge length (Euclidean, in pixels).  Axial = NR, Diagonal = NR·√2.
+        self.edge_len = torch.sqrt(nbr_dx ** 2 + nbr_dy ** 2)   # [K]
 
-    def build(self, pos_xy: torch.Tensor, belief: torch.Tensor, frontier: torch.Tensor,
-              fscale: int = 1) -> dict:
-        """pos_xy [L,2] (posa di ogni lattice), belief [N,H,W], frontier [N,hc,wc] (res=fscale).
-        Ritorna dict coords/valid/edges/utility [L,...] su GPU. NB: buffer riusati in-place."""
-        self.coords_t.copy_(pos_xy.unsqueeze(1) + self.offsets.unsqueeze(0))
-        self.util_t.zero_()
-        bel = wp.from_torch(belief.contiguous(), dtype=wp.uint8)
-        fro = wp.from_torch(frontier.to(torch.uint8).contiguous(), dtype=wp.uint8)
-        coords = wp.from_torch(self.coords_t, dtype=wp.vec2)
-        valid = wp.from_torch(self.valid_t, dtype=wp.uint8)
-        edges = wp.from_torch(self.edges_t, dtype=wp.uint8)
-        util = wp.from_torch(self.util_t, dtype=wp.int32)
+        # 3x3 dilation kernel for flood fill on lattice.
+        self._dilate_k = torch.ones(1, 1, 3, 3, dtype=torch.float32, device=dev)
 
-        wp.launch(_node_valid, dim=(self.n, self.KK),
-                  inputs=[bel, self._env_idx, coords, valid], device=self.device)
-        wp.launch(_edge_mask, dim=(self.n, self.KK, N_DIR),
-                  inputs=[bel, self._env_idx, coords, valid, self._diy, self._dix, self.K, edges],
-                  device=self.device)
-        wp.launch(_node_utility, dim=(self.n, self.KK, self.n_uray),
-                  inputs=[bel, fro, self._env_idx, coords, valid, self.util_range, self.n_uray,
-                          int(fscale), util],
-                  device=self.device)
-        wp.synchronize()
-        return {"coords": self.coords_t, "valid": self.valid_t,
-                "edges": self.edges_t, "utility": self.util_t}
+    # ---------------------------------------------------------------------- #
+    # main build                                                              #
+    # ---------------------------------------------------------------------- #
+    def build(
+        self,
+        occupancy: torch.Tensor,     # uint8 [N, H, W]
+        frontier: torch.Tensor,      # bool  [N, H, W]
+        robot_xy: torch.Tensor,      # float [N, 2]  (x, y) world
+        visited_step: torch.Tensor,  # long  [N, N_max]  step index of last visit (-1 if unvisited)
+        current_step: int,
+    ) -> dict[str, torch.Tensor]:
+        assert occupancy.dim() == 3
+        N, H, W = occupancy.shape
+        assert (H, W) == (self.H, self.W)
+        dev = occupancy.device
 
+        # 1) Sample occupancy at each lattice node → is_free_lattice[N, LH, LW]
+        node_x = self.node_xy[:, 0].long().clamp(0, W - 1)   # [N_max]
+        node_y = self.node_xy[:, 1].long().clamp(0, H - 1)
+        flat = node_y * W + node_x                            # [N_max]
+        occ_flat = occupancy.view(N, -1)                      # [N, H*W]
+        node_occ = occ_flat[:, flat]                          # [N, N_max]
+        is_free_node = node_occ == FREE                       # [N, N_max]
+        is_free_lat = is_free_node.view(N, self.LH, self.LW)
 
-def build_anchors(centers: torch.Tensor, valid: torch.Tensor, count: torch.Tensor,
-                  a_max: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
-    """Seleziona fino ad a_max centri di frontiera per i anchor globali, rankati per count.
+        # 2) Flood-fill from robot's lattice cell, restricted to is_free_lat.
+        rx = robot_xy[:, 0].clamp(0, W - 1).long()
+        ry = robot_xy[:, 1].clamp(0, H - 1).long()
+        rli = (ry // self.NR).clamp(0, self.LH - 1)
+        rlj = (rx // self.NR).clamp(0, self.LW - 1)
+        seed = torch.zeros((N, self.LH, self.LW), dtype=torch.float32, device=dev)
+        seed[torch.arange(N, device=dev), rli, rlj] = 1.0
+        seed = seed * is_free_lat.float()                     # seed must itself be free; if not, will stay zero
+        reach = seed
+        for _ in range(self.flood_max_iters):
+            dil = F.conv2d(reach.unsqueeze(1), self._dilate_k, padding=1).squeeze(1)
+            new = (dil > 0).float() * is_free_lat.float()
+            if torch.equal(new, reach):
+                break
+            reach = new
+        node_valid = (reach.view(N, self.N_max) > 0)          # [N, N_max] bool
 
-    centers [N,C,2], valid [N,C], count [N,C] -> anchors [N,a_max,2], mask [N,a_max].
-    Oltre a_max si droppano i centri con count piu basso (drop low-utility).
-    """
-    n, c, _ = centers.shape
-    score = count * valid.float()                       # invalid -> 0
-    a_max = min(a_max, c)
-    top_val, top_idx = torch.topk(score, a_max, dim=1)  # [N,a_max]
-    anchors = torch.gather(centers, 1, top_idx.unsqueeze(-1).expand(-1, -1, 2))
-    mask = top_val > 0
-    return anchors, mask
+        # 3) Edges: edge target idx, validity = both endpoints valid + collision-free.
+        edge_idx = self.edge_idx_static.unsqueeze(0).expand(N, -1, -1).contiguous()  # [N, N_max, K]
+        nbr_idx_safe = edge_idx.clamp(min=0)                  # [-1 → 0] for gather
+        nbr_valid_geom = edge_idx >= 0
+        # Gather neighbor validity.
+        nbr_node_valid = torch.gather(
+            node_valid, dim=1, index=nbr_idx_safe.view(N, -1)
+        ).view(N, self.N_max, K)
+        endpoints_valid = node_valid.unsqueeze(-1) & nbr_node_valid & nbr_valid_geom
+
+        # Collision check: sample S points along each edge in world coords.
+        nx_all = self.node_xy[:, 0].view(1, self.N_max, 1, 1)    # [1, N_max, 1, 1]
+        ny_all = self.node_xy[:, 1].view(1, self.N_max, 1, 1)
+        sx = nx_all + self.sample_dx.view(1, 1, K, self.S)       # [1, N_max, K, S]
+        sy = ny_all + self.sample_dy.view(1, 1, K, self.S)
+        sx = sx.clamp(0, W - 1).long()
+        sy = sy.clamp(0, H - 1).long()
+        sample_lin = sy * W + sx                                  # [1, N_max, K, S]
+        sample_lin = sample_lin.expand(N, -1, -1, -1)             # [N, N_max, K, S]
+        occ_samples = torch.gather(occ_flat, 1, sample_lin.reshape(N, -1)).view(N, self.N_max, K, self.S)
+        collision_free = (occ_samples != OBSTACLE).all(dim=-1)    # [N, N_max, K]
+
+        edge_valid = endpoints_valid & collision_free
+        edge_idx = torch.where(edge_valid, edge_idx, torch.full_like(edge_idx, -1))
+
+        # 4) Utility via integral image of frontier (square window approximation of disk).
+        fr = frontier.float()                                     # [N, H, W]
+        ii = F.pad(fr, (1, 0, 1, 0)).cumsum(-1).cumsum(-2)        # [N, H+1, W+1]
+        UR = self.UR
+        x0 = (node_x - UR).clamp(0, W)
+        x1 = (node_x + UR + 1).clamp(0, W)
+        y0 = (node_y - UR).clamp(0, H)
+        y1 = (node_y + UR + 1).clamp(0, H)
+        def _gather_ii(ys, xs):
+            lin = ys * (W + 1) + xs
+            lin = lin.view(1, self.N_max).expand(N, -1)
+            return torch.gather(ii.view(N, -1), 1, lin)
+        util = (_gather_ii(y1, x1) - _gather_ii(y0, x1)
+                - _gather_ii(y1, x0) + _gather_ii(y0, x0))
+        util_max = float((2 * UR + 1) ** 2)
+        utility_norm = (util / util_max).clamp(0, 1)
+        utility_norm = utility_norm * node_valid.float()
+
+        # 5) curr_idx: nearest valid node to robot.
+        node_x_w = self.node_xy[:, 0].view(1, self.N_max)
+        node_y_w = self.node_xy[:, 1].view(1, self.N_max)
+        dx = node_x_w - robot_xy[:, 0:1]
+        dy = node_y_w - robot_xy[:, 1:2]
+        d2 = dx * dx + dy * dy
+        d2 = d2.masked_fill(~node_valid, float("inf"))
+        curr_idx = d2.argmin(dim=-1)                              # [N]
+
+        # 6) Per-node features (7 dims).
+        node_feat = torch.zeros((N, self.N_max, 7), dtype=torch.float32, device=dev)
+        curr_xy = self.node_xy[curr_idx]                          # [N, 2]
+        win_half = 0.5 * max(self.H, self.W)
+        node_feat[..., 0] = (self.node_xy[:, 0].view(1, -1) - curr_xy[:, 0:1]) / win_half  # x_rel
+        node_feat[..., 1] = (self.node_xy[:, 1].view(1, -1) - curr_xy[:, 1:2]) / win_half  # y_rel
+        node_feat[..., 2] = utility_norm
+        visited = (visited_step >= 0).float()
+        node_feat[..., 3] = visited
+        last_norm = torch.where(
+            visited.bool(),
+            visited_step.float() / max(1.0, float(current_step)),
+            torch.zeros_like(visited),
+        ).clamp(0, 1)
+        node_feat[..., 4] = last_norm
+        # feat[5] prob_occupied (M>1, written by Explorer)
+        # feat[6] guidepost (filled by build_guidepost if called)
+        node_feat = node_feat * node_valid.unsqueeze(-1).float()
+
+        # 7) curr_nbr gather.
+        curr_nbr = torch.gather(
+            edge_idx, dim=1,
+            index=curr_idx.view(N, 1, 1).expand(-1, 1, K),
+        ).squeeze(1)
+        curr_nbr_valid = curr_nbr >= 0
+
+        return {
+            "node_xy": self.node_xy.unsqueeze(0).expand(N, -1, -1).contiguous(),
+            "node_valid": node_valid,
+            "node_feat": node_feat,
+            "edge_idx": edge_idx,
+            "edge_valid": edge_valid,
+            "edge_len": self.edge_len,                            # static [K]
+            "curr_idx": curr_idx,
+            "curr_nbr": curr_nbr,
+            "curr_nbr_valid": curr_nbr_valid,
+            "utility": utility_norm,
+        }
+
+    # ---------------------------------------------------------------------- #
+    # guidepost (Bellman-Ford on GPU)                                         #
+    # ---------------------------------------------------------------------- #
+    @torch.no_grad()
+    def build_guidepost(self, info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Batched Bellman-Ford with edge_len weights from curr_idx.
+
+        Mutates `info` in-place to add:
+            guidepost_mask     bool  [N, N_max]      nodes lying on shortest path
+            guidepost_target   long  [N]             flat idx of best target (utility argmax over reachable)
+            guidepost_path_idx long  [N, P_max]      from-curr-to-target node indices, -1 padded
+            guidepost_path_valid bool [N, P_max]
+            guidepost_path_xy  float [N, P_max, 2]   world coords for render (NaN-padded)
+
+        Also writes the mask into `info['node_feat'][..., 6]` to populate feat[6].
+        """
+        edge_idx = info["edge_idx"]        # [N, N_max, K]
+        edge_valid = info["edge_valid"]    # [N, N_max, K]
+        node_valid = info["node_valid"]    # [N, N_max]
+        utility = info["utility"]          # [N, N_max]
+        curr_idx = info["curr_idx"]        # [N]
+        node_xy = self.node_xy             # [N_max, 2]
+
+        N = edge_idx.shape[0]
+        N_max = self.N_max
+        K_ = K
+        dev = edge_idx.device
+        INF = float("inf")
+
+        # dist[N, N_max] init INF, dist[curr] = 0.
+        dist = torch.full((N, N_max), INF, dtype=torch.float32, device=dev)
+        arange_N = torch.arange(N, device=dev)
+        dist[arange_N, curr_idx] = 0.0
+        parent = torch.full((N, N_max), -1, dtype=torch.long, device=dev)
+
+        edge_len = self.edge_len.view(1, 1, K_)                          # [1, 1, K]
+        edge_idx_safe = edge_idx.clamp(min=0)                             # gather-safe
+
+        # Iterate Bellman-Ford relaxations. Process the relaxation as:
+        #   for each node v, look at its 8 neighbors u; candidate dist via u = dist[u] + w(u, v)
+        # The static `edge_idx[v, k]` here means "what is the neighbor u? edge from v to that u".
+        # Since the graph is undirected with symmetric weights and same K layout,
+        # using the candidate `dist[u] + edge_len[k]` is equivalent to relaxing v through u.
+        for it in range(self.guidepost_iters):
+            # Gather dist of each neighbor.
+            nbr_dist = torch.gather(
+                dist, dim=1, index=edge_idx_safe.view(N, -1)
+            ).view(N, N_max, K_)                                          # [N, N_max, K]
+            cand = nbr_dist + edge_len                                    # [N, N_max, K]
+            cand = cand.masked_fill(~edge_valid, INF)
+            # best per node v over K neighbors
+            best_vals, best_k = cand.min(dim=-1)                          # [N, N_max]
+            # update where best < dist
+            update = best_vals < dist
+            dist = torch.where(update, best_vals, dist)
+            # parent[v] = edge_idx[v, best_k]
+            best_parent = torch.gather(edge_idx, dim=2, index=best_k.unsqueeze(-1)).squeeze(-1)
+            parent = torch.where(update, best_parent, parent)
+            # cheap early exit (avoid sync every iter)
+            if it >= 4 and (it % 8 == 0):
+                if not bool(update.any().item()):
+                    break
+
+        # Pick target = argmax(utility) over reachable + valid nodes.
+        reachable = (dist < INF) & node_valid                             # [N, N_max]
+        util_for_target = torch.where(reachable, utility, torch.full_like(utility, -1.0))
+        target = util_for_target.argmax(dim=-1)                           # [N]
+        # If all unreachable / zero utility, target == curr (no-op).
+        no_util = (util_for_target.max(dim=-1).values <= 0)
+        target = torch.where(no_util, curr_idx, target)
+
+        # Reconstruct path by walking parent pointers from target → curr.
+        P_max = self.guidepost_path_max
+        path_idx = torch.full((N, P_max), -1, dtype=torch.long, device=dev)
+        path_valid = torch.zeros((N, P_max), dtype=torch.bool, device=dev)
+        # Start at target; first slot in path_idx[:, 0] is target.
+        cur = target.clone()
+        active = torch.ones(N, dtype=torch.bool, device=dev) & (target != curr_idx)
+        for p in range(P_max):
+            path_idx[:, p] = torch.where(active, cur, torch.full_like(cur, -1))
+            path_valid[:, p] = active
+            # advance: if cur == curr_idx, stop after recording this slot.
+            reached_curr = (cur == curr_idx)
+            # next node = parent[cur]; deactivate if cur reached curr_idx or parent == -1
+            par = parent[arange_N, cur]
+            stop = reached_curr | (par < 0)
+            active = active & ~stop
+            cur = torch.where(stop, cur, par)
+
+        # Always include curr_idx as final waypoint if path has length.
+        # The loop already records cur == curr_idx when reached_curr triggers.
+
+        # Build mask of nodes on path.
+        guidepost_mask = torch.zeros((N, N_max), dtype=torch.bool, device=dev)
+        # scatter at path_idx where valid
+        safe_pi = path_idx.clamp(min=0)
+        mask_v = path_valid
+        guidepost_mask.scatter_(1, safe_pi, mask_v)
+        # Also include curr itself.
+        guidepost_mask[arange_N, curr_idx] = True
+
+        # Path xy for render. NaN-padded.
+        path_xy = torch.full((N, P_max, 2), float("nan"), dtype=torch.float32, device=dev)
+        safe_xy = node_xy[safe_pi]                                        # [N, P_max, 2]
+        path_xy = torch.where(path_valid.unsqueeze(-1), safe_xy, path_xy)
+
+        # next_hop[N]: the neighbor of curr_idx that lies on the shortest path
+        # toward target. Identify as the node whose parent == curr_idx among path nodes.
+        # path_idx walks target → ... → curr; the slot immediately before curr_idx
+        # is the next hop. Find it by scanning path_idx for entries with parent == curr_idx.
+        next_hop = curr_idx.clone()                                       # default: stay put
+        for p in range(P_max):
+            slot = path_idx[:, p]                                          # [N]
+            slot_safe = slot.clamp(min=0)
+            par = parent[arange_N, slot_safe]                              # parent of slot node
+            is_next = (par == curr_idx) & (slot >= 0) & path_valid[:, p]
+            # only overwrite where we haven't found a next_hop yet (stay put → curr_idx)
+            need = (next_hop == curr_idx) & is_next
+            next_hop = torch.where(need, slot, next_hop)
+
+        # Build per-K bias for pointer: 1.0 at the K-slot whose neighbor flat-idx == next_hop.
+        # curr_nbr is [N, K] from build().
+        curr_nbr = info["curr_nbr"]                                        # [N, K]
+        guidepost_nbr_bias = (curr_nbr == next_hop.unsqueeze(-1)).float()  # [N, K]
+        # If next_hop == curr (no path), bias all zero.
+        any_match = guidepost_nbr_bias.sum(dim=-1, keepdim=True) > 0
+        guidepost_nbr_bias = guidepost_nbr_bias * any_match.float()
+
+        # Write feat[6] guidepost.
+        info["node_feat"][..., 6] = guidepost_mask.float()
+        info["guidepost_mask"] = guidepost_mask
+        info["guidepost_target"] = target
+        info["guidepost_path_idx"] = path_idx
+        info["guidepost_path_valid"] = path_valid
+        info["guidepost_path_xy"] = path_xy
+        info["guidepost_dist"] = dist
+        info["guidepost_next_hop"] = next_hop                              # [N]
+        info["guidepost_nbr_bias"] = guidepost_nbr_bias                    # [N, K]
+        return info
