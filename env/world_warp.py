@@ -179,8 +179,18 @@ class WarpWorld:
         """Fuse per-agent log-odds for communicating pairs.
 
         comm_mask: [N, M, M] bool — True at (n,i,j) means agent i and j can comm in env n.
-        Fusion: elementwise max (idempotent — safe to call every step pair is in range).
-        After fusion re-derives categorical from updated log-odds in pure torch.
+
+        Fusion: max-magnitude — pick lo with larger |lo|, keep its sign. Convention is
+        positive lo = FREE, negative lo = OBSTACLE, |lo| ≈ 0 = UNKNOWN.
+
+        Why not torch.max(lo_i, lo_j): max(0, -5) = 0 → UNKNOWN, dropping OBSTACLE evidence.
+        Symptom: after rendezvous, cells that teammate observed as wall stop being OBSTACLE
+        in my map (my lo=0, their lo=-5 → max=0). Surrounding cells become FREE via their
+        positive lo. Then frontier (FREE cell with UNKNOWN neighbors) tints the former-wall
+        UNKNOWN-now cells red on render.
+
+        max-magnitude preserves both FREE and OBSTACLE evidence. Idempotent for repeated
+        fusion (|lo| is monotonically non-decreasing under this op, capped by the clamp).
         """
         if self.m < 2:
             return
@@ -193,7 +203,10 @@ class WarpWorld:
                     continue
                 any_changed = True
                 mask = can.view(-1, 1, 1)   # broadcast over H, W
-                merged = torch.max(lo[:, i], lo[:, j]).clamp_(_LO_OCC_TH - 5, _LO_CLAMP)
+                lo_i = lo[:, i]
+                lo_j = lo[:, j]
+                use_i = lo_i.abs() >= lo_j.abs()
+                merged = torch.where(use_i, lo_i, lo_j).clamp_(_LO_OCC_TH - 5, _LO_CLAMP)
                 lo[:, i] = torch.where(mask, merged, lo[:, i])
                 lo[:, j] = torch.where(mask, merged, lo[:, j])
         if any_changed:

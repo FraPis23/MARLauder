@@ -64,6 +64,7 @@ class GraphLattice:
         flood_max_iters: int = 200,
         guidepost_iters: int | None = None,
         guidepost_path_max: int | None = None,
+        n_hops: int = 2,
         device: str = "cuda:0",
     ) -> None:
         self.device = device
@@ -117,6 +118,63 @@ class GraphLattice:
 
         # 3x3 dilation kernel for flood fill on lattice.
         self._dilate_k = torch.ones(1, 1, 3, 3, dtype=torch.float32, device=dev)
+
+        # K_INDEX_TABLE[d_li+1, d_lj+1] → K-slot index for analytic direction.
+        # Maps (sign(target_li - curr_li), sign(target_lj - curr_lj)) ∈ {-1,0,1}² to
+        # the K=8 slot in NBR_OFFSETS. Diagonal (0,0) → -1 (curr == target, no move).
+        # NBR_OFFSETS = ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1))
+        # i.e. (NW,N,NE,W,E,SW,S,SE).
+        k_table = torch.full((3, 3), -1, dtype=torch.long, device=dev)
+        for k_idx, (dr, dc) in enumerate(NBR_OFFSETS):
+            k_table[dr + 1, dc + 1] = k_idx
+        self.K_INDEX_TABLE = k_table                              # [3, 3]
+
+        # ----- Phase C: ego-centric subgraph window precomputation ----- #
+        # Window side = (2 * n_hops + 3), one extra ring beyond the n_hops receptive
+        # field so boundary nodes still aggregate from valid neighbors in the last
+        # GAT layer (boundary nodes whose neighbors fall outside the window have
+        # those edges masked, degrading them — keep them as padding only).
+        self.n_hops = int(n_hops)
+        self.window_side = 2 * self.n_hops + 3
+        self.window_size = self.window_side * self.window_side
+        self.window_radius = self.window_side // 2                # = n_hops + 1
+        self.window_local_center = self.window_size // 2          # center index, constant
+
+        # window_offsets[w_local, :] = (d_li, d_lj) in [-radius, +radius], row-major.
+        offs_li = torch.arange(-self.window_radius, self.window_radius + 1, device=dev)
+        offs_lj = torch.arange(-self.window_radius, self.window_radius + 1, device=dev)
+        oli, olj = torch.meshgrid(offs_li, offs_lj, indexing="ij")
+        self.window_offsets = torch.stack([oli.reshape(-1), olj.reshape(-1)], dim=-1)   # [W², 2]
+
+        # window_idx_table[k, w_local] = GLOBAL flat idx of node at offset (d_li, d_lj)
+        # from cell k. -1 if out of lattice bounds.
+        k_li_col = self.li_flat.view(self.N_max, 1)                # [N_max, 1]
+        k_lj_col = self.lj_flat.view(self.N_max, 1)
+        off_li_row = self.window_offsets[:, 0].view(1, self.window_size)
+        off_lj_row = self.window_offsets[:, 1].view(1, self.window_size)
+        gli = k_li_col + off_li_row                                # [N_max, W²]
+        glj = k_lj_col + off_lj_row
+        in_bounds = (gli >= 0) & (gli < self.LH) & (glj >= 0) & (glj < self.LW)
+        self.window_idx_table = torch.where(
+            in_bounds, gli * self.LW + glj, torch.full_like(gli, -1),
+        )                                                          # [N_max, W²]
+
+        # window_local_edge_table[w_local, k] = LOCAL idx (in [0, W²)) of the K-th
+        # neighbor of the window cell at w_local. -1 if neighbor outside the window.
+        # Independent of the lattice cell k; depends only on window geometry.
+        local_edge = torch.full((self.window_size, K), -1, dtype=torch.long, device=dev)
+        for w_local in range(self.window_size):
+            d_li = int(self.window_offsets[w_local, 0].item())
+            d_lj = int(self.window_offsets[w_local, 1].item())
+            for k_idx, (dr, dc) in enumerate(NBR_OFFSETS):
+                nbr_li = d_li + dr
+                nbr_lj = d_lj + dc
+                if -self.window_radius <= nbr_li <= self.window_radius and \
+                   -self.window_radius <= nbr_lj <= self.window_radius:
+                    nbr_local = (nbr_li + self.window_radius) * self.window_side \
+                              + (nbr_lj + self.window_radius)
+                    local_edge[w_local, k_idx] = nbr_local
+        self.window_local_edge_table = local_edge                  # [W², K]
 
     # ---------------------------------------------------------------------- #
     # main build                                                              #
@@ -203,14 +261,14 @@ class GraphLattice:
         utility_norm = (util / util_max).clamp(0, 1)
         utility_norm = utility_norm * node_valid.float()
 
-        # 5) curr_idx: nearest valid node to robot.
-        node_x_w = self.node_xy[:, 0].view(1, self.N_max)
-        node_y_w = self.node_xy[:, 1].view(1, self.N_max)
-        dx = node_x_w - robot_xy[:, 0:1]
-        dy = node_y_w - robot_xy[:, 1:2]
-        d2 = dx * dx + dy * dy
-        d2 = d2.masked_fill(~node_valid, float("inf"))
-        curr_idx = d2.argmin(dim=-1)                              # [N]
+        # 5) curr_idx: O(1) analytic lookup.
+        # Node center at (lj+0.5)*NR → nearest column = floor(x/NR).
+        # Agents always land on lattice node positions (_spread_starts_graph places
+        # them on node_xy; step() moves them to chosen node coords). Floor-divide
+        # is therefore exact — no argmin search needed.
+        lj_curr = (robot_xy[:, 0] / float(self.NR)).long().clamp(0, self.LW - 1)
+        li_curr = (robot_xy[:, 1] / float(self.NR)).long().clamp(0, self.LH - 1)
+        curr_idx = li_curr * self.LW + lj_curr                   # [N]
 
         # 6) Per-node features (7 dims).
         node_feat = torch.zeros((N, self.N_max, 7), dtype=torch.float32, device=dev)
@@ -390,3 +448,298 @@ class GraphLattice:
         info["guidepost_next_hop"] = next_hop                              # [N]
         info["guidepost_nbr_bias"] = guidepost_nbr_bias                    # [N, K]
         return info
+
+    # ---------------------------------------------------------------------- #
+    # B1 redo: BF from TARGET + warm-start + overwrite-mode + early exit     #
+    # ---------------------------------------------------------------------- #
+    @torch.no_grad()
+    def bf_from_target(
+        self,
+        info: dict[str, torch.Tensor],
+        target: torch.Tensor,                    # [N] long, BF source = target node
+        dist_init: torch.Tensor | None = None,   # [N, N_max] warm-start dist (else +inf)
+        max_iters: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Overwrite-mode Bellman-Ford from `target` over the lattice.
+
+        Why overwrite-mode (`dist = best_vals` not `min(dist, best_vals)`):
+            With monotonic-min BF + warm-start, stale-low dist values from a previous
+            step persist even when the edge that achieved them is now invalid (e.g.
+            a newly-scanned wall blocked the path). Overwrite-mode recomputes dist[v]
+            from scratch each iter using current neighbor distances, so stale values
+            propagate out within a few iterations. Forces dist[target] = 0 each iter
+            to anchor the source.
+
+        Returns:
+            dist   [N, N_max] f32 — shortest path cost FROM target TO each node.
+            parent [N, N_max] long — neighbor index used to reach each node (parent
+                                     in the shortest-path tree rooted at target).
+        """
+        edge_idx = info["edge_idx"]              # [N, N_max, K]
+        edge_valid = info["edge_valid"]          # [N, N_max, K]
+
+        N = edge_idx.shape[0]
+        N_max = self.N_max
+        K_ = K
+        dev = edge_idx.device
+        INF = float("inf")
+        max_iters = max_iters if max_iters is not None else self.guidepost_iters
+
+        # Init dist
+        if dist_init is not None:
+            dist = dist_init.clone()
+        else:
+            dist = torch.full((N, N_max), INF, dtype=torch.float32, device=dev)
+        arange_N = torch.arange(N, device=dev)
+        dist[arange_N, target] = 0.0
+        parent = torch.full((N, N_max), -1, dtype=torch.long, device=dev)
+
+        edge_len = self.edge_len.view(1, 1, K_)
+        edge_idx_safe = edge_idx.clamp(min=0)
+
+        for it in range(max_iters):
+            nbr_dist = torch.gather(
+                dist, dim=1, index=edge_idx_safe.view(N, -1)
+            ).view(N, N_max, K_)
+            cand = nbr_dist + edge_len
+            cand = cand.masked_fill(~edge_valid, INF)
+            best_vals, best_k = cand.min(dim=-1)                          # [N, N_max]
+            # Overwrite (not monotonic min): handles stale dist_init correctly.
+            prev_dist = dist
+            dist = best_vals
+            dist[arange_N, target] = 0.0                                  # force source
+            best_parent = torch.gather(edge_idx, dim=2, index=best_k.unsqueeze(-1)).squeeze(-1)
+            parent = best_parent
+            # Early exit when converged (sync ~10 μs on modern Ada, cheap).
+            if it >= 1 and (it % 8 == 0):
+                if bool(torch.equal(prev_dist, dist)):
+                    break
+
+        return dist, parent
+
+    @torch.no_grad()
+    def analytic_next_hop(
+        self,
+        curr_idx: torch.Tensor,                  # [N] flat node idx
+        target: torch.Tensor,                    # [N] flat node idx
+        edge_valid: torch.Tensor,                # [N, N_max, K]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """O(1) analytic direction from curr toward target on the lattice.
+
+        Returns:
+            k_analytic  [N] long  — K-slot of the immediate-step direction toward
+                                    target. -1 when curr == target.
+            edge_clear  [N] bool  — True if the immediate edge (curr, k_analytic)
+                                    is valid. Does NOT trace the full path; only
+                                    checks the first hop. (Full-path tracing would
+                                    require a Python loop and lose the O(1) cost.)
+        """
+        N = curr_idx.shape[0]
+        dev = curr_idx.device
+        arange_N = torch.arange(N, device=dev)
+        curr_li = curr_idx // self.LW
+        curr_lj = curr_idx % self.LW
+        tgt_li = target // self.LW
+        tgt_lj = target % self.LW
+        d_li = torch.sign(tgt_li - curr_li).long()                        # {-1, 0, +1}
+        d_lj = torch.sign(tgt_lj - curr_lj).long()
+        k_analytic = self.K_INDEX_TABLE[d_li + 1, d_lj + 1]               # [N], -1 if curr==target
+        # Check edge_valid[arange, curr_idx, k_analytic]. k_analytic == -1 needs masking.
+        k_safe = k_analytic.clamp(min=0)
+        edge_at = edge_valid[arange_N, curr_idx, k_safe]                  # [N]
+        edge_clear = edge_at & (k_analytic >= 0)
+        return k_analytic, edge_clear
+
+    @torch.no_grad()
+    def select_target_no_bf(
+        self,
+        utility: torch.Tensor,        # [N, N_max]
+        node_valid: torch.Tensor,     # [N, N_max]
+    ) -> torch.Tensor:
+        """Target = argmax(utility · node_valid). node_valid is set by flood-fill from
+        curr in build() and already filters reachability, so a 'valid' node IS reachable
+        from curr through known-FREE space. No BF needed for target selection."""
+        masked = torch.where(node_valid, utility, torch.full_like(utility, -1.0))
+        target = masked.argmax(dim=-1)                                     # [N]
+        return target
+
+    @torch.no_grad()
+    def build_guidepost_v2(
+        self,
+        info: dict[str, torch.Tensor],
+        target: torch.Tensor,                    # [N] target flat idx
+        dist_init: torch.Tensor | None = None,   # [N, N_max] warm-start dist
+    ) -> dict[str, torch.Tensor]:
+        """B1-redo guidepost: BF FROM target (not curr), overwrite-mode, warm-startable.
+
+        Writes the same info-dict fields as `build_guidepost`. Downstream code does
+        not change. The semantic change is: `parent[v]` now points TOWARD target (not
+        toward curr), so the path is reconstructed by walking parent from curr.
+
+        Args:
+            info: dict from `build()` (must contain edge_idx, edge_valid, node_valid,
+                  utility, curr_idx, curr_nbr, curr_nbr_valid, node_xy).
+            target: [N] flat node idx of the BF source (= long-horizon goal).
+            dist_init: optional warm-start [N, N_max] from a previous step. When the
+                       target is unchanged across steps, this dramatically cuts BF iters.
+
+        Writes to `info`:
+            guidepost_mask        bool  [N, N_max]
+            guidepost_target      long  [N]
+            guidepost_path_idx    long  [N, P_max]      curr → ... → target
+            guidepost_path_valid  bool  [N, P_max]
+            guidepost_path_xy     float [N, P_max, 2]
+            guidepost_dist        float [N, N_max]      for next-step warm-start
+            guidepost_next_hop    long  [N]
+            guidepost_nbr_bias    float [N, K]
+        Also fills `info["node_feat"][..., 6]`.
+        """
+        edge_idx = info["edge_idx"]
+        edge_valid = info["edge_valid"]
+        node_valid = info["node_valid"]
+        curr_idx = info["curr_idx"]
+        curr_nbr = info["curr_nbr"]              # [N, K] flat indices, -1 padded
+        curr_nbr_valid = info["curr_nbr_valid"]  # [N, K]
+        node_xy = self.node_xy
+
+        N = edge_idx.shape[0]
+        N_max = self.N_max
+        K_ = K
+        P_max = self.guidepost_path_max
+        dev = edge_idx.device
+        INF = float("inf")
+        arange_N = torch.arange(N, device=dev)
+
+        # 1) BF FROM target with warm-start. Returns dist[N, N_max], parent[N, N_max].
+        dist, parent = self.bf_from_target(info, target=target, dist_init=dist_init)
+
+        # 2) next_hop = parent[curr]. If parent[curr] < 0 (curr == target or unreachable),
+        #    stay put (next_hop = curr).
+        par_at_curr = parent[arange_N, curr_idx]                          # [N]
+        next_hop = torch.where(par_at_curr >= 0, par_at_curr, curr_idx)
+
+        # 3) Reconstruct path by walking parent from curr toward target.
+        path_idx = torch.full((N, P_max), -1, dtype=torch.long, device=dev)
+        path_valid = torch.zeros((N, P_max), dtype=torch.bool, device=dev)
+        cur = curr_idx.clone()
+        active = torch.ones(N, dtype=torch.bool, device=dev)
+        for p in range(P_max):
+            path_idx[:, p] = torch.where(active, cur, torch.full_like(cur, -1))
+            path_valid[:, p] = active
+            reached_target = (cur == target)
+            par = parent[arange_N, cur]
+            stop = reached_target | (par < 0)
+            active = active & ~stop
+            cur = torch.where(stop, cur, par)
+
+        # 4) Mask
+        guidepost_mask = torch.zeros((N, N_max), dtype=torch.bool, device=dev)
+        safe_pi = path_idx.clamp(min=0)
+        guidepost_mask.scatter_(1, safe_pi, path_valid)
+        guidepost_mask[arange_N, curr_idx] = True
+
+        # 5) path_xy for render
+        path_xy = torch.full((N, P_max, 2), float("nan"), dtype=torch.float32, device=dev)
+        safe_xy = node_xy[safe_pi]
+        path_xy = torch.where(path_valid.unsqueeze(-1), safe_xy, path_xy)
+
+        # 6) guidepost_nbr_bias: one-hot over K at the slot matching next_hop
+        guidepost_nbr_bias = (curr_nbr == next_hop.unsqueeze(-1)).float()
+        any_match = guidepost_nbr_bias.sum(dim=-1, keepdim=True) > 0
+        guidepost_nbr_bias = guidepost_nbr_bias * any_match.float()
+
+        # 7) Write feat[6] + info
+        info["node_feat"][..., 6] = guidepost_mask.float()
+        info["guidepost_mask"] = guidepost_mask
+        info["guidepost_target"] = target
+        info["guidepost_path_idx"] = path_idx
+        info["guidepost_path_valid"] = path_valid
+        info["guidepost_path_xy"] = path_xy
+        info["guidepost_dist"] = dist
+        info["guidepost_next_hop"] = next_hop
+        info["guidepost_nbr_bias"] = guidepost_nbr_bias
+        # Target world coords (render uses this — node_xy in obs is local window now).
+        info["guidepost_target_xy"] = node_xy[target]                 # [N, 2]
+        return info
+
+    # ---------------------------------------------------------------------- #
+    # Phase C: extract ego-centric subgraph window centered on curr_idx       #
+    # ---------------------------------------------------------------------- #
+    @torch.no_grad()
+    def extract_local_window(self, info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Slice a (2·n_hops + 3)² window out of the global graph, per env.
+
+        The encoder runs on the window instead of the full N_max-node lattice.
+        Receptive field of `n_layers` GAT layers stacked on the window equals
+        `n_layers` lattice hops outward from the center — same as on the full
+        graph, but with vastly fewer wasted FLOPs.
+
+        Returns a NEW dict with local-window views. Edge indices in this dict
+        are LOCAL indices into [0, window_size). The global-flat `curr_nbr`
+        (needed by env.step to decode actions) is retained as `curr_nbr_global`.
+
+        All other fields produced by `build()` / `build_guidepost_v2()` are kept
+        from `info` for downstream use (visited_step, guidepost_path_xy in global
+        world coords, etc.). The caller decides which subset to expose in obs.
+        """
+        edge_idx_global = info["edge_idx"]                     # [N, N_max, K]
+        edge_valid_global = info["edge_valid"]                 # [N, N_max, K]
+        node_valid_global = info["node_valid"]                 # [N, N_max]
+        node_feat_global = info["node_feat"]                   # [N, N_max, F]
+        node_xy_global = info["node_xy"]                       # [N, N_max, 2]
+        utility_global = info["utility"]                       # [N, N_max]
+        curr_idx = info["curr_idx"]                            # [N]
+        curr_nbr_global = info["curr_nbr"]                     # [N, K]
+
+        N = curr_idx.shape[0]
+        W2 = self.window_size
+        K_ = K
+        F_ = node_feat_global.shape[-1]
+        dev = curr_idx.device
+
+        # Per-env local→global map: window_idx_table indexed by curr_idx.
+        l2g = self.window_idx_table[curr_idx]                  # [N, W²]
+        in_window = l2g >= 0                                   # [N, W²]
+        safe_g = l2g.clamp(min=0)                              # [N, W²], -1 → 0 for gather safety
+
+        # Gather node-level fields
+        local_node_xy = torch.gather(
+            node_xy_global, 1, safe_g.unsqueeze(-1).expand(-1, -1, 2),
+        )                                                      # [N, W², 2]
+        local_node_valid = torch.gather(node_valid_global, 1, safe_g) & in_window  # [N, W²]
+        local_node_feat = torch.gather(
+            node_feat_global, 1, safe_g.unsqueeze(-1).expand(-1, -1, F_),
+        )
+        local_node_feat = local_node_feat * in_window.unsqueeze(-1).float()        # zero OOB
+        local_utility = torch.gather(utility_global, 1, safe_g) * in_window.float()
+
+        # Edge indices are LOCAL (broadcast static table)
+        local_edge_idx = self.window_local_edge_table.unsqueeze(0).expand(N, -1, -1).contiguous()
+        # Edge validity: combine global edge_valid AND neighbor-in-window AND own-in-window
+        local_edge_valid_global = torch.gather(
+            edge_valid_global, 1, safe_g.unsqueeze(-1).expand(-1, -1, K_),
+        )                                                      # [N, W², K]
+        nbr_in_window = local_edge_idx >= 0                    # [N, W², K]
+        own_in_window = in_window.unsqueeze(-1)                # [N, W², 1]
+        local_edge_valid = local_edge_valid_global & nbr_in_window & own_in_window
+
+        # curr is window center
+        local_curr_idx = torch.full((N,), self.window_local_center, dtype=torch.long, device=dev)
+        local_curr_nbr = self.window_local_edge_table[self.window_local_center].view(1, K_).expand(N, K_).contiguous()
+        local_curr_nbr_valid = torch.gather(
+            local_edge_valid, 1, local_curr_idx.view(N, 1, 1).expand(-1, 1, K_),
+        ).squeeze(1)                                           # [N, K]
+
+        return {
+            "node_xy_local": local_node_xy,
+            "node_valid_local": local_node_valid,
+            "node_feat_local": local_node_feat,
+            "edge_idx_local": local_edge_idx,
+            "edge_valid_local": local_edge_valid,
+            "curr_idx_local": local_curr_idx,
+            "curr_nbr_local": local_curr_nbr,
+            "curr_nbr_valid_local": local_curr_nbr_valid,
+            "utility_local": local_utility,
+            "local_to_global": l2g,           # [N, W²], -1 padded
+            "curr_nbr_global": curr_nbr_global,
+        }

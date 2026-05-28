@@ -24,7 +24,8 @@ def main() -> None:
     ap.add_argument("--split", default="train/easy")
     ap.add_argument("--n-maps", type=int, default=5, help="Num maps to eval")
     ap.add_argument("--steps", type=int, default=512)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Seed for map sampling (default: random each run)")
     ap.add_argument("--out", type=Path, default=None, help="Dir for GIFs (default: ckpt dir)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -64,7 +65,11 @@ def main() -> None:
     for map_i, map_idx in enumerate(map_indices):
         print(f"\n[{map_i+1}/{args.n_maps}] map={map_idx}...", end=" ", flush=True)
 
-        env_cfg = EnvCfg(n_envs=1, n_agents=n_agents, max_episode_steps=args.steps)
+        # Read env knobs from saved cfg so eval matches training shape.
+        env_dict = cfg_dict.get("env", {}) if isinstance(cfg_dict, dict) else {}
+        n_hops_ckpt = env_dict.get("n_hops", 2)
+        env_cfg = EnvCfg(n_envs=1, n_agents=n_agents,
+                         max_episode_steps=args.steps, n_hops=n_hops_ckpt)
         env = Explorer(split, env_cfg, seed=map_idx)
 
         # Load specific map

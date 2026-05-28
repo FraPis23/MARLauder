@@ -37,6 +37,9 @@ def main() -> None:
     ap.add_argument("--max-episode-steps", type=int, default=512)
     ap.add_argument("--minibatches", type=int, default=1,
                     help="PPO minibatches per epoch (must divide n-envs)")
+    ap.add_argument("--n-hops", type=int, default=2,
+                    help="Ego-centric encoder window radius. Window side = 2·n_hops + 3 "
+                         "(49 nodes at 2, 121 at 4, 225 at 6). GAT n_layers tied to n_hops.")
     # --- learning ---
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--ent-coef", type=float, default=0.01)
@@ -53,6 +56,7 @@ def main() -> None:
         n_envs=args.n_envs,
         n_agents=args.n_agents,
         rollout_len=args.rollout_len,
+        n_hops=args.n_hops,
         device=args.device,
         seed=args.seed,
         compile=args.compile,
@@ -64,6 +68,7 @@ def main() -> None:
             nr=16,                              # lattice spacing — 16px → N_max≈1200 nodes
             max_episode_steps=args.max_episode_steps,
             comm_range_px=args.comm_range,
+            n_hops=args.n_hops,
         ),
         ppo=MAPPOCfg(
             ent_coef=args.ent_coef,

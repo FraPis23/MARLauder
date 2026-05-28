@@ -87,9 +87,13 @@ class EvalRollout:
                 evalid_ag = obs["edge_valid"][e, ag].cpu().numpy()
                 curr_ag  = int(obs["curr_idx"][e, ag])
 
-                target_flat_ag = int(obs["guidepost_target"][e, ag].item())
-                tgt_xy_ag = (float(obs["node_xy"][e, ag, target_flat_ag, 0].item()),
-                             float(obs["node_xy"][e, ag, target_flat_ag, 1].item()))
+                # node_xy is now LOCAL window. Use precomputed global target world coords.
+                tgt_xy_ag = (float(obs["guidepost_target_xy"][e, ag, 0].item()),
+                             float(obs["guidepost_target_xy"][e, ag, 1].item()))
+                # "At target" check: distance from agent to target ≤ lattice spacing.
+                ax_, ay_ = trails[ag][-1]
+                at_target = (abs(tgt_xy_ag[0] - ax_) < env.cfg.nr
+                             and abs(tgt_xy_ag[1] - ay_) < env.cfg.nr)
                 path_xy_ag    = obs["guidepost_path_xy"][e, ag].cpu().numpy()
                 path_valid_ag = obs["guidepost_path_valid"][e, ag].cpu().numpy()
 
@@ -102,7 +106,7 @@ class EvalRollout:
                     step=step_t, explored=explored,
                     draw_edges=self.cfg.draw_edges, eidx=eidx_ag, evalid=evalid_ag,
                     path_xy=path_xy_ag, path_valid=path_valid_ag,
-                    target_xy=tgt_xy_ag if target_flat_ag != curr_ag else None,
+                    target_xy=tgt_xy_ag if not at_target else None,
                     extra_agents_xy=[trails[oag][-1] for oag in other_ags],
                     extra_agents_trails=[trails[oag][-self.cfg.trail_len:] for oag in other_ags],
                     extra_agent_indices=other_ags,

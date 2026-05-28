@@ -57,6 +57,9 @@ class EnvCfg:
     done_explored_thresh: float = 0.99
     comm_range_px: float = 120.0        # communication range (default 2× sensor_range)
     comm_los_samples: int = 40          # LOS line samples (Bresenham approx)
+    step_penalty_coef: float = 0.1     # total step penalty over episode = coef (scaled by 1/max_steps)
+    completion_bonus: float = 10.0     # reward given at the terminal step when explored >= threshold
+    n_hops: int = 2                     # ego-centric encoder window radius (window_side = 2·n_hops + 3)
 
 
 class Explorer:
@@ -87,6 +90,7 @@ class Explorer:
             utility_range_px=cfg.utility_range_px,
             collision_samples=5,
             flood_max_iters=cfg.flood_max_iters,
+            n_hops=cfg.n_hops,
             device=self.dev,
         )
         self.N_max = self.graph.N_max
@@ -100,6 +104,13 @@ class Explorer:
         self.curr_idx     = torch.zeros((self.N, self.M),              dtype=torch.long,    device=self.dev)
         # last known position: agent i's knowledge of agent j's position
         self.last_known_pos = torch.zeros((self.N, self.M, self.M, 2), dtype=torch.float32, device=self.dev)
+        # B1-redo: per-agent guidepost cache for warm-start BF from target.
+        # _target_prev[N, M]: previous step's target node per agent. -1 = no cache.
+        # _dist_prev[N, M, N_max]: previous step's BF dist (rooted at target). +inf = cold.
+        self._target_prev = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
+        self._dist_prev   = torch.full(
+            (self.N, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
+        )
         self._last_obs: dict = {}
 
         self._reset_all()
@@ -115,10 +126,13 @@ class Explorer:
     def step(self, action: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, dict]:
         """action: long [N, M] in [0, K). Returns (obs, reward[N,M], done[N], info)."""
         assert action.shape == (self.N, self.M)
-        curr_nbr       = self._last_obs["curr_nbr"]
-        curr_nbr_valid = self._last_obs["curr_nbr_valid"]
-        chosen       = torch.gather(curr_nbr,       dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
-        chosen_valid = torch.gather(curr_nbr_valid, dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
+        # Phase C: action decode uses GLOBAL curr_nbr (model picked K-slot from local
+        # window's curr_nbr_local, but env needs global flat idx to compute world coords
+        # and update visited_step).
+        curr_nbr_global = self._last_obs["curr_nbr_global"]            # [N, M, K]
+        curr_nbr_valid  = self._last_obs["curr_nbr_valid"]             # [N, M, K] (local-edge validity)
+        chosen       = torch.gather(curr_nbr_global, dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
+        chosen_valid = torch.gather(curr_nbr_valid,  dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
         chosen = torch.where(chosen_valid, chosen, self.curr_idx).clamp(min=0)
 
         node_xy = self.graph.node_xy
@@ -160,12 +174,18 @@ class Explorer:
         self.world.fuse_maps(comm_mask)
         self._update_last_known_pos(comm_mask)
 
-        # Reward: Δ(union FREE across agents) / total_free
+        # Reward: Δ(union FREE) + completion bonus − constant step penalty
+        # step_penalty_coef / max_steps: total budget over episode = step_penalty_coef.
+        # completion_bonus: one-shot reward at terminal step.
         union_free = (self.world.occupancy_torch == _FREE).any(dim=1).view(self.N, -1).float().sum(-1)
         explored_rate = (union_free / self.free_total.clamp(min=1.0)).clamp(0, 1)
         delta = (union_free - self.last_union) / self.free_total.clamp(min=1.0)
         self.last_union = union_free
-        team_reward = delta.clamp(min=0.0)
+        terminated_now = explored_rate >= self.cfg.done_explored_thresh
+        step_penalty = self.cfg.step_penalty_coef / max(1, self.cfg.max_episode_steps)
+        team_reward = (delta.clamp(min=0.0)
+                       + terminated_now.float() * self.cfg.completion_bonus
+                       - step_penalty)
         reward = team_reward.unsqueeze(-1).expand(-1, self.M)
 
         self._refresh_obs(comm_mask)
@@ -249,21 +269,107 @@ class Explorer:
     # ---------------------------------------------------------------------- #
     # internals                                                               #
     # ---------------------------------------------------------------------- #
-    def _spread_starts_graph(self, start_row: int, start_col: int) -> torch.Tensor:
-        """Return M start positions [M, 2] (x=col, y=row) on distinct lattice nodes.
+    def _spread_starts_graph(self, start_row: int, start_col: int, env_idx: int = 0) -> torch.Tensor:
+        """Return M start positions [M, 2] on lattice-adjacent FREE nodes.
 
-        Takes the M nearest graph nodes to the map start, sorted by distance.
-        Guaranteed distinct (nodes are unique), guaranteed valid (nodes = free cells).
-        Fully GPU — node_xy already on device, no CPU loop.
+        Strategy:
+          1. Anchor = nearest FREE lattice node to (start_row, start_col).
+          2. For agents 2..M: pick from anchor's 8 graph neighbors (one lattice hop away),
+             requiring (a) neighbor node FREE on GT, (b) segment from anchor to neighbor
+             contains no obstacle pixel (S=5 sample points).
+          3. If fewer than M-1 valid graph-neighbors of anchor: extend search to anchor's
+             2-hop ring. Final fallback: reuse anchor (will trigger collision-revert at
+             step 0 — better than placing agent on a wall).
+
+        Prevents the prior bug where two agents could be picked at lattice nodes close
+        in Euclidean distance but separated by a wall — those agents start on opposite
+        sides of an obstacle, never see each other, never share maps.
         """
-        start_pos = torch.tensor([float(start_col), float(start_row)], device=self.dev)
-        node_xy = self.graph.node_xy                                    # [N_max, 2]
-        dist = (node_xy - start_pos.unsqueeze(0)).norm(dim=-1)          # [N_max]
-        k = min(self.M, node_xy.shape[0])
-        _, sorted_idx = torch.topk(dist, k=k, largest=False)            # k nearest
-        out = torch.zeros(self.M, 2, dtype=torch.float32, device=self.dev)
-        for i in range(self.M):
-            out[i] = node_xy[sorted_idx[i % k]]                        # wraps if k < M
+        from env.graph_lattice import NBR_OFFSETS
+
+        dev = self.dev
+        H, W = self.H, self.W
+        LH, LW = self.graph.LH, self.graph.LW
+        NR = self.cfg.nr
+        gt = self.world.gt_torch[env_idx]                                # [H, W]
+        node_xy = self.graph.node_xy                                     # [N_max, 2]
+
+        # Anchor: nearest FREE lattice node to start.
+        start_pos = torch.tensor([float(start_col), float(start_row)], device=dev)
+        nx = node_xy[:, 0].long().clamp(0, W - 1)
+        ny = node_xy[:, 1].long().clamp(0, H - 1)
+        node_free = gt[ny, nx] == GT_FREE                                # [N_max]
+        dist = (node_xy - start_pos.unsqueeze(0)).norm(dim=-1)
+        dist_masked = torch.where(node_free, dist, torch.full_like(dist, float("inf")))
+        anchor_flat = int(dist_masked.argmin().item())
+
+        chosen: list[int] = [anchor_flat]
+
+        if self.M > 1:
+            anchor_li = anchor_flat // LW
+            anchor_lj = anchor_flat % LW
+            anchor_x = float(node_xy[anchor_flat, 0].item())
+            anchor_y = float(node_xy[anchor_flat, 1].item())
+
+            def segment_clear(nx_w: float, ny_w: float) -> bool:
+                S = 5
+                for s in range(1, S + 1):
+                    t = s / (S + 1.0)
+                    sx = int(round(anchor_x + t * (nx_w - anchor_x)))
+                    sy = int(round(anchor_y + t * (ny_w - anchor_y)))
+                    sx = max(0, min(W - 1, sx))
+                    sy = max(0, min(H - 1, sy))
+                    if int(gt[sy, sx].item()) != GT_FREE:
+                        return False
+                return True
+
+            def candidates_at_ring(ring: int) -> list[tuple[float, int]]:
+                """Lattice cells at Chebyshev distance == ring from anchor."""
+                out_list: list[tuple[float, int]] = []
+                for d_li in range(-ring, ring + 1):
+                    for d_lj in range(-ring, ring + 1):
+                        if max(abs(d_li), abs(d_lj)) != ring:
+                            continue
+                        cand_li = anchor_li + d_li
+                        cand_lj = anchor_lj + d_lj
+                        if not (0 <= cand_li < LH and 0 <= cand_lj < LW):
+                            continue
+                        flat = int(cand_li * LW + cand_lj)
+                        if not bool(node_free[flat].item()):
+                            continue
+                        cx = float(node_xy[flat, 0].item())
+                        cy = float(node_xy[flat, 1].item())
+                        if not segment_clear(cx, cy):
+                            continue
+                        out_list.append((float(dist[flat].item()), flat))
+                out_list.sort()
+                return out_list
+
+            # Ring 1: lattice-adjacent neighbors of anchor (the user-requested behavior).
+            cands = candidates_at_ring(1)
+            for _, flat in cands:
+                if len(chosen) >= self.M:
+                    break
+                if flat in chosen:
+                    continue
+                chosen.append(flat)
+            # Fallback: extend to ring 2, 3, ... until M reached or ring exhausts lattice.
+            ring = 2
+            while len(chosen) < self.M and ring <= max(LH, LW):
+                for _, flat in candidates_at_ring(ring):
+                    if len(chosen) >= self.M:
+                        break
+                    if flat in chosen:
+                        continue
+                    chosen.append(flat)
+                ring += 1
+            # Last-resort fallback: pad with anchor.
+            while len(chosen) < self.M:
+                chosen.append(anchor_flat)
+
+        out = torch.zeros(self.M, 2, dtype=torch.float32, device=dev)
+        for i, flat in enumerate(chosen):
+            out[i] = node_xy[flat]
         return out
 
     def _reset_all(self) -> None:
@@ -286,10 +392,13 @@ class Explorer:
         self.starts[idx_t]                            = starts_new
         self.visited_step[idx_t]                      = -1
         self.t[idx_t]                                 = 0
+        # Reset guidepost cache: cold-start BF on next obs refresh.
+        self._target_prev[idx_t]                      = -1
+        self._dist_prev[idx_t]                        = float("inf")
 
         for j_env, e in enumerate(idx):
             row0, col0 = int(starts_new[j_env, 0]), int(starts_new[j_env, 1])
-            agent_pos = self._spread_starts_graph(row0, col0)           # [M, 2] on GPU
+            agent_pos = self._spread_starts_graph(row0, col0, env_idx=e)  # [M, 2] on GPU
             self.pos[e] = agent_pos
             # All agents know all actual start positions (in comm range at reset)
             for ag in range(self.M):
@@ -302,25 +411,18 @@ class Explorer:
         self._refresh_obs()
 
     def _refresh_obs(self, comm_mask: torch.Tensor | None = None) -> None:
-        """Build per-agent obs from current per-agent occupancy + positions."""
-        node_xy_list            = []
-        node_valid_list         = []
-        node_feat_list          = []
-        edge_idx_list           = []
-        edge_valid_list         = []
-        curr_idx_list           = []
-        curr_nbr_list           = []
-        curr_nbr_valid_list     = []
-        utility_list            = []
-        guidepost_mask_list     = []
-        guidepost_target_list   = []
-        guidepost_path_xy_list  = []
-        guidepost_path_valid_list = []
-        guidepost_nbr_bias_list = []
-        guidepost_next_hop_list = []
+        """Build per-agent obs from current per-agent occupancy + positions.
 
+        Phase C: encoder consumes ego-centric subgraph windows, not the full lattice.
+        Pass 1: build global graph + guidepost per agent (still need global for utility
+                integral image, flood-fill reachability, target selection).
+        Pass 2: cross-agent feat[5] (teammate_pos) — writes to global node_feat.
+        Pass 3: extract local (2·n_hops + 3)² window per agent; this is what the model sees.
+        """
+        # ---- Pass 1: build global infos + warm-started target-rooted BF ----
+        infos: list[dict] = []
         for a in range(self.M):
-            occ_a      = self.world.occupancy_torch[:, a, :, :]  # [N, H, W]
+            occ_a      = self.world.occupancy_torch[:, a, :, :]
             frontier_a = compute_frontier(occ_a)
             info = self.graph.build(
                 occupancy=occ_a,
@@ -329,58 +431,97 @@ class Explorer:
                 visited_step=self.visited_step[:, a, :],
                 current_step=int(self.t.max().item()),
             )
-            self.graph.build_guidepost(info)
-            node_xy_list.append(info["node_xy"])
-            node_valid_list.append(info["node_valid"])
-            node_feat_list.append(info["node_feat"])
-            edge_idx_list.append(info["edge_idx"])
-            edge_valid_list.append(info["edge_valid"])
-            curr_idx_list.append(info["curr_idx"])
-            curr_nbr_list.append(info["curr_nbr"])
-            curr_nbr_valid_list.append(info["curr_nbr_valid"])
-            utility_list.append(info["utility"])
-            guidepost_mask_list.append(info["guidepost_mask"])
+            new_target = self.graph.select_target_no_bf(info["utility"], info["node_valid"])
+            target_same = (new_target == self._target_prev[:, a]).unsqueeze(-1)   # [N, 1]
+            dist_init = torch.where(
+                target_same.expand(-1, self.N_max),
+                self._dist_prev[:, a, :],
+                torch.full_like(self._dist_prev[:, a, :], float("inf")),
+            )
+            self.graph.build_guidepost_v2(info, target=new_target, dist_init=dist_init)
+            self._target_prev[:, a] = new_target
+            self._dist_prev[:, a, :] = info["guidepost_dist"]
+            infos.append(info)
+
+        # ---- Pass 2: cross-agent feat[5] on GLOBAL node_feat ----
+        # Mark the global node nearest to each teammate's last-known position. After
+        # local-window extraction, this survives if the marked node falls inside
+        # the agent's window; otherwise the teammate position is "lost" in this view.
+        if self.M > 1:
+            nx = self.graph.node_xy[:, 0].view(1, -1)         # [1, N_max]
+            ny = self.graph.node_xy[:, 1].view(1, -1)
+            arange_n = torch.arange(self.N, device=self.dev)
+            for a in range(self.M):
+                occ_a_feat = torch.zeros(
+                    (self.N, self.N_max), dtype=torch.float32, device=self.dev,
+                )
+                for b in range(self.M):
+                    if a == b:
+                        continue
+                    lkp = self.last_known_pos[:, a, b, :]      # [N, 2]
+                    dx  = nx - lkp[:, 0:1]
+                    dy  = ny - lkp[:, 1:2]
+                    nearest = (dx * dx + dy * dy).argmin(dim=-1)  # [N]
+                    occ_a_feat[arange_n, nearest] = 1.0
+                infos[a]["node_feat"][..., 5] = occ_a_feat
+
+        # ---- Pass 3: extract per-agent local window ----
+        node_xy_list = []
+        node_valid_list = []
+        node_feat_list = []
+        edge_idx_list = []
+        edge_valid_list = []
+        curr_idx_list = []
+        curr_nbr_list = []
+        curr_nbr_valid_list = []
+        utility_list = []
+        curr_nbr_global_list = []
+        local_to_global_list = []
+        guidepost_target_list = []
+        guidepost_target_xy_list = []
+        guidepost_path_xy_list = []
+        guidepost_path_valid_list = []
+        guidepost_nbr_bias_list = []
+        guidepost_next_hop_list = []
+
+        for a in range(self.M):
+            info = infos[a]
+            local = self.graph.extract_local_window(info)
+            node_xy_list.append(local["node_xy_local"])
+            node_valid_list.append(local["node_valid_local"])
+            node_feat_list.append(local["node_feat_local"])
+            edge_idx_list.append(local["edge_idx_local"])
+            edge_valid_list.append(local["edge_valid_local"])
+            curr_idx_list.append(local["curr_idx_local"])
+            curr_nbr_list.append(local["curr_nbr_local"])
+            curr_nbr_valid_list.append(local["curr_nbr_valid_local"])
+            utility_list.append(local["utility_local"])
+            curr_nbr_global_list.append(local["curr_nbr_global"])
+            local_to_global_list.append(local["local_to_global"])
             guidepost_target_list.append(info["guidepost_target"])
+            guidepost_target_xy_list.append(info["guidepost_target_xy"])
             guidepost_path_xy_list.append(info["guidepost_path_xy"])
             guidepost_path_valid_list.append(info["guidepost_path_valid"])
             guidepost_nbr_bias_list.append(info["guidepost_nbr_bias"])
             guidepost_next_hop_list.append(info["guidepost_next_hop"])
 
-        node_xy             = torch.stack(node_xy_list, dim=1)
-        node_valid          = torch.stack(node_valid_list, dim=1)
-        node_feat           = torch.stack(node_feat_list, dim=1)
-        edge_idx            = torch.stack(edge_idx_list, dim=1)
-        edge_valid          = torch.stack(edge_valid_list, dim=1)
-        curr_idx            = torch.stack(curr_idx_list, dim=1)
-        curr_nbr            = torch.stack(curr_nbr_list, dim=1)
-        curr_nbr_valid      = torch.stack(curr_nbr_valid_list, dim=1)
-        utility             = torch.stack(utility_list, dim=1)
-        guidepost_mask      = torch.stack(guidepost_mask_list, dim=1)
-        guidepost_target    = torch.stack(guidepost_target_list, dim=1)
-        guidepost_path_xy   = torch.stack(guidepost_path_xy_list, dim=1)
+        node_xy              = torch.stack(node_xy_list, dim=1)
+        node_valid           = torch.stack(node_valid_list, dim=1)
+        node_feat            = torch.stack(node_feat_list, dim=1)
+        edge_idx             = torch.stack(edge_idx_list, dim=1)
+        edge_valid           = torch.stack(edge_valid_list, dim=1)
+        curr_idx             = torch.stack(curr_idx_list, dim=1)
+        curr_nbr             = torch.stack(curr_nbr_list, dim=1)
+        curr_nbr_valid       = torch.stack(curr_nbr_valid_list, dim=1)
+        utility              = torch.stack(utility_list, dim=1)
+        curr_nbr_global      = torch.stack(curr_nbr_global_list, dim=1)
+        local_to_global      = torch.stack(local_to_global_list, dim=1)
+        guidepost_target     = torch.stack(guidepost_target_list, dim=1)
+        guidepost_target_xy  = torch.stack(guidepost_target_xy_list, dim=1)
+        guidepost_path_xy    = torch.stack(guidepost_path_xy_list, dim=1)
         guidepost_path_valid = torch.stack(guidepost_path_valid_list, dim=1)
-        guidepost_nbr_bias  = torch.stack(guidepost_nbr_bias_list, dim=1)
-        guidepost_next_hop  = torch.stack(guidepost_next_hop_list, dim=1)
-
-        # feat[5]: last-known position of teammate at nearest graph node.
-        # For M=1: stays zero (no teammates). For M>1: mark the node nearest
-        # to each agent's last-known position of each other agent.
-        if self.M > 1:
-            nx = self.graph.node_xy[:, 0].view(1, -1)  # [1, N_max]
-            ny = self.graph.node_xy[:, 1].view(1, -1)
-            occ_feat = torch.zeros(
-                (self.N, self.M, self.N_max), dtype=torch.float32, device=self.dev)
-            arange_n = torch.arange(self.N, device=self.dev)
-            for a in range(self.M):
-                for b in range(self.M):
-                    if a == b:
-                        continue
-                    lkp = self.last_known_pos[:, a, b, :]   # [N, 2]
-                    dx  = nx - lkp[:, 0:1]                  # [N, N_max]
-                    dy  = ny - lkp[:, 1:2]
-                    nearest = (dx * dx + dy * dy).argmin(dim=-1)  # [N]
-                    occ_feat[arange_n, a, nearest] = 1.0
-            node_feat[..., 5] = occ_feat
+        guidepost_nbr_bias   = torch.stack(guidepost_nbr_bias_list, dim=1)
+        guidepost_next_hop   = torch.stack(guidepost_next_hop_list, dim=1)
 
         self.curr_idx = curr_idx
         if comm_mask is None:
@@ -389,18 +530,20 @@ class Explorer:
             ).view(1, self.M, self.M).expand(self.N, -1, -1)
 
         self._last_obs = {
-            "node_xy":              node_xy,
-            "node_valid":           node_valid,
-            "node_feat":            node_feat,
-            "edge_idx":             edge_idx,
-            "edge_valid":           edge_valid,
-            "curr_idx":             curr_idx,
-            "curr_nbr":             curr_nbr,
+            "node_xy":              node_xy,            # LOCAL [N, M, W², 2]
+            "node_valid":           node_valid,         # LOCAL [N, M, W²]
+            "node_feat":            node_feat,          # LOCAL [N, M, W², F]
+            "edge_idx":             edge_idx,           # LOCAL [N, M, W², K]
+            "edge_valid":           edge_valid,         # LOCAL [N, M, W², K]
+            "curr_idx":             curr_idx,           # LOCAL [N, M] = constant window center
+            "curr_nbr":             curr_nbr,           # LOCAL [N, M, K]
             "curr_nbr_valid":       curr_nbr_valid,
             "action_mask":          curr_nbr_valid,
-            "utility":              utility,
-            "guidepost_mask":       guidepost_mask,
+            "utility":              utility,            # LOCAL [N, M, W²]
+            "curr_nbr_global":      curr_nbr_global,    # GLOBAL [N, M, K] — for env.step action decode
+            "local_to_global":      local_to_global,    # [N, M, W²] global flat idx (or -1) per local slot
             "guidepost_target":     guidepost_target,
+            "guidepost_target_xy":  guidepost_target_xy,    # GLOBAL world coords [N, M, 2]
             "guidepost_path_xy":    guidepost_path_xy,
             "guidepost_path_valid": guidepost_path_valid,
             "guidepost_nbr_bias":   guidepost_nbr_bias,

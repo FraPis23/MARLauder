@@ -26,7 +26,8 @@ class TrainCfg:
     rollout_len: int = 128
     d_hidden: int = 128
     n_heads: int = 4
-    n_layers: int = 2
+    n_hops: int = 2          # ego-centric encoder window radius; n_layers tied to this
+    n_layers: int = 2        # GAT layers; default tied to n_hops in make_env_model
     lr_actor: float = 3e-4
     lr_critic: float = 1e-3
     device: str = "cuda:0"
@@ -45,7 +46,10 @@ class TrainCfg:
 def _normalize_cfg(cfg: TrainCfg) -> None:
     cfg.env.n_envs = cfg.n_envs
     cfg.env.n_agents = cfg.n_agents
+    cfg.env.n_hops = cfg.n_hops
     cfg.env.max_episode_steps = max(cfg.env.max_episode_steps, cfg.rollout_len)
+    # Tie n_layers to n_hops so the GAT receptive field uses the full window.
+    cfg.n_layers = cfg.n_hops
 
 
 def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
@@ -173,8 +177,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
     milestones = {int(round(n_iters * p / 100.0)): p for p in ckpt_pct}
 
     print(f"[train] iters={n_iters}  steps/iter={steps_per_iter}  total≈{n_iters * steps_per_iter:,}")
-    t_start = time.time()
-    t_prev = t_start
+    total_train_time = 0.0      # cumulative collect+update time (eval-free)
     total_env_steps = 0
     for it in range(1, n_iters + 1):
         buf.h_actor_init.copy_(h_act.detach())
@@ -186,13 +189,15 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t_end = time.time()
+        # SPS measures only collect + update — milestone eval excluded.
+        iter_time = t_end - t_collect
+        total_train_time += iter_time
         total_env_steps += steps_per_iter
-        sps_iter = steps_per_iter / max(1e-6, t_end - t_prev)
-        sps_all = total_env_steps / max(1e-6, t_end - t_start)
-        coll_pct = 100.0 * (t_update - t_collect) / max(1e-6, t_end - t_collect)
+        sps_iter = steps_per_iter / max(1e-6, iter_time)
+        sps_all  = total_env_steps / max(1e-6, total_train_time)
+        coll_pct = 100.0 * (t_update - t_collect) / max(1e-6, iter_time)
         coll_sps = steps_per_iter / max(1e-6, t_update - t_collect)
-        upd_sps = steps_per_iter / max(1e-6, t_end - t_update)
-        t_prev = t_end
+        upd_sps  = steps_per_iter / max(1e-6, t_end - t_update)
         if it % log_every == 0:
             print(f"[it {it:4d}/{n_iters}] "
                   f"explored avg={explored_avg*100:5.1f}% end={explored_final*100:5.1f}%  "
