@@ -10,15 +10,18 @@ For deep architectural detail, see [DOCS.md](DOCS.md). For session-by-session de
 
 ## Features
 
-- GPU-resident simulation: Warp LiDAR + torch graph build + frontier detection + Bellman-Ford guidepost, all batched across N envs.
+- GPU-resident simulation: Warp LiDAR + torch graph build + frontier detection + Bellman-Ford on GPU, all batched across N envs.
 - Multi-agent (1..M) with intermittent communication: agents fuse occupancy maps when within `comm_range_px` AND with clear line of sight on ground truth.
-- Per-agent occupancy maps `[N, M, H, W]` stored flat for Warp 3-dim kernel compatibility, exposed as `team_occupancy()` (union) and per-agent views.
+- Per-agent occupancy maps `[N, M, H, W]` stored flat for Warp 3-dim kernel compatibility.
 - 8-neighbor regular lattice graph (NR=16 px → ~1200 nodes on 480×640), flood-fill reachability, collision-checked edges.
-- Masked GAT encoder (2 layers, d=128, 4 heads) → GRUCell actor → PointerHead over K=8 directions.
-- Centralized-training-decentralized-execution (CTDE) critic: shared encoder + per-agent `curr_emb` concatenation → joint state value V(s).
-- Bellman-Ford guidepost on GPU: shortest path with axial cost NR, diagonal cost NR·√2; feeds the policy as both a node feature and a logit-bias prior on the next neighbor.
-- MAPPO with GAE-λ, value normalization, AMP fp16, TBPTT (chunked encoder forward), torch.compile on encoder.
-- Per-agent side-by-side eval rendering: each panel shows that agent's own occupancy, frontier, graph, target, trail, and green comm-link line drawn whenever the pair is in range.
+- **Ego-centric GAT encoder** (configurable `n_hops` window) — restricts attention to a `(2·n_hops+3)²` window around curr.
+- **Strategic frontier-attention head** — per-agent MHA over top-K=16 global frontier candidates with BF-distance, teammate-distance, comm-gap, yield, and joint-distribution (`team_alt_score`) features. Gumbel-ST discrete pick. Replaces the previous hard `guidepost_nbr_bias` hijack.
+- **BF-from-curr + BF-from-teammate** for true wall-aware shortest-path candidate distances (warm-started). Plus a floored+learnable `path_bias` soft prior on action logits toward the BF first-hop of the strategic pick (floor keeps it from collapsing).
+- **Per-agent set-op reward** (v0.4): per-agent scan-delta, give/recv at rendezvous, overlap penalty (lattice set-op baselined at last meeting), revisit + proximity penalty. Per-agent GAE advantages, shared CTDE value baseline.
+- **Debug full-sharing flags** + **ramping curriculum** scaffold. fp16 NaN-guarded action logits.
+- Centralized-training-decentralized-execution (CTDE) critic.
+- MAPPO with GAE-λ (per-agent advantages with shared V baseline), value normalization, AMP fp16, TBPTT (chunked encoder forward), torch.compile on encoder.
+- Per-agent side-by-side eval rendering: each panel shows that agent's own occupancy, frontier, graph, **strategic target + correct BF path**, trail, and green comm-link line drawn whenever the pair is in range.
 
 ---
 
@@ -47,7 +50,7 @@ The container mounts the parent directory at `/workspace` so `MARLauder/` and ad
 PYTHONPATH=. python scripts/run_train.py \
     --split train/easy --total-steps 40000 \
     --n-envs 8 --n-agents 2 \
-    --rollout-len 64 --max-episode-steps 128 \
+    --rollout-len 64 --max-episode-steps 64 \
     --out /workspace/MARLauder/runs/smoke
 ```
 
@@ -55,20 +58,20 @@ Verifies the full pipeline boots, runs a few PPO updates, writes a checkpoint, a
 
 ### Full training run
 
-See [DOCS.md §6](DOCS.md) for the canonical command. Summary:
+See [DOCS.md §6](DOCS.md) for the canonical command. Set `--rollout-len ≥ --max-episode-steps` so episodes complete inside a rollout (populates `ep_end`). Summary:
 
 ```bash
 PYTHONPATH=. python scripts/run_train.py \
     --split train/easy \
     --total-steps 5_000_000 \
-    --n-envs 32 --n-agents 2 \
+    --n-envs 64 --n-agents 2 \
     --comm-range 120 \
-    --rollout-len 128 --max-episode-steps 512 \
+    --rollout-len 256 --max-episode-steps 256 \
     --minibatches 4 \
     --lr 3e-4 --ent-coef 0.01 \
+    --path-bias-floor 1.5 \
     --compile --eval-on-ckpt \
-    --seed 0 \
-    --out /workspace/MARLauder/runs/run_v03
+    --out /workspace/MARLauder/runs/run_v04
 ```
 
 ### Eval a checkpoint on N random maps
@@ -82,16 +85,23 @@ PYTHONPATH=. python scripts/eval_final.py \
 GIFs land next to the checkpoint as `eval_map00892.gif`, `eval_map04388.gif`, ...
 Each is a side-by-side panel per agent. Architecture is inferred from the checkpoint weights — no need to pass `--d-hidden`/`--n-heads`/`--n-layers`.
 
-### Eval one specific map with explicit architecture
+Pin specific maps via `--map-idx N [N ...]` (single or list, overrides `--n-maps`/`--seed`), e.g. `--map-idx 9580 1234`. Without `--map-idx`, indices are drawn from `--seed`.
+
+### Eval one specific map by index
 
 ```bash
 PYTHONPATH=. python scripts/run_eval.py \
-    --ckpt /workspace/MARLauder/runs/run_v03/final.pt \
-    --split test/complex --map-idx 7 \
+    --ckpt /workspace/MARLauder/runs/run_v04/final.pt \
+    --split train/easy --map-idx 9580 \
+    --n-agents 2 \
     --d-hidden 128 --n-heads 4 --n-layers 2 \
-    --steps 512 \
-    --out /workspace/MARLauder/runs/run_v03/eval_map7.gif
+    --steps 256 \
+    --out /workspace/MARLauder/runs/run_v04/eval_map9580.gif
 ```
+
+`--map-idx N` selects map at index `N` (0-indexed). Start positions placed via `_spread_starts_graph` (lattice-adjacent FREE nodes, BFS + segment-clear, same as training). Env cfg (`n_hops`, `top_k`, comm/force flags) is read from the checkpoint via `EnvCfg.from_ckpt_dict`. Add `--force-full-occupancy-sharing` / `--force-full-pos-sharing` to force persistent sharing at eval. Pass `--d-hidden`/`--n-heads`/`--n-layers` to match the trained network.
+
+The rendered amber target/path is the **strategic head's chosen frontier + its correct BF path** — the node the policy actually pursues.
 
 ---
 
@@ -137,27 +147,25 @@ MARLauder/
 A single iteration prints a dense one-liner:
 
 ```
-[load] split=train/easy  ngt=2451  H=480 W=640
-[train] iters=1220  steps/iter=4096  total≈4,997,120
-[it    1/1220] explored avg= 5.4% end= 9.3%  pg=-0.0123  v=0.7521  ent=2.063  kl=+0.0041  clip=8.3%  sps=178(178avg) coll=512 upd=240
-[it    2/1220] explored avg= 6.1% end=10.1%  pg=-0.0118  v=0.7204  ent=2.041  kl=+0.0045  clip=9.1%  sps=183(180avg) coll=510 upd=241
+[train] iters=152  steps/iter=16384  total≈2,490,368
+[it    1/152] ep_end=  9.3%(ended= 64)  pg=-0.0123  v=0.7521  ent=2.063  kl=+0.0041  clip=8.3%  sps=540(540avg) coll=687 upd=2514
+[it    2/152] ep_end= 11.1%(ended= 64)  pg=-0.0118  v=0.7204  ent=2.041  kl=+0.0045  clip=9.1%  sps=560(550avg) coll=690 upd=2520
 ...
-[ckpt] /workspace/MARLauder/runs/run_v03/ckpt_025.pt
-[eval] /workspace/MARLauder/runs/run_v03/eval_ckpt_025_m0.gif  map=12  final_explored=42.1%  frames=287
-[eval] /workspace/MARLauder/runs/run_v03/eval_ckpt_025_m1.gif  map=84  final_explored=39.7%  frames=265
+[ckpt] /workspace/MARLauder/runs/run_v04/ckpt_025.pt
+[eval] /workspace/MARLauder/runs/run_v04/eval_ckpt_025_m0.gif  map=12  final_explored=42.1%  frames=256
 ...
-[done] /workspace/MARLauder/runs/run_v03/final.pt
+[done] /workspace/MARLauder/runs/run_v04/final.pt
 ```
 
 Field meanings:
 
 | Field | What it means |
 |---|---|
-| `explored avg` / `end` | Mean explored fraction during the rollout and at the final step. Watch this grow with iters. |
+| `ep_end` | Mean explored fraction at the terminal step of all episodes that ENDED this iter. `ended=K` = how many episodes that was. `n/a` until ≥1 completes — set `--rollout-len ≥ --max-episode-steps` so episodes finish inside a rollout. |
 | `pg` | PPO policy gradient loss. Small negative (-0.005 to -0.02) is healthy. |
-| `v` | Value loss. Drops then plateaus around 0.3–0.8. |
-| `ent` | Entropy of the action distribution. Should decay smoothly, not collapse. |
-| `kl` | KL divergence between old and new policy. Stays < 0.02 with `clip-eps=0.2`. |
+| `v` | Value loss. Drops then plateaus. |
+| `ent` | Action-distribution entropy. Should decay smoothly, not collapse. |
+| `kl` | KL between old/new policy. Stays < 0.02 with `clip-eps=0.2`. |
 | `clip` | Fraction of samples hit by the PPO clip. Healthy: 5–20%. |
 | `sps` | Total env steps per wall-clock second (current iter / running average). |
 | `coll` / `upd` | Per-phase sps — rollout collection vs PPO update. |
@@ -176,32 +184,49 @@ The most-used `run_train.py` flags:
 |---|---|---|
 | `--split` | `train/easy` | Map split: `train/easy`, `train/difficult`, `test/{complex,corridor,hybrid}` |
 | `--out` | `runs/run_default` | Output directory for checkpoints + eval GIFs |
-| `--seed` | `0` | RNG seed for split sampling, policy initialization, episode randomness |
+| `--seed` | `-1` | torch RNG (actions, init). Maps use independent fresh-entropy RNG each run |
 | `--total-steps` | `5_000_000` | Total environment transitions (`n_envs × rollout_len × iters`) |
 | `--n-envs` | `16` | Parallel envs. Must be divisible by `--minibatches` |
 | `--n-agents` | `1` | Number of cooperative agents per env |
 | `--comm-range` | `120.0` | Communication range in pixels (0 = never communicate) |
+| `--rollout-len` | `128` | Steps per PPO update. Set ≥ `--max-episode-steps` to populate `ep_end` |
 | `--max-episode-steps` | `512` | Episode truncation |
+| `--n-hops` | `2` | Ego-centric encoder window radius |
+| `--top-k` | `16` | Strategic-head frontier candidates per agent |
+| `--path-bias-floor` | `1.5` | Floor on target-following bias |
+| `--yield-scale` / `--overlap-pen` / `--proximity-pen` | `3.0` / `3.0` / `0.005` | Anti-chase knobs |
+| `--force-full-pos-sharing` / `--force-full-occupancy-sharing` | off | Debug: perfect teammate positions / synced maps |
+| `--curriculum` | off | Ramp easy→difficult mix (needs same-canvas splits) |
 | `--compile` | off | `torch.compile` the encoder (~2× update speedup) |
-| `--eval-on-ckpt` | off | Emit 2 eval GIFs on random maps at each milestone |
+| `--eval-on-ckpt` | off | Emit 2 eval GIFs at each milestone |
 
-Full parameter reference: [DOCS.md §5](DOCS.md). For knobs not exposed on the CLI (lattice spacing, GAT width, PPO clip, etc.), see [DOCS.md §11](DOCS.md).
+Full parameter reference + reward weights: [DOCS.md §5](DOCS.md). Hardcoded knobs: [DOCS.md §11](DOCS.md).
 
-`eval_final.py` reads architecture (n_agents, d_hidden, n_heads, n_layers) directly from the checkpoint state dict. `--seed` defaults to system entropy (different maps each run).
+`eval_final.py` infers architecture from the checkpoint weights and reads env cfg from the checkpoint. `run_eval.py` / `eval_final.py` `--seed` defaults to system entropy (different maps each run).
 
 ---
 
-## Reward
+## Reward (v0.4)
+
+Per-agent set-op reward, lattice-level, baselined at last comm event between each pair:
 
 ```
-reward_team = max(0, Δ(union FREE) / total_free)         # discovery delta — shared across agents
-            + 1{terminated} · completion_bonus            # one-shot at episode end (default +10.0)
-            − step_penalty_coef / max_episode_steps       # per-step time pressure (default 0.1 / max_steps)
+reward[a] = α_scan · scan_self_delta[a]      # cells I LiDAR-scanned this step (node level)
+          + β     · team_delta                # Δunion FREE (cooperation anchor)
+          + ζ_give · give[a]                  # NEW cells I bring to teammate at comm
+          + ζ_recv · recv[a]                  # NEW cells I receive at comm
+          − η_lap  · overlap[a]               # we BOTH scanned same area since last meeting
+          − γ      · revisit_pen[a]           # node visited within last W=8 steps
+          − ε_prox · proximity_pen[a]         # teammate within sensor_range AND visible
+          + 1{terminated} · completion_bonus
+          − step_penalty
 ```
 
-The discovery term rewards expansion of the team's collective known-free region. The completion bonus fires when `explored_rate ≥ done_explored_thresh` (default 0.99). The step penalty creates time pressure: with defaults at `max_episode_steps=512`, each step costs ~0.000195, totalling 0.1 over a full unterminated episode.
+Defaults: `α_scan=1.0, β=0.3, ζ_give=1.5, ζ_recv=0.5, η_lap=3.0, γ=0.02, ε_prox=0.005, completion_bonus=10.0, step_penalty_coef=0.1`.
 
-All M agents receive the same scalar reward (team reward).
+Each agent gets its **own** scalar reward. GAE computes per-agent advantages with a shared CTDE value baseline. Anti-chase comes from `overlap`/`proximity` penalties plus the strategic head's `cand_own_minus_team` (yield) and `team_alt_score` (joint distribution) features — all smooth, no hard thresholds. A floored+learnable `path_bias` keeps the actor following its chosen target so grid-utility doesn't dominate.
+
+Full reward derivation + decentralization properties: [DOCS.md §4](DOCS.md).
 
 ---
 
@@ -214,7 +239,7 @@ Two agents `i` and `j` can communicate at step `t` if both:
 
 When the condition holds, on the same step:
 
-- Per-agent occupancy log-odds maps are fused via elementwise `max(lo_i, lo_j)`. Idempotent across consecutive steps in range (no double-counting).
+- Per-agent occupancy log-odds maps are fused via elementwise **max-magnitude** (`where(|lo_i|≥|lo_j|, lo_i, lo_j)`) — preserves OBSTACLE evidence (negative lo) that a plain `max` would drop. Idempotent across consecutive steps in range.
 - `last_known_pos[i][j]` is overwritten with the actual current position of agent `j` (and vice versa).
 
 When out of range, agents drift with their own partial maps. The `last_known_pos` entries become stale until the next rendezvous. Feature `node_feat[..., 5]` exposes a one-hot at the lattice node nearest each known teammate position.
@@ -227,10 +252,12 @@ Agent–agent collision is enforced at the env level: if a planned sub-step move
 
 ```
 GT map → Warp LiDAR per agent → per-agent log-odds → torch occupancy categorical
-         → conv2d frontier → graph_lattice.build (nodes + edges + utility integral image)
-         → graph_lattice.build_guidepost (Bellman-Ford from curr to argmax-utility target)
-         → obs dict [N, M, ...] → encoder (shared GAT) → actor GRU + PointerHead → action
-                                                       └→ CTDE critic GRU → V(s)
+   → conv2d frontier → graph_lattice.build (nodes + edges + utility integral image)
+   → BF-from-curr + BF-from-teammate → extract_topk_candidates (K=16, wall-aware dist)
+   → obs dict [N, M, ...]
+   → ego-centric GAT encoder → StrategicHead (Gumbel-ST target pick)
+   → actor GRU + PointerHead (+path_bias toward target's BF first-hop) → action
+                                                  └→ CTDE critic GRU → V(s)
 ```
 
 Full pipeline and shapes: [DOCS.md §9](DOCS.md).
@@ -243,10 +270,10 @@ Full pipeline and shapes: [DOCS.md §9](DOCS.md).
 |---|---|---|
 | v0.1 | Single-agent baseline (Warp LiDAR + lattice graph + GAT + MAPPO) | ✓ |
 | v0.2 | Terminology cleanup, Bellman-Ford guidepost, diagonal cost, MAPPO speedup | ✓ |
-| v0.3 | Multi-agent intermittent communication, per-agent maps, per-agent eval render | ✓ (current) |
-| v0.4 | Target diversification, reward shaping, ego-centric subgraph | In progress |
-| v0.5 | Curriculum train/easy → train/difficult | Planned |
-| v0.6 | Eval suite: per-split curves, TB logger, milestone GIF auto-generation | Planned |
-| v0.7 | ToM teammate-belief module (probabilistic teammate-state encoder) | Planned |
+| v0.3 | Multi-agent intermittent communication, per-agent maps, per-agent eval render | ✓ |
+| v0.4 | Strategic frontier-attention head (Gumbel-ST), ego-centric encoder, BF-from-curr + BF-from-teammate cand ranking, joint-distribution feature, floored path-bias, per-agent set-op reward, anti-chase signals, debug full-sharing flags, curriculum scaffold | ✓ (current) |
+| v0.5 | Curriculum train/easy → train/difficult (scaffold landed; blocked on differing canvas sizes) | Partial |
+| v0.6 | Eval suite: per-split curves, TB logger, voluntary-rendezvous reward | Planned |
+| v0.7 | ToM teammate-belief module (probabilistic teammate-state encoder, replaces point lkp in cand features) | Planned |
 
 v0.8 (hierarchical L2 graph) explicitly out of scope for this rewrite.

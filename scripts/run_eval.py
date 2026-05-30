@@ -35,37 +35,42 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--draw-edges", action="store_true", default=True)
     ap.add_argument("--deterministic", action="store_true", default=True)
+    ap.add_argument("--force-full-occupancy-sharing", action="store_true",
+                    help="I.2: force persistent map fusion at eval (override ckpt)")
+    ap.add_argument("--force-full-pos-sharing", action="store_true",
+                    help="I.2: force persistent teammate-pos awareness at eval (override ckpt)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, default=Path("/workspace/MARLauder/runs/eval.gif"))
     args = ap.parse_args()
 
+    # Peek at ckpt to recover FULL env cfg (n_hops, top_k, force flags, ...).
+    ckpt_peek = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    cfg_peek = ckpt_peek.get("cfg", {})
+    env_peek = cfg_peek.get("env", {}) if isinstance(cfg_peek, dict) else {}
+
+    # I.2 — CLI overrides let you force sharing at eval even if ckpt was trained without.
+    overrides = dict(n_envs=1, n_agents=args.n_agents, max_episode_steps=args.steps + 1)
+    if args.force_full_occupancy_sharing:
+        overrides["force_full_occupancy_sharing"] = True
+    if args.force_full_pos_sharing:
+        overrides["force_full_pos_sharing"] = True
+
     split = load_split(args.split, device=args.device)
-    env_cfg = EnvCfg(n_envs=1, n_agents=args.n_agents, max_episode_steps=args.steps + 1)
+    env_cfg = EnvCfg.from_ckpt_dict(env_peek, **overrides)
     env = Explorer(split, env_cfg, seed=int(args.map_idx))
-    # Force the fixed map idx.
-    gt_new, starts_new, fc_new = sample_batch(split, 1, indices=np.array([args.map_idx]),
-                                              seed=0, device=args.device)
-    env.world.gt_torch.copy_(gt_new)
-    env.world.occupancy_torch.zero_()
-    env.world.occupancy_logodds_torch.zero_()
-    env.starts.copy_(starts_new)
-    env.free_total.copy_(fc_new.float())
-    env.visited_step.fill_(-1)
-    env.t.zero_()
-    env.pos[:, :, 0] = float(starts_new[0, 1])
-    env.pos[:, :, 1] = float(starts_new[0, 0])
-    env.world.set_positions(env.pos)
-    env.world.scan()
-    env.last_union.copy_((env.world.occupancy_torch == 1).view(1, -1).float().sum(dim=-1))
-    env._refresh_obs()
+    # G.1 — full reset for specific map. Avoids stale BF cache / strategic features.
+    env.reload_map(env_idx=0, map_idx=int(args.map_idx))
 
     model = MarlActorCritic(n_agents=args.n_agents, d=args.d_hidden,
                             n_heads=args.n_heads, n_layers=args.n_layers).to(args.device)
-    ckpt = torch.load(args.ckpt, map_location=args.device, weights_only=False)
-    sd = ckpt["model"]
+    ckpt = ckpt_peek  # already loaded above
+    sd = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in ckpt["model"].items()}
     # Strip torch.compile prefix if present.
     sd = {k.replace("encoder._orig_mod.", "encoder."): v for k, v in sd.items()}
-    model.load_state_dict(sd)
+    # I.3 — old checkpoints store `path_bias`; new model uses `path_bias_learn`. Remap + tolerant.
+    if "path_bias" in sd and "path_bias_learn" not in sd:
+        sd["path_bias_learn"] = sd.pop("path_bias")
+    model.load_state_dict(sd, strict=False)
     model.eval()
     print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}")
 

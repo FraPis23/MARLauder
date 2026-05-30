@@ -26,6 +26,8 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=512)
     ap.add_argument("--seed", type=int, default=None,
                     help="Seed for map sampling (default: random each run)")
+    ap.add_argument("--map-idx", type=int, nargs="+", default=None,
+                    help="Specific map indices (overrides --n-maps / --seed)")
     ap.add_argument("--out", type=Path, default=None, help="Dir for GIFs (default: ckpt dir)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -50,7 +52,10 @@ def main() -> None:
     print(f"       n_agents={n_agents}  d={d_hidden}  heads={n_heads}  layers={n_layers}")
 
     model = MarlActorCritic(n_agents=n_agents, d=d_hidden, n_heads=n_heads, n_layers=n_layers).to(args.device)
-    model.load_state_dict(sd)
+    # I.3 — remap legacy path_bias → path_bias_learn; tolerant load.
+    if "path_bias" in sd and "path_bias_learn" not in sd:
+        sd["path_bias_learn"] = sd.pop("path_bias")
+    model.load_state_dict(sd, strict=False)
     model.eval()
 
     import imageio.v2 as imageio
@@ -58,42 +63,23 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     split = load_split(args.split, device=args.device)
-    rng = np.random.default_rng(args.seed)
-    map_indices = rng.integers(0, split.n, size=args.n_maps).tolist()
+    if args.map_idx is not None:
+        map_indices = list(args.map_idx)
+    else:
+        rng = np.random.default_rng(args.seed)
+        map_indices = rng.integers(0, split.n, size=args.n_maps).tolist()
 
     explored_list: list[float] = []
     for map_i, map_idx in enumerate(map_indices):
         print(f"\n[{map_i+1}/{args.n_maps}] map={map_idx}...", end=" ", flush=True)
 
-        # Read env knobs from saved cfg so eval matches training shape.
+        # I.2 — read FULL env cfg from ckpt (force flags, top_k, n_hops, ...) so eval mirrors training.
         env_dict = cfg_dict.get("env", {}) if isinstance(cfg_dict, dict) else {}
-        n_hops_ckpt = env_dict.get("n_hops", 2)
-        env_cfg = EnvCfg(n_envs=1, n_agents=n_agents,
-                         max_episode_steps=args.steps, n_hops=n_hops_ckpt)
+        env_cfg = EnvCfg.from_ckpt_dict(env_dict, n_envs=1, n_agents=n_agents,
+                                        max_episode_steps=args.steps)
         env = Explorer(split, env_cfg, seed=map_idx)
-
-        # Load specific map
-        gt_new, starts_new, fc_new = sample_batch(
-            split, 1, indices=np.array([map_idx]), seed=0, device=args.device,
-        )
-        env.world.gt_torch[0] = gt_new[0]
-        env.world.occupancy_torch[0] = 0
-        env.world.occupancy_logodds_torch[0] = 0.0
-        env.starts[0] = starts_new[0]
-        env.free_total[0] = fc_new[0]
-        env.visited_step[0] = -1
-        env.t[0] = 0
-
-        row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
-        agent_pos = env._spread_starts_graph(row0, col0)
-        env.pos[0] = agent_pos
-        for ag in range(n_agents):
-            env.last_known_pos[0, :, ag] = agent_pos[ag]
-
-        env.world.set_positions(env.pos)
-        env.world.scan()
-        env.last_union[0] = (env.world.occupancy_torch[0] == 1).any(dim=0).view(-1).float().sum()
-        env._refresh_obs()
+        # G.1 — full reset for specific map. Eliminates stale BF cache + reward baselines.
+        env.reload_map(env_idx=0, map_idx=int(map_idx))
 
         # Run eval
         rollout = EvalRollout(env, model, EvalCfg(max_steps=args.steps, deterministic=True,

@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from env.explorer import EnvCfg, Explorer
-from env.maps import load_split
+from env.maps import MultiSplit, load_split
 from models.actor_critic import MarlActorCritic
 from models.value_normalizer import ValueNormalizer
 from train.buffer import Rollout
@@ -28,6 +28,7 @@ class TrainCfg:
     n_heads: int = 4
     n_hops: int = 2          # ego-centric encoder window radius; n_layers tied to this
     n_layers: int = 2        # GAT layers; default tied to n_hops in make_env_model
+    path_bias_floor: float = 1.5   # I.3 — fixed floor on target-following bias (actor logits)
     lr_actor: float = 3e-4
     lr_critic: float = 1e-3
     device: str = "cuda:0"
@@ -41,6 +42,11 @@ class TrainCfg:
     eval_n_maps: int = 2            # GIFs per milestone
     env: EnvCfg = field(default_factory=EnvCfg)
     ppo: MAPPOCfg = field(default_factory=MAPPOCfg)
+    # H.5 — curriculum: ramp from easy → easy+difficult mix. When True, train_split uses
+    # MultiSplit({easy, difficult}, weights). Weights updated per iter:
+    #   0–30%: (1.0, 0.0).  30–60%: (0.7, 0.3).  60–100%: (0.5, 0.5).
+    curriculum: bool = False
+    curriculum_splits: tuple = ("train/easy", "train/difficult")
 
 
 def _normalize_cfg(cfg: TrainCfg) -> None:
@@ -52,12 +58,28 @@ def _normalize_cfg(cfg: TrainCfg) -> None:
     cfg.n_layers = cfg.n_hops
 
 
+def _curriculum_weights(progress: float) -> list[float]:
+    """H.5 — Ramp easy/difficult mix from 100% easy to 50/50 over training."""
+    if progress < 0.3:
+        return [1.0, 0.0]
+    if progress < 0.6:
+        return [0.7, 0.3]
+    return [0.5, 0.5]
+
+
 def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
     _normalize_cfg(cfg)
-    split = load_split(cfg.split, device=cfg.device)
-    env = Explorer(split, cfg.env, seed=cfg.seed)
+    if cfg.curriculum:
+        splits = [load_split(name, device=cfg.device) for name in cfg.curriculum_splits]
+        ms = MultiSplit(splits, weights=_curriculum_weights(0.0))
+        env = Explorer(ms, cfg.env, seed=cfg.seed)
+        print(f"[curriculum] enabled: {cfg.curriculum_splits} initial weights={ms.weights}")
+    else:
+        split = load_split(cfg.split, device=cfg.device)
+        env = Explorer(split, cfg.env, seed=cfg.seed)
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
-                            n_heads=cfg.n_heads, n_layers=cfg.n_layers).to(cfg.device)
+                            n_heads=cfg.n_heads, n_layers=cfg.n_layers,
+                            path_bias_floor=cfg.path_bias_floor).to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead", dynamic=False)
@@ -68,9 +90,15 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
 
 
 def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, h_crit, vnorm: ValueNormalizer) -> tuple:
+    """Collect a T-step rollout. Returns (h_act, h_crit, ep_end_mean, ep_end_n).
+
+    H.1 — ep_end_mean = mean explored_rate at terminal step of each episode that ENDED
+    during this rollout. If no episode ends (rollout_len < max_episode_steps and no early
+    99%-explored termination), returns NaN. Configure --rollout-len ≥ max-episode-steps
+    to ensure completions.
+    """
     obs = env.obs
-    explored_acc = 0.0
-    explored_final = 0.0
+    ep_end_explored: list[float] = []
     for t in range(buf.T):
         with torch.no_grad():
             out = model.act(obs, h_act, h_crit, deterministic=False)
@@ -79,16 +107,15 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         v_norm = out["value"]
         value = vnorm.denormalize(v_norm)
         obs_next, reward, done, info = env.step(action)
-        buf.store(t, obs, action, logp, value, reward, done)
+        buf.store(t, obs, action, logp, value, reward, done, out["target_choice"])
         er = info["explored_rate"]
-        explored_acc += float(er.mean().item())
-        # peak per-env (env auto-resets on done — capture the value at done==True step,
-        # otherwise the running mean of the final step).
-        explored_final = float(er.mean().item())
-        # Update hidden states; zero where done at this step.
+        # Capture explored_rate at end-of-episode moments BEFORE auto-reset.
+        if bool(done.any().item()):
+            done_idx = done.nonzero(as_tuple=True)[0]
+            for e_done in done_idx.tolist():
+                ep_end_explored.append(float(er[e_done].item()))
         h_act = out["hidden_actor"]
         h_crit = out["hidden_critic"]
-        # done is recorded at step t — for next step's hidden, mask.
         nonterm = (~done).float()
         h_act = h_act * nonterm.view(-1, 1, 1)
         h_crit = h_crit * nonterm.view(-1, 1)
@@ -98,7 +125,8 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         out = model.act(obs, h_act, h_crit, deterministic=True)
         v_last = vnorm.denormalize(out["value"])
     buf.last_value.copy_(v_last)
-    return h_act, h_crit, explored_acc / buf.T, explored_final
+    ep_end_mean = sum(ep_end_explored) / len(ep_end_explored) if ep_end_explored else float("nan")
+    return h_act, h_crit, ep_end_mean, len(ep_end_explored)
 
 
 def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx: int) -> None:
@@ -111,34 +139,16 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
     from env.maps import load_split as _load
 
     split = _load(cfg.eval_split, device=cfg.device)
-    env_cfg = _EnvCfg(
+    # I.2 — mirror the FULL training env cfg (force flags, top_k, n_hops, ...) so the
+    # eval render reflects the same comm/sharing behavior used in training.
+    env_cfg = _EnvCfg.from_ckpt_dict(
+        cfg.env.__dict__,
         n_envs=1, n_agents=cfg.n_agents,
-        nr=cfg.env.nr, sensor_range_px=cfg.env.sensor_range_px,
-        comm_range_px=cfg.env.comm_range_px,
         max_episode_steps=cfg.eval_steps + 1,
     )
     env = _Explorer(split, env_cfg, seed=map_idx)
-    gt_new, starts_new, fc_new = sample_batch(
-        split, 1, indices=np.array([map_idx]), seed=0, device=cfg.device,
-    )
-    # Load specific map and reset properly using _spread_starts_graph
-    # so multi-agent starts are on distinct nodes (not same pixel).
-    env.world.gt_torch.copy_(gt_new)
-    env.world.occupancy_torch.zero_()
-    env.world.occupancy_logodds_torch.zero_()
-    env.starts.copy_(starts_new)
-    env.free_total.copy_(fc_new.float())
-    env.visited_step.fill_(-1)
-    env.t.zero_()
-    row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
-    agent_pos = env._spread_starts_graph(row0, col0)                    # [M, 2] on GPU
-    env.pos[0] = agent_pos
-    for ag in range(env.M):
-        env.last_known_pos[0, :, ag] = agent_pos[ag]
-    env.world.set_positions(env.pos)
-    env.world.scan()
-    env.last_union.copy_((env.world.occupancy_torch == 1).any(dim=1).view(1, -1).float().sum(dim=-1))
-    env._refresh_obs()
+    # Full reset for the specific map (clears all stale caches; correct adjacent spawn).
+    env.reload_map(env_idx=0, map_idx=int(map_idx))
 
     was_training = model.training
     model.eval()
@@ -158,7 +168,8 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
     cfg.out_dir = Path(cfg.out_dir)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(cfg.seed)
-    eval_rng = np.random.default_rng(cfg.seed + 99)
+    # Eval RNG always fresh entropy → eval-on-ckpt maps random each run, independent of cfg.seed.
+    eval_rng = np.random.default_rng()
     if torch.cuda.is_available():
         # TF32 fastpath for f32 matmuls (Ampere+); inductor warning is silenced by this.
         torch.set_float32_matmul_precision("high")
@@ -180,10 +191,16 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
     total_train_time = 0.0      # cumulative collect+update time (eval-free)
     total_env_steps = 0
     for it in range(1, n_iters + 1):
+        # H.5 — update curriculum weights each iter.
+        if cfg.curriculum and hasattr(env.split, "set_weights"):
+            new_w = _curriculum_weights(it / max(1, n_iters))
+            if new_w != env.split.weights:
+                env.split.set_weights(new_w)
+                print(f"[curriculum] iter={it} weights={new_w}")
         buf.h_actor_init.copy_(h_act.detach())
         buf.h_critic_init.copy_(h_crit.detach())
         t_collect = time.time()
-        h_act, h_crit, explored_avg, explored_final = collect_rollout(env, model, buf, h_act, h_crit, vnorm)
+        h_act, h_crit, ep_end_mean, ep_end_n = collect_rollout(env, model, buf, h_act, h_crit, vnorm)
         t_update = time.time()
         stats = ppo_update(model, optimizer, vnorm, buf, cfg.ppo, cfg.device)
         if torch.cuda.is_available():
@@ -199,8 +216,11 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
         coll_sps = steps_per_iter / max(1e-6, t_update - t_collect)
         upd_sps  = steps_per_iter / max(1e-6, t_end - t_update)
         if it % log_every == 0:
+            # H.1 — ep_end is the only exploration metric: mean explored_rate at terminal
+            # step over all episodes that ENDED during this rollout. `ended` = # episodes.
+            ep_str = f"ep_end={ep_end_mean*100:5.1f}%(ended={ep_end_n:3d})" if ep_end_n > 0 else "ep_end=   n/a       "
             print(f"[it {it:4d}/{n_iters}] "
-                  f"explored avg={explored_avg*100:5.1f}% end={explored_final*100:5.1f}%  "
+                  f"{ep_str}  "
                   f"pg={stats['pg_loss']:+.4f}  v={stats['v_loss']:.4f}  "
                   f"ent={stats['entropy']:.3f}  kl={stats['kl']:+.4f}  "
                   f"clip={stats['clipfrac']*100:.1f}%  "
@@ -228,10 +248,13 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                 for gi, midx in enumerate(map_indices):
                     gif_path = cfg.out_dir / f"eval_ckpt_{pct:03d}_m{gi}.gif"
                     _emit_eval_gif(model, cfg, gif_path, int(midx))
-    # final
+    # final — include cfg so eval can mirror the env config (I.2).
     torch.save({
         "iter": n_iters,
         "model": model.state_dict(),
         "vnorm": vnorm.state_dict(),
+        "cfg": cfg.__dict__ | {"env": cfg.env.__dict__, "ppo": cfg.ppo.__dict__,
+                               "out_dir": str(cfg.out_dir),
+                               "n_agents": cfg.n_agents},
     }, cfg.out_dir / "final.pt")
     print(f"[done] {cfg.out_dir/'final.pt'}")

@@ -551,6 +551,62 @@ class GraphLattice:
         return k_analytic, edge_clear
 
     @torch.no_grad()
+    def extract_topk_candidates(
+        self,
+        utility: torch.Tensor,        # [N, N_max]
+        node_valid: torch.Tensor,     # [N, N_max]
+        curr_xy: torch.Tensor,        # [N, 2] world coords of agent
+        K: int = 16,
+        bf_dist: torch.Tensor | None = None,   # [N, N_max] BF dist from curr; replaces euclid
+    ) -> dict[str, torch.Tensor]:
+        """Phase A v2 / A1: top-K frontier candidates per env, ranked by valid utility.
+
+        Returns dict with:
+            cand_idx       long  [N, K]      flat global node idx; -1 where slot has no valid candidate
+            cand_xy        f32   [N, K, 2]   world coords (zeros where invalid)
+            cand_utility   f32   [N, K]      raw utility values (0 where invalid)
+            cand_valid     bool  [N, K]      True where cand_idx[k] >= 0
+            cand_rel_xy    f32   [N, K, 2]   (cand_xy − curr_xy) (zeros where invalid)
+            cand_euclid    f32   [N, K]      ‖cand_xy − curr_xy‖ (0 where invalid)
+
+        Reachability is already encoded in node_valid (flood-fill from curr through
+        known-FREE space). Selected targets are guaranteed reachable; wall-bumping
+        at the strategic level is impossible by construction.
+        """
+        N, N_max = utility.shape
+        # Mask unreachable nodes with sentinel below 0 so they never enter top-K.
+        SENTINEL = float("-inf")
+        masked = torch.where(node_valid, utility, torch.full_like(utility, SENTINEL))
+        topk_vals, topk_idx = masked.topk(K, dim=-1)                              # [N, K]
+        valid = torch.isfinite(topk_vals) & (topk_vals > 0.0)                     # frontier must have utility>0
+        # Use 0-fill (not -1) for the gather; rely on valid mask downstream.
+        safe_idx = torch.where(valid, topk_idx, torch.zeros_like(topk_idx))       # [N, K]
+        xy = self.node_xy[safe_idx]                                               # [N, K, 2]
+        xy = xy * valid.unsqueeze(-1).float()                                     # zero out invalid slots
+        cand_idx_out = torch.where(valid, topk_idx, torch.full_like(topk_idx, -1))
+        cand_util = torch.where(valid, topk_vals, torch.zeros_like(topk_vals))
+        rel = xy - curr_xy.unsqueeze(1)                                           # [N, K, 2]
+        rel = rel * valid.unsqueeze(-1).float()
+        if bf_dist is not None:
+            # Option A: replace straight-line euclid with BF shortest-path distance
+            # through known-FREE space. Wall-aware. Same magnitude as euclid in open
+            # space, much larger in maze around obstacles.
+            d_per_cand = torch.gather(bf_dist, dim=1, index=safe_idx)              # [N, K]
+            # Unreachable nodes have +inf; clamp to a large finite value for stability.
+            d_per_cand = torch.where(torch.isfinite(d_per_cand), d_per_cand,
+                                      torch.full_like(d_per_cand, 1.0e6))
+            euclid = d_per_cand * valid.float()                                    # [N, K]
+        else:
+            euclid = rel.norm(dim=-1) * valid.float()                              # [N, K]
+        return {
+            "cand_idx":     cand_idx_out,
+            "cand_xy":      xy,
+            "cand_utility": cand_util,
+            "cand_valid":   valid,
+            "cand_rel_xy":  rel,
+            "cand_euclid":  euclid,
+        }
+
     def select_target_no_bf(
         self,
         utility: torch.Tensor,        # [N, N_max]

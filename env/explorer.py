@@ -27,7 +27,7 @@ reset(indices): reload map, reset all per-agent state.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 import torch
@@ -60,6 +60,47 @@ class EnvCfg:
     step_penalty_coef: float = 0.1     # total step penalty over episode = coef (scaled by 1/max_steps)
     completion_bonus: float = 10.0     # reward given at the terminal step when explored >= threshold
     n_hops: int = 2                     # ego-centric encoder window radius (window_side = 2·n_hops + 3)
+    # Phase D — per-agent reward shaping (lattice-level set ops, baselined at last comm).
+    scan_reward_weight: float = 1.0         # α_scan: cells I LiDAR-scanned this step
+    team_reward_weight: float = 0.3         # β: shared Δunion (cooperation anchor)
+    give_bonus_coef: float = 1.5            # ζ_give: NEW cells I bring to teammate at rendezvous
+    recv_bonus_coef: float = 0.5            # ζ_recv: NEW cells I get from teammate at rendezvous
+    overlap_penalty_coef: float = 3.0       # η_lap: cells we BOTH scanned independently since last comm
+    revisit_penalty_coef: float = 0.02      # γ: penalty per step on a node visited in last W steps
+    revisit_window: int = 8                 # W: lookback window for revisit detection
+    # G.4.a — amplify cand_own_minus_team feature (yield signal). Higher scale → faster
+    # learning of yielding behavior (smooth, no oscillation).
+    cand_own_minus_team_scale: float = 3.0
+    # G.4.b — per-step proximity penalty when teammate is too close (anti-chase).
+    proximity_penalty_coef: float = 0.005   # ε_prox: reward subtracted per step when close
+    proximity_penalty_radius_px: float = -1.0   # <=0 = sensor_range_px
+    # A2 — bypass distance / LOS check in comm: every step every agent communicates.
+    force_full_comm: bool = False
+    # Debug — persistent teammate-position awareness (positions only, not maps).
+    # When True, last_known_pos and t_last_comm always reflect actual current pos,
+    # regardless of comm_mask. Map fusion still gated by comm_mask. Used to isolate
+    # whether chase/weird-movement bugs come from stale lkp or elsewhere. Remove later.
+    force_full_pos_sharing: bool = False
+    # H.4 — persistent occupancy sharing (debug only). When True, world.fuse_maps fires
+    # with all-True mask every step → maps continuously synchronized. Set ops give/recv/
+    # overlap derived from fully-synced maps. Distinct from force_full_comm (which
+    # short-circuits _comm_check); this directly overrides the comm_mask used in fusion
+    # and reward set ops, without changing what cand_max_comm_gap reports.
+    force_full_occupancy_sharing: bool = False
+    # Phase A v2 / A1 — top-K frontier candidates per agent for strategic head.
+    top_k_candidates: int = 16
+
+    @classmethod
+    def from_ckpt_dict(cls, d: dict, **overrides) -> "EnvCfg":
+        """I.2 — reconstruct EnvCfg from a saved cfg["env"] dict, applying overrides.
+
+        Filters `d` to valid EnvCfg fields so unknown / stale keys are ignored. Ensures
+        eval mirrors training comm/sharing/feature config (force flags, top_k, n_hops...).
+        """
+        valid = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in d.items() if k in valid}
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
 
 class Explorer:
@@ -70,9 +111,11 @@ class Explorer:
         self.H, self.W = split.canvas
         self.M = cfg.n_agents
         self.N = cfg.n_envs
-        self.rng = np.random.default_rng(seed)
-
-        gt, starts, fc = sample_batch(split, cfg.n_envs, seed=seed, device=self.dev)
+        # Map RNG always fresh entropy (independent of cfg.seed). cfg.seed governs torch
+        # RNG only (action sampling, init reproducibility for training stability).
+        self.rng = np.random.default_rng()
+        init_seed = int(self.rng.integers(0, 1 << 31))
+        gt, starts, fc = sample_batch(split, cfg.n_envs, seed=init_seed, device=self.dev)
         self.map_indices = torch.zeros(cfg.n_envs, dtype=torch.long, device=self.dev)
         self.starts = starts.clone()
         self.free_total = fc.clone().float()
@@ -111,6 +154,37 @@ class Explorer:
         self._dist_prev   = torch.full(
             (self.N, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
         )
+        # Step of last comm event between agents a and j (per env). Used by Phase A v2
+        # strategic head as the cand_max_comm_gap feature (uncertainty over teammate pos).
+        # Reset to t=0 at episode start (since _reset_envs writes actual start positions
+        # into last_known_pos, so all pairs are "freshly in comm" at t=0).
+        self.t_last_comm = torch.zeros((self.N, self.M, self.M), dtype=torch.long, device=self.dev)
+        # Fix B — previous action K-slot per agent. -1 at reset → zero one-hot.
+        self.last_action = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
+        # Option A — BF-from-curr cache. Warm-start when curr unchanged step-to-step.
+        self._curr_prev = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
+        self._dist_curr_prev = torch.full(
+            (self.N, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
+        )
+        # H.3 — BF-from-teammate cache per (env, agent, teammate). Warm-start when lkp_node
+        # unchanged. Mem: N·M·M·N_max·4B = 614 KB at M=2 / 9.8 MB at M=8.
+        self._team_node_prev = torch.full(
+            (self.N, self.M, self.M), -1, dtype=torch.long, device=self.dev,
+        )
+        self._dist_team_prev = torch.full(
+            (self.N, self.M, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
+        )
+        # Phase D — lattice-level per-agent free count after last step (post-fusion).
+        self.last_own_free_node = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        # Per-pair last-meeting node-level FREE mask (union snapshot at last comm event).
+        # [N, M, M, N_max] bool ≈ 154 KB at default (N=32, M=2, N_max≈1200).
+        self.last_meeting_node_mask = torch.zeros(
+            (self.N, self.M, self.M, self.N_max), dtype=torch.bool, device=self.dev,
+        )
+        # Precompute lattice→pixel flat index for fast node-level FREE extraction.
+        nx = self.graph.node_xy[:, 0].long().clamp(0, self.W - 1)
+        ny = self.graph.node_xy[:, 1].long().clamp(0, self.H - 1)
+        self._node_flat_idx = (ny * self.W + nx).long()                                  # [N_max]
         self._last_obs: dict = {}
 
         self._reset_all()
@@ -166,27 +240,123 @@ class Explorer:
 
         env_idx   = torch.arange(self.N, device=self.dev).view(self.N, 1).expand(-1, self.M)
         agent_idx = torch.arange(self.M, device=self.dev).view(1, self.M).expand(self.N, -1)
+        # Phase D — snapshot prior visited_step for the chosen node BEFORE update, for revisit detection.
+        self._prev_visit_for_revisit = self.visited_step[env_idx, agent_idx, chosen].clone()        # [N, M]
         self.visited_step[env_idx, agent_idx, chosen] = self.t.view(self.N, 1).expand(-1, self.M)
         self.t = self.t + 1
+        # Fix B: remember last action K-slot for next obs.
+        self.last_action = action.clone()
+
+        # ------ Phase D — node-level set-op reward, baselined at last comm ------
+        # Snapshot post-scan, pre-fusion node-level FREE per agent.
+        N_max = self.N_max
+        occ_pre_flat = self.world.occupancy_torch.view(self.N, self.M, -1)                # [N, M, H*W]
+        free_node_pre = occ_pre_flat[:, :, self._node_flat_idx] == _FREE                  # [N, M, N_max]
 
         # Communication: check range + LOS, fuse maps, update last_known_pos
         comm_mask = self._comm_check()
+        # H.4 — when persistent occupancy sharing enabled, override comm_mask used for
+        # map fusion AND reward set ops to all-True. Keeps cand_max_comm_gap intact
+        # (that uses t_last_comm which only updates via real or pos-share comm).
+        if self.cfg.force_full_occupancy_sharing:
+            comm_mask = torch.ones_like(comm_mask)
         self.world.fuse_maps(comm_mask)
         self._update_last_known_pos(comm_mask)
 
-        # Reward: Δ(union FREE) + completion bonus − constant step penalty
-        # step_penalty_coef / max_steps: total budget over episode = step_penalty_coef.
-        # completion_bonus: one-shot reward at terminal step.
+        # Post-fusion node-level FREE.
+        occ_post_flat = self.world.occupancy_torch.view(self.N, self.M, -1)
+        free_node_post = occ_post_flat[:, :, self._node_flat_idx] == _FREE                # [N, M, N_max]
+
+        # team_delta (pixel-level, for completion check + cooperative term).
         union_free = (self.world.occupancy_torch == _FREE).any(dim=1).view(self.N, -1).float().sum(-1)
         explored_rate = (union_free / self.free_total.clamp(min=1.0)).clamp(0, 1)
-        delta = (union_free - self.last_union) / self.free_total.clamp(min=1.0)
+        team_delta = ((union_free - self.last_union) / self.free_total.clamp(min=1.0)).clamp(min=0.0)
         self.last_union = union_free
+
+        # scan_self_delta: cells I LiDAR-scanned this step (node level, pre-fusion).
+        denom = float(max(1, N_max))
+        own_free_post_scan_node = free_node_pre.float().sum(-1)                            # [N, M]
+        scan_self_delta = ((own_free_post_scan_node - self.last_own_free_node) / denom).clamp(min=0.0)
+        # Update last_own_free_node to post-fusion (next step's baseline).
+        self.last_own_free_node = free_node_post.float().sum(-1)
+
+        # Per-pair: contribution / reception / overlap with last-meeting baseline.
+        give_bonus  = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        recv_bonus  = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        overlap_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        if self.M > 1:
+            for i in range(self.M):
+                for j in range(self.M):
+                    if i == j:
+                        continue
+                    comm_ij = comm_mask[:, i, j]                                           # [N]
+                    if not comm_ij.any():
+                        continue
+                    baseline = self.last_meeting_node_mask[:, i, j]                        # [N, N_max]
+                    M_i = free_node_pre[:, i]
+                    M_j = free_node_pre[:, j]
+                    my_new = M_i & ~baseline                                               # cells I scanned since
+                    j_new  = M_j & ~baseline
+                    contribution_to_j = (my_new & ~M_j).float().sum(-1)                    # NEW I bring
+                    reception_from_j  = (j_new  & ~M_i).float().sum(-1)                    # NEW j brings
+                    new_overlap_ij    = (my_new & j_new).float().sum(-1)                   # both scanned same
+                    comm_f = comm_ij.float()
+                    give_bonus[:, i]  = give_bonus[:, i]  + (contribution_to_j / denom) * comm_f
+                    recv_bonus[:, i]  = recv_bonus[:, i]  + (reception_from_j  / denom) * comm_f
+                    overlap_pen[:, i] = overlap_pen[:, i] + (new_overlap_ij    / denom) * comm_f
+
+            # Update last_meeting_node_mask for pairs that just communicated.
+            # Post-fusion union is the new baseline. After max-magnitude fusion both agents
+            # have same map → use free_node_post[:, i] as canonical union snapshot.
+            for i in range(self.M):
+                for j in range(self.M):
+                    if i == j:
+                        continue
+                    mask_ij = comm_mask[:, i, j].view(self.N, 1).expand(self.N, N_max)
+                    self.last_meeting_node_mask[:, i, j] = torch.where(
+                        mask_ij, free_node_post[:, i], self.last_meeting_node_mask[:, i, j]
+                    )
+
+        # revisit_pen: chosen node revisited within last W steps by same agent.
+        W_rev = max(1, int(self.cfg.revisit_window))
+        prev_visit_for_chosen = self._prev_visit_for_revisit                                # [N, M]
+        t_now_per_m = (self.t - 1).view(self.N, 1).expand(self.N, self.M)                   # [N, M]
+        is_recent_revisit = (prev_visit_for_chosen >= 0) & ((t_now_per_m - prev_visit_for_chosen) < W_rev)
+        revisit_pen = is_recent_revisit.float()
+
+        # G.4.b — per-step proximity penalty when teammate within sensor_range AND in comm.
+        # Gated by comm_mask → "visible teammate too close" only. Decentralized.
+        proximity_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        if self.M > 1 and self.cfg.proximity_penalty_coef > 0:
+            prox_r = self.cfg.proximity_penalty_radius_px
+            if prox_r <= 0:
+                prox_r = self.cfg.sensor_range_px
+            for i in range(self.M):
+                for j in range(self.M):
+                    if i == j:
+                        continue
+                    d = (self.pos[:, i] - self.pos[:, j]).norm(dim=-1)              # [N]
+                    too_close = (d < prox_r).float() * comm_mask[:, i, j].float()    # [N]
+                    proximity_pen[:, i] = proximity_pen[:, i] + too_close
+
         terminated_now = explored_rate >= self.cfg.done_explored_thresh
         step_penalty = self.cfg.step_penalty_coef / max(1, self.cfg.max_episode_steps)
-        team_reward = (delta.clamp(min=0.0)
-                       + terminated_now.float() * self.cfg.completion_bonus
-                       - step_penalty)
-        reward = team_reward.unsqueeze(-1).expand(-1, self.M)
+        a_scan  = self.cfg.scan_reward_weight
+        beta    = self.cfg.team_reward_weight
+        z_give  = self.cfg.give_bonus_coef
+        z_recv  = self.cfg.recv_bonus_coef
+        eta_lap = self.cfg.overlap_penalty_coef
+        gamma   = self.cfg.revisit_penalty_coef
+        eps_prox = self.cfg.proximity_penalty_coef
+        reward = (a_scan  * scan_self_delta
+                  + beta  * team_delta.unsqueeze(-1)
+                  + z_give * give_bonus
+                  + z_recv * recv_bonus
+                  - eta_lap * overlap_pen
+                  - gamma   * revisit_pen
+                  - eps_prox * proximity_pen
+                  + terminated_now.float().unsqueeze(-1) * self.cfg.completion_bonus
+                  - step_penalty)
 
         self._refresh_obs(comm_mask)
 
@@ -223,6 +393,8 @@ class Explorer:
         comm_mask = eye.clone()
         if M < 2:
             return comm_mask
+        if self.cfg.force_full_comm:
+            return torch.ones((N, M, M), dtype=torch.bool, device=self.dev)
 
         comm_range = self.cfg.comm_range_px
         S = self.cfg.comm_los_samples
@@ -254,16 +426,32 @@ class Explorer:
         return comm_mask
 
     def _update_last_known_pos(self, comm_mask: torch.Tensor) -> None:
-        """Update last_known_pos where agents can communicate."""
+        """Update last_known_pos (point belief) and t_last_comm (σ-inflation timer).
+
+        Normally gated by comm_mask. If cfg.force_full_pos_sharing is True, ALL pairs
+        get fresh pos every step (debug only — used to test if chase/weird-movement
+        bugs come from stale lkp). Map fusion remains comm-gated regardless.
+        """
+        t_now = self.t                                   # [N]
+        if self.cfg.force_full_pos_sharing:
+            # Update all (i, j) pairs unconditionally to actual positions.
+            for i in range(self.M):
+                for j in range(self.M):
+                    self.last_known_pos[:, i, j] = self.pos[:, j, :]
+                    self.t_last_comm[:, i, j] = t_now
+            return
         for i in range(self.M):
             for j in range(self.M):
-                can = comm_mask[:, i, j]   # [N]
+                can = comm_mask[:, i, j]                # [N]
                 if not can.any():
                     continue
-                new_pos = self.pos[:, j, :]   # [N, 2] — actual current position
+                new_pos = self.pos[:, j, :]             # [N, 2] — actual current position
                 mask2d  = can.view(-1, 1)
                 self.last_known_pos[:, i, j] = torch.where(
                     mask2d.expand(-1, 2), new_pos, self.last_known_pos[:, i, j]
+                )
+                self.t_last_comm[:, i, j] = torch.where(
+                    can, t_now, self.t_last_comm[:, i, j]
                 )
 
     # ---------------------------------------------------------------------- #
@@ -306,64 +494,54 @@ class Explorer:
         chosen: list[int] = [anchor_flat]
 
         if self.M > 1:
-            anchor_li = anchor_flat // LW
-            anchor_lj = anchor_flat % LW
-            anchor_x = float(node_xy[anchor_flat, 0].item())
-            anchor_y = float(node_xy[anchor_flat, 1].item())
+            # BFS over 8-conn lattice from anchor. Edge (u,v) passable iff:
+            #   - v is FREE on GT (node_free[v])
+            #   - segment u→v has no obstacle (S=5 samples on a one-hop segment is reliable)
+            # Guarantees chosen nodes lie in anchor's connected FREE component.
+            node_free_list = node_free.cpu().tolist()
+            nx_arr = node_xy[:, 0].cpu().tolist()
+            ny_arr = node_xy[:, 1].cpu().tolist()
+            gt_cpu = gt.cpu()
 
-            def segment_clear(nx_w: float, ny_w: float) -> bool:
+            def segment_clear(ax: float, ay: float, bx: float, by: float) -> bool:
                 S = 5
                 for s in range(1, S + 1):
                     t = s / (S + 1.0)
-                    sx = int(round(anchor_x + t * (nx_w - anchor_x)))
-                    sy = int(round(anchor_y + t * (ny_w - anchor_y)))
+                    sx = int(round(ax + t * (bx - ax)))
+                    sy = int(round(ay + t * (by - ay)))
                     sx = max(0, min(W - 1, sx))
                     sy = max(0, min(H - 1, sy))
-                    if int(gt[sy, sx].item()) != GT_FREE:
+                    if int(gt_cpu[sy, sx].item()) != GT_FREE:
                         return False
                 return True
 
-            def candidates_at_ring(ring: int) -> list[tuple[float, int]]:
-                """Lattice cells at Chebyshev distance == ring from anchor."""
-                out_list: list[tuple[float, int]] = []
-                for d_li in range(-ring, ring + 1):
-                    for d_lj in range(-ring, ring + 1):
-                        if max(abs(d_li), abs(d_lj)) != ring:
-                            continue
-                        cand_li = anchor_li + d_li
-                        cand_lj = anchor_lj + d_lj
-                        if not (0 <= cand_li < LH and 0 <= cand_lj < LW):
-                            continue
-                        flat = int(cand_li * LW + cand_lj)
-                        if not bool(node_free[flat].item()):
-                            continue
-                        cx = float(node_xy[flat, 0].item())
-                        cy = float(node_xy[flat, 1].item())
-                        if not segment_clear(cx, cy):
-                            continue
-                        out_list.append((float(dist[flat].item()), flat))
-                out_list.sort()
-                return out_list
+            from collections import deque
+            visited: set[int] = {anchor_flat}
+            order: list[int] = []
+            q: deque[int] = deque([anchor_flat])
+            while q and len(order) < self.M * 4:
+                u = q.popleft()
+                u_li, u_lj = u // LW, u % LW
+                ux, uy = nx_arr[u], ny_arr[u]
+                for dr, dc in NBR_OFFSETS:
+                    v_li, v_lj = u_li + dr, u_lj + dc
+                    if not (0 <= v_li < LH and 0 <= v_lj < LW):
+                        continue
+                    v = v_li * LW + v_lj
+                    if v in visited or not node_free_list[v]:
+                        continue
+                    if not segment_clear(ux, uy, nx_arr[v], ny_arr[v]):
+                        continue
+                    visited.add(v)
+                    order.append(v)
+                    q.append(v)
 
-            # Ring 1: lattice-adjacent neighbors of anchor (the user-requested behavior).
-            cands = candidates_at_ring(1)
-            for _, flat in cands:
+            # Pick first M-1 from BFS order (closest in graph hops from anchor).
+            for v in order:
                 if len(chosen) >= self.M:
                     break
-                if flat in chosen:
-                    continue
-                chosen.append(flat)
-            # Fallback: extend to ring 2, 3, ... until M reached or ring exhausts lattice.
-            ring = 2
-            while len(chosen) < self.M and ring <= max(LH, LW):
-                for _, flat in candidates_at_ring(ring):
-                    if len(chosen) >= self.M:
-                        break
-                    if flat in chosen:
-                        continue
-                    chosen.append(flat)
-                ring += 1
-            # Last-resort fallback: pad with anchor.
+                chosen.append(v)
+            # Last-resort fallback: pad with anchor (collision-revert at step 0).
             while len(chosen) < self.M:
                 chosen.append(anchor_flat)
 
@@ -374,6 +552,56 @@ class Explorer:
 
     def _reset_all(self) -> None:
         self._reset_envs(list(range(self.N)))
+
+    def reload_map(self, env_idx: int, map_idx: int) -> None:
+        """G.1 — load specific map into env slot `env_idx` and do a FULL reset.
+
+        Used by eval scripts so all stale state (BF cache, comm timers, reward baselines,
+        last_meeting_node_mask, etc.) is cleared. Previously eval scripts only reset a
+        subset → corrupted BF warm-start + strategic features.
+        """
+        gt_new, starts_new, fc_new = sample_batch(
+            self.split, 1, indices=np.array([map_idx]),
+            seed=int(self.rng.integers(0, 1 << 31)), device=self.dev,
+        )
+        # Overwrite the slot's map ingredients, then call _reset_envs which sets up
+        # all per-agent state from scratch — but _reset_envs draws RANDOM map idx,
+        # so we splice the requested map in afterwards.
+        # Simpler path: invoke the shared reset path with this env_idx, then overwrite.
+        self._reset_envs([env_idx])
+        # Replace the random map _reset_envs used with the requested one.
+        idx_t = torch.tensor([env_idx], dtype=torch.long, device=self.dev)
+        self.world.gt_torch[idx_t]                    = gt_new
+        self.world.occupancy_torch[idx_t]             = 0
+        self.world.occupancy_logodds_torch[idx_t]     = 0.0
+        self.free_total[idx_t]                        = fc_new.float()
+        self.starts[idx_t]                            = starts_new
+        self.visited_step[idx_t]                      = -1
+        self.t[idx_t]                                 = 0
+        self._target_prev[idx_t]                      = -1
+        self._dist_prev[idx_t]                        = float("inf")
+        self._curr_prev[idx_t]                        = -1
+        self._dist_curr_prev[idx_t]                   = float("inf")
+        self.t_last_comm[idx_t]                       = 0
+        self.last_action[idx_t]                       = -1
+        # Place agents using new map's start.
+        row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
+        agent_pos = self._spread_starts_graph(row0, col0, env_idx=env_idx)
+        self.pos[env_idx] = agent_pos
+        for ag in range(self.M):
+            self.last_known_pos[env_idx, :, ag] = agent_pos[ag]
+        self.world.set_positions(self.pos)
+        self.world.scan()
+        union_free = (self.world.occupancy_torch[idx_t] == _FREE).any(dim=1).view(1, -1).float().sum(-1)
+        self.last_union[idx_t] = union_free
+        # Lattice-level reward state.
+        occ_flat = self.world.occupancy_torch[idx_t].view(1, self.M, -1)
+        free_node = occ_flat[:, :, self._node_flat_idx] == _FREE
+        self.last_own_free_node[idx_t] = free_node.float().sum(-1)
+        union_node = free_node.any(dim=1, keepdim=False)
+        self.last_meeting_node_mask[idx_t] = union_node.view(1, 1, 1, self.N_max).expand(
+            -1, self.M, self.M, -1).contiguous()
+        self._refresh_obs()
 
     def _reset_envs(self, idx: list[int]) -> None:
         if not idx:
@@ -395,6 +623,16 @@ class Explorer:
         # Reset guidepost cache: cold-start BF on next obs refresh.
         self._target_prev[idx_t]                      = -1
         self._dist_prev[idx_t]                        = float("inf")
+        # Reset BF-from-curr cache.
+        self._curr_prev[idx_t]                        = -1
+        self._dist_curr_prev[idx_t]                   = float("inf")
+        # H.3 — reset BF-from-teammate cache.
+        self._team_node_prev[idx_t]                   = -1
+        self._dist_team_prev[idx_t]                   = float("inf")
+        # Reset comm-gap timer: at reset, last_known_pos is set to actual start positions
+        # (see loop below), so all pairs are "freshly in comm" at t=0.
+        self.t_last_comm[idx_t]                       = 0
+        self.last_action[idx_t]                       = -1
 
         for j_env, e in enumerate(idx):
             row0, col0 = int(starts_new[j_env, 0]), int(starts_new[j_env, 1])
@@ -408,6 +646,15 @@ class Explorer:
         self.world.scan()
         union_free = (self.world.occupancy_torch[idx_t] == _FREE).any(dim=1).view(n, -1).float().sum(-1)
         self.last_union[idx_t] = union_free
+        # Phase D — lattice-level per-agent free count after first scan + per-pair baseline.
+        occ_flat_reset = self.world.occupancy_torch[idx_t].view(n, self.M, -1)              # [n, M, H*W]
+        free_node_reset = occ_flat_reset[:, :, self._node_flat_idx] == _FREE                # [n, M, N_max]
+        self.last_own_free_node[idx_t] = free_node_reset.float().sum(-1)
+        # Baseline per pair = node-level UNION of all agents' initial scans.
+        # Treats reset as a "virtual rendezvous" where everyone knows what's been scanned.
+        union_node_reset = free_node_reset.any(dim=1, keepdim=False)                        # [n, N_max]
+        self.last_meeting_node_mask[idx_t] = union_node_reset.view(n, 1, 1, self.N_max).expand(
+            -1, self.M, self.M, -1).contiguous()
         self._refresh_obs()
 
     def _refresh_obs(self, comm_mask: torch.Tensor | None = None) -> None:
@@ -420,7 +667,12 @@ class Explorer:
         Pass 3: extract local (2·n_hops + 3)² window per agent; this is what the model sees.
         """
         # ---- Pass 1: build global infos + warm-started target-rooted BF ----
+        # Phase A v2 (A1): also extract top-K frontier candidates per agent for strategic head.
+        # Argmax target selection here is the LEGACY path (used until Phase A v2 / A2 lands
+        # the strategic head that will pick target from cand_*).
+        K_cand = int(self.cfg.top_k_candidates)
         infos: list[dict] = []
+        cand_list: list[dict] = []
         for a in range(self.M):
             occ_a      = self.world.occupancy_torch[:, a, :, :]
             frontier_a = compute_frontier(occ_a)
@@ -441,7 +693,137 @@ class Explorer:
             self.graph.build_guidepost_v2(info, target=new_target, dist_init=dist_init)
             self._target_prev[:, a] = new_target
             self._dist_prev[:, a, :] = info["guidepost_dist"]
+            # Option A — BF FROM curr → dist[N, N_max] used to score cand by true path length.
+            # Warm-start from previous step's BF-from-curr if curr unchanged (Phase B reuse).
+            curr_same = (info["curr_idx"] == self._curr_prev[:, a]).unsqueeze(-1)
+            curr_dist_init = torch.where(
+                curr_same.expand(-1, self.N_max),
+                self._dist_curr_prev[:, a, :],
+                torch.full_like(self._dist_curr_prev[:, a, :], float("inf")),
+            )
+            bf_dist_from_curr, bf_parent_from_curr = self.graph.bf_from_target(
+                info, target=info["curr_idx"], dist_init=curr_dist_init,
+            )
+            self._curr_prev[:, a]      = info["curr_idx"]
+            self._dist_curr_prev[:, a] = bf_dist_from_curr
+            info["bf_dist_from_curr"]  = bf_dist_from_curr
+            info["bf_parent_from_curr"] = bf_parent_from_curr   # [N, N_max] predecessor on path from curr
+            info["_bf_parent_for_first_hop"] = bf_parent_from_curr   # used after cand extraction
+            # H.3 — BF FROM each teammate's last-known position (in agent a's own map).
+            # Per teammate j != a: lkp_node = floor(lkp[a, j] / NR), then BF rooted there.
+            # Warm-startable. Result stored in info["bf_dist_team"][N, M, N_max] with self-slot
+            # left as +inf (unused).
+            if self.M > 1:
+                LH, LW = self.graph.LH, self.graph.LW
+                NR = float(self.cfg.nr)
+                lkp_a = self.last_known_pos[:, a]                                          # [N, M, 2]
+                lj_t = (lkp_a[..., 0] / NR).long().clamp(0, LW - 1)
+                li_t = (lkp_a[..., 1] / NR).long().clamp(0, LH - 1)
+                team_node_a = li_t * LW + lj_t                                              # [N, M]
+                bf_dist_team_per_j = torch.full(
+                    (self.N, self.M, self.N_max), float("inf"),
+                    dtype=torch.float32, device=self.dev,
+                )
+                for j in range(self.M):
+                    if j == a:
+                        continue
+                    target_j = team_node_a[:, j]                                            # [N]
+                    same_j = (target_j == self._team_node_prev[:, a, j]).unsqueeze(-1)
+                    team_dist_init = torch.where(
+                        same_j.expand(-1, self.N_max),
+                        self._dist_team_prev[:, a, j],
+                        torch.full_like(self._dist_team_prev[:, a, j], float("inf")),
+                    )
+                    dist_j, _ = self.graph.bf_from_target(
+                        info, target=target_j, dist_init=team_dist_init,
+                    )
+                    self._team_node_prev[:, a, j] = target_j
+                    self._dist_team_prev[:, a, j] = dist_j
+                    bf_dist_team_per_j[:, j] = dist_j
+                info["bf_dist_team"] = bf_dist_team_per_j                                   # [N, M, N_max]
             infos.append(info)
+            cand_a = self.graph.extract_topk_candidates(
+                info["utility"], info["node_valid"], curr_xy=self.pos[:, a, :], K=K_cand,
+                bf_dist=bf_dist_from_curr,
+            )
+            # G.3.c — for each cand, compute K=8 first-hop slot via BF parent walk.
+            # Walk parent from cand_idx back; node whose parent==curr is first hop.
+            cand_idx_a = cand_a["cand_idx"]                                      # [N, K_cand]
+            curr_idx_a = info["curr_idx"]                                        # [N]
+            parent_a = bf_parent_from_curr                                       # [N, N_max]
+            curr_nbr_a_global = info["curr_nbr"]                                 # [N, K=8] global flat idx (-1 padded)
+            cur = cand_idx_a.clamp(min=0)                                        # [N, K_cand]
+            # Walk: stop when parent[cur] == curr OR parent[cur] < 0.
+            for _walk in range(self.N_max):
+                par = torch.gather(parent_a, dim=1, index=cur)                   # [N, K_cand]
+                reached = (par == curr_idx_a.unsqueeze(-1))                      # cur is first-hop
+                invalid = (par < 0)
+                stop = reached | invalid
+                cur = torch.where(stop, cur, par)
+                if bool(stop.all().item()):
+                    break
+            first_hop_node = cur                                                  # [N, K_cand]
+            # Match against curr's K=8 neighbors to get K-slot.
+            match = (first_hop_node.unsqueeze(-1) == curr_nbr_a_global.unsqueeze(1))  # [N, K_cand, K=8]
+            any_match = match.any(dim=-1)                                         # [N, K_cand]
+            slot = match.float().argmax(dim=-1)                                   # [N, K_cand]
+            first_hop_onehot = torch.nn.functional.one_hot(slot, num_classes=self.K).float()
+            first_hop_onehot = first_hop_onehot * (any_match.float().unsqueeze(-1) * cand_a["cand_valid"].float().unsqueeze(-1))
+            cand_a["cand_bf_first_hop_onehot"] = first_hop_onehot                 # [N, K_cand, K=8]
+
+            # H.3 — per-cand BF dist FROM each teammate j.
+            # H.2 — joint distribution alternative score (M-agnostic).
+            if self.M > 1:
+                cand_valid_f = cand_a["cand_valid"].float()                                  # [N, K_cand]
+                cand_util_a = cand_a["cand_utility"]                                          # [N, K_cand]
+                safe_idx = cand_idx_a.clamp(min=0)
+                # Per-teammate BF dist to cand.
+                cand_team_bf_per_j = torch.full(
+                    (self.N, self.M, K_cand), float("inf"),
+                    dtype=torch.float32, device=self.dev,
+                )
+                alt_per_j = torch.zeros(
+                    (self.N, self.M, K_cand), dtype=torch.float32, device=self.dev,
+                )
+                for j in range(self.M):
+                    if j == a:
+                        continue
+                    dist_j_full = info["bf_dist_team"][:, j]                                  # [N, N_max]
+                    d_per_cand = torch.gather(dist_j_full, dim=1, index=safe_idx)             # [N, K_cand]
+                    d_per_cand = torch.where(
+                        torch.isfinite(d_per_cand), d_per_cand, torch.full_like(d_per_cand, 1.0e6)
+                    )
+                    cand_team_bf_per_j[:, j] = d_per_cand * cand_valid_f
+                    # Teammate j's score for each cand:
+                    team_score_j = cand_util_a / (1.0 + d_per_cand / float(self.cfg.nr))      # [N, K_cand]
+                    team_score_j = team_score_j * cand_valid_f
+                    # Best alternative: max over k' != k. Use top-2 trick.
+                    top2_vals, top2_idx = team_score_j.topk(2, dim=-1)                        # [N, 2]
+                    # For each k, best_alt = top2_vals[..., 0] if k != top2_idx[..., 0] else top2_vals[..., 1]
+                    arange_k = torch.arange(K_cand, device=self.dev).view(1, K_cand).expand(self.N, K_cand)
+                    is_top1 = (arange_k == top2_idx[..., 0:1])                                # [N, K_cand]
+                    best_alt = torch.where(is_top1, top2_vals[..., 1:2], top2_vals[..., 0:1]).squeeze(-1)
+                    alt_per_j[:, j] = (best_alt - team_score_j).clamp(min=0.0) * cand_valid_f
+                # Min over teammates of BF dist (self slot already +inf from init).
+                cand_min_team_bf_dist = cand_team_bf_per_j.min(dim=1).values                   # [N, K_cand]
+                cand_min_team_bf_dist = torch.where(
+                    torch.isfinite(cand_min_team_bf_dist),
+                    cand_min_team_bf_dist,
+                    torch.zeros_like(cand_min_team_bf_dist),
+                )
+                # Mean over teammates of alt score (excludes self via 0-init for j==a).
+                # Number of valid teammates = M - 1.
+                alt_score_mean = alt_per_j.sum(dim=1) / max(1, self.M - 1)                     # [N, K_cand]
+                cand_a["cand_min_team_bf_dist"] = cand_min_team_bf_dist
+                cand_a["cand_team_alt_score"] = alt_score_mean
+            else:
+                cand_a["cand_min_team_bf_dist"] = torch.zeros(
+                    (self.N, K_cand), dtype=torch.float32, device=self.dev,
+                )
+                cand_a["cand_team_alt_score"] = torch.zeros(
+                    (self.N, K_cand), dtype=torch.float32, device=self.dev,
+                )
+            cand_list.append(cand_a)
 
         # ---- Pass 2: cross-agent feat[5] on GLOBAL node_feat ----
         # Mark the global node nearest to each teammate's last-known position. After
@@ -483,6 +865,9 @@ class Explorer:
         guidepost_path_valid_list = []
         guidepost_nbr_bias_list = []
         guidepost_next_hop_list = []
+        # G.3.b — BF parent from curr, for render-time path walk to strategic target.
+        bf_parent_list = []
+        curr_idx_global_list = []
 
         for a in range(self.M):
             info = infos[a]
@@ -504,6 +889,56 @@ class Explorer:
             guidepost_path_valid_list.append(info["guidepost_path_valid"])
             guidepost_nbr_bias_list.append(info["guidepost_nbr_bias"])
             guidepost_next_hop_list.append(info["guidepost_next_hop"])
+            bf_parent_list.append(info["bf_parent_from_curr"])
+            curr_idx_global_list.append(info["curr_idx"])
+
+        # ---- Phase A v2 / A1: assemble candidate tensors + teammate features ----
+        # Stack per-agent cand dicts into [N, M, K, ...] tensors.
+        cand_idx_all     = torch.stack([c["cand_idx"]     for c in cand_list], dim=1)  # [N, M, K]
+        cand_bf_first_hop_all = torch.stack(
+            [c["cand_bf_first_hop_onehot"] for c in cand_list], dim=1
+        )  # [N, M, K_cand, K=8]
+        cand_xy_all      = torch.stack([c["cand_xy"]      for c in cand_list], dim=1)  # [N, M, K, 2]
+        cand_utility_all = torch.stack([c["cand_utility"] for c in cand_list], dim=1)  # [N, M, K]
+        cand_valid_all   = torch.stack([c["cand_valid"]   for c in cand_list], dim=1)  # [N, M, K]
+        cand_rel_xy_all  = torch.stack([c["cand_rel_xy"]  for c in cand_list], dim=1)  # [N, M, K, 2]
+        cand_euclid_all  = torch.stack([c["cand_euclid"]  for c in cand_list], dim=1)  # [N, M, K]
+        # H.3 — BF min-team-dist replaces euclidean. H.2 — alt score for joint distribution.
+        cand_min_team_dist = torch.stack([c["cand_min_team_bf_dist"] for c in cand_list], dim=1)  # [N, M, K]
+        cand_team_alt_all  = torch.stack([c["cand_team_alt_score"]   for c in cand_list], dim=1)  # [N, M, K]
+
+        # Comm-gap feature: max over j != a of (t - t_last_comm[a, j]).
+        if self.M > 1:
+            eye = torch.eye(self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M)
+            gap = (self.t.view(self.N, 1, 1) - self.t_last_comm).clamp(min=0).float()  # [N, M, M]
+            gap = torch.where(eye, torch.full_like(gap, -1.0), gap)
+            cand_max_comm_gap_per_agent = gap.max(dim=-1).values.clamp(min=0.0)         # [N, M]
+            cand_max_comm_gap = cand_max_comm_gap_per_agent.unsqueeze(-1).expand(-1, -1, K_cand)
+        else:
+            cand_max_comm_gap  = torch.zeros_like(cand_euclid_all)
+
+        # Fix A: per-cand "am I closer than nearest teammate?" signal.
+        # own_dist = ||cand - own_pos|| (already cand_euclid_all).
+        # delta = own_dist - cand_min_team_dist. Negative = I'm closer → I should take it.
+        # Positive = teammate closer → I should yield. Decentralized (each uses own lkp).
+        canvas_diag = float((self.H ** 2 + self.W ** 2) ** 0.5)
+        # G.4.a — own_dist uses BF (cand_euclid_all = bf_dist_from_curr[cand] post-Option A);
+        # team_dist remains euclidean to lkp. Amplified by scale before clamp to give the
+        # strategic head a stronger yield signal (faster learning, no hard threshold).
+        cand_own_minus_team_raw = (cand_euclid_all - cand_min_team_dist) / canvas_diag
+        cand_own_minus_team = cand_own_minus_team_raw * float(self.cfg.cand_own_minus_team_scale)
+        cand_feat_all = torch.stack([
+            cand_rel_xy_all[..., 0] / canvas_diag,
+            cand_rel_xy_all[..., 1] / canvas_diag,
+            cand_utility_all,                                       # already in [0, 1]
+            cand_euclid_all / canvas_diag,
+            cand_min_team_dist / canvas_diag,                       # H.3 — BF dist (was euclid)
+            (cand_max_comm_gap / max(1.0, float(self.cfg.max_episode_steps))).clamp(max=1.0),
+            cand_own_minus_team.clamp(-1.0, 1.0),                   # Fix A — yielding signal
+            cand_team_alt_all.clamp(0.0, 1.0),                       # H.2 — joint alt score
+        ], dim=-1)                                                  # [N, M, K, 8]
+        # Mask out invalid candidate slots' features (zero them).
+        cand_feat_all = cand_feat_all * cand_valid_all.unsqueeze(-1).float()
 
         node_xy              = torch.stack(node_xy_list, dim=1)
         node_valid           = torch.stack(node_valid_list, dim=1)
@@ -522,6 +957,8 @@ class Explorer:
         guidepost_path_valid = torch.stack(guidepost_path_valid_list, dim=1)
         guidepost_nbr_bias   = torch.stack(guidepost_nbr_bias_list, dim=1)
         guidepost_next_hop   = torch.stack(guidepost_next_hop_list, dim=1)
+        bf_parent_from_curr  = torch.stack(bf_parent_list, dim=1)         # [N, M, N_max]
+        curr_idx_global      = torch.stack(curr_idx_global_list, dim=1)   # [N, M]
 
         self.curr_idx = curr_idx
         if comm_mask is None:
@@ -548,7 +985,27 @@ class Explorer:
             "guidepost_path_valid": guidepost_path_valid,
             "guidepost_nbr_bias":   guidepost_nbr_bias,
             "guidepost_next_hop":   guidepost_next_hop,
+            "bf_parent_from_curr":  bf_parent_from_curr,    # G.3.b — [N, M, N_max] for render path
+            "curr_idx_global":      curr_idx_global,        # G.3.b — [N, M] global flat idx for walk anchor
             "pos":                  self.pos.clone(),
             "comm_mask":            comm_mask,
             "last_known_pos":       self.last_known_pos.clone(),
+            # Phase A v2 / A1: strategic-head inputs.
+            "cand_idx":             cand_idx_all,       # GLOBAL flat idx  [N, M, K]
+            "cand_xy":              cand_xy_all,        # world coords     [N, M, K, 2]
+            "cand_utility":         cand_utility_all,   # raw utility      [N, M, K]
+            "cand_valid":           cand_valid_all,     # bool             [N, M, K]
+            "cand_feat":            cand_feat_all,      # [N, M, K, 7] normalized features
+            "cand_bf_first_hop":    cand_bf_first_hop_all,  # G.3.c [N, M, K_cand, K=8]
+            # Fix B: previous action one-hot per agent.
+            "prev_action":          self._prev_action_onehot(),    # [N, M, K=8] float
         }
+
+    def _prev_action_onehot(self) -> torch.Tensor:
+        """One-hot [N, M, K=8] of last_action. Zero everywhere when last_action == -1."""
+        K = self.K
+        out = torch.zeros((self.N, self.M, K), dtype=torch.float32, device=self.dev)
+        valid = self.last_action >= 0
+        safe = self.last_action.clamp(min=0)
+        out.scatter_(2, safe.unsqueeze(-1), valid.float().unsqueeze(-1))
+        return out

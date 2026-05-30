@@ -53,6 +53,7 @@ def ppo_update(
     T, N, M, d = rollout.T, rollout.N, rollout.M, rollout.d_hidden
     K = rollout.K
     advantages, returns = rollout.compute_gae(gamma=cfg.gamma, lam=cfg.lam)
+    # advantages [T, N, M], returns [T, N] (team-mean target for shared V).
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     vnorm.update(returns)
     returns_norm = vnorm.normalize(returns)
@@ -98,7 +99,7 @@ def ppo_update(
                         t = c0 + tt
                         action_t = rollout.actions[t, env_idx]              # [Nmb, M]
                         old_logp_t = rollout.logp[t, env_idx]
-                        adv_t = advantages[t, env_idx].unsqueeze(-1).expand(-1, M)
+                        adv_t = advantages[t, env_idx]                       # [Nmb, M] per-agent
                         ret_t = returns_norm[t, env_idx]
                         action_mask_t = chunk_obs["action_mask"][tt]        # [Nmb, M, K]
 
@@ -107,8 +108,7 @@ def ppo_update(
                             last_h_act = last_h_act * nonterm.view(-1, 1, 1)
                             last_h_crit = last_h_crit * nonterm.view(-1, 1)
 
-                        gnb = chunk_obs.get("guidepost_nbr_bias")
-                        gnb_t = gnb[tt] if gnb is not None else None
+                        stored_choice_t = rollout.target_choice[t, env_idx]
                         ev = model.evaluate_step_from_enc(
                             curr_emb=curr_emb_chunk[tt],
                             nbr_embs=nbr_embs_chunk[tt],
@@ -116,7 +116,13 @@ def ppo_update(
                             action=action_t,
                             hidden_actor=last_h_act,
                             hidden_critic=last_h_crit,
-                            guidepost_nbr_bias=gnb_t,
+                            cand_feat=chunk_obs["cand_feat"][tt],
+                            cand_valid=chunk_obs["cand_valid"][tt],
+                            cand_xy=chunk_obs["cand_xy"][tt],
+                            pos=chunk_obs["pos"][tt],
+                            prev_action=chunk_obs["prev_action"][tt],
+                            stored_choice=stored_choice_t,
+                            cand_bf_first_hop=chunk_obs["cand_bf_first_hop"][tt],
                         )
                         new_logp = ev["logp"]
                         new_val = ev["value"]
