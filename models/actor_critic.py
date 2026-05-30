@@ -54,10 +54,12 @@ class PointerHead(nn.Module):
         scores = (q * k).sum(dim=-1) / math.sqrt(self.d)            # [B, K]
         any_valid = mask.any(dim=-1, keepdim=True)
         mask_eff = torch.where(any_valid.expand_as(mask), mask, torch.ones_like(mask))
-        # Finite large-negative (not -inf): keeps Categorical valid under fp16 / NaN-prone
-        # late training. A fully-masked row → all NEG → uniform softmax (no NaN). Also
-        # sanitize any NaN/inf that leaked from the encoder before masking.
-        NEG = -1.0e9
+        # Finite large-negative (fp16-safe -1e4, matches StrategicHead): keeps Categorical
+        # valid under fp16 / NaN-prone late training. softmax(-1e4)≈0 → masked slots get ~0
+        # prob, identical to -inf for sampling/argmax (proven: fp32 prob diff 0.0). A
+        # fully-masked row → all NEG → uniform softmax (no NaN). nan_to_num sanitizes any
+        # NaN/inf leaked from the encoder before masking.
+        NEG = -1.0e4
         scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0e4, neginf=NEG)
         scores = scores.masked_fill(~mask_eff, NEG)
         return scores
@@ -281,7 +283,7 @@ class MarlActorCritic(nn.Module):
             ).squeeze(1)                                                                # [B, K=8]
             logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e9)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
         if deterministic:
             action = logits.argmax(dim=-1)
@@ -344,7 +346,7 @@ class MarlActorCritic(nn.Module):
             chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
             logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e9)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
         logp = dist.log_prob(action.reshape(B))
         entropy = dist.entropy()
@@ -447,7 +449,7 @@ class MarlActorCritic(nn.Module):
             chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
             logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e9)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
         logp = dist.log_prob(action.reshape(B))
         entropy = dist.entropy()
