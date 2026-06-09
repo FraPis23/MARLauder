@@ -66,13 +66,22 @@ class EnvCfg:
     give_bonus_coef: float = 1.5            # ζ_give: NEW cells I bring to teammate at rendezvous
     recv_bonus_coef: float = 0.5            # ζ_recv: NEW cells I get from teammate at rendezvous
     overlap_penalty_coef: float = 3.0       # η_lap: cells we BOTH scanned independently since last comm
-    revisit_penalty_coef: float = 0.02      # γ: penalty per step on a node visited in last W steps
+    revisit_penalty_coef: float = 0.05      # γ: penalty per step on a node visited in last W steps
     revisit_window: int = 8                 # W: lookback window for revisit detection
+    # Stall penalty — heavy cost for standing still (no net displacement this step). Catches
+    # collision-revert holds AND invalid/curr-node picks. Pressures agents to reroute /
+    # separate instead of deadlocking. δ_stall ≫ revisit so standing still is "heavily penalized".
+    stall_penalty_coef: float = 0.1         # δ_stall
+    # Objective second-guessing penalty (graph-tree). Fires when the agent flips the
+    # BF-from-curr first-hop BRANCH toward its strategic target while the previous target
+    # was still reachable + unreached (B+D). Same-direction target shifts (frontier
+    # receding down the same branch) cost 0; only genuine mid-route fork-flips are taxed.
+    target_switch_penalty_coef: float = 0.05    # δ_obj
     # G.4.a — amplify cand_own_minus_team feature (yield signal). Higher scale → faster
     # learning of yielding behavior (smooth, no oscillation).
     cand_own_minus_team_scale: float = 3.0
     # G.4.b — per-step proximity penalty when teammate is too close (anti-chase).
-    proximity_penalty_coef: float = 0.005   # ε_prox: reward subtracted per step when close
+    proximity_penalty_coef: float = 0.05    # ε_prox: reward subtracted per step when close
     proximity_penalty_radius_px: float = -1.0   # <=0 = sensor_range_px
     # A2 — bypass distance / LOS check in comm: every step every agent communicates.
     force_full_comm: bool = False
@@ -161,6 +170,14 @@ class Explorer:
         self.t_last_comm = torch.zeros((self.N, self.M, self.M), dtype=torch.long, device=self.dev)
         # Fix B — previous action K-slot per agent. -1 at reset → zero one-hot.
         self.last_action = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
+        # Collision tiebreak — per-episode randomized priority key per (env, agent). Lower
+        # key wins (advances); higher key yields (holds). Re-drawn each reset → no systematic
+        # role bias. Decentralized: derivable from a shared per-episode seed at deploy.
+        self._collision_key = torch.rand((self.N, self.M), device=self.dev)
+        # Objective second-guessing — previous step's strategic target (global node idx).
+        # -1 = none yet (episode start). Reset on episode done. Used by the B+D branch-flip
+        # penalty to detect mid-route fork switches in the BF-from-curr tree.
+        self._prev_target_node = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
         # Option A — BF-from-curr cache. Warm-start when curr unchanged step-to-step.
         self._curr_prev = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
         self._dist_curr_prev = torch.full(
@@ -197,8 +214,16 @@ class Explorer:
         return self._last_obs
 
     @torch.no_grad()
-    def step(self, action: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, dict]:
-        """action: long [N, M] in [0, K). Returns (obs, reward[N,M], done[N], info)."""
+    def step(
+        self, action: torch.Tensor, target_choice: torch.Tensor | None = None,
+    ) -> tuple[dict, torch.Tensor, torch.Tensor, dict]:
+        """action: long [N, M] in [0, K). Returns (obs, reward[N,M], done[N], info).
+
+        target_choice: optional long [N, M] = the strategic head's chosen K-slot in the
+        candidate list (from `model.act`). When provided, enables the objective
+        second-guessing penalty (B+D branch-flip on the BF-from-curr tree). None (eval /
+        baseline) → penalty off.
+        """
         assert action.shape == (self.N, self.M)
         # Phase C: action decode uses GLOBAL curr_nbr (model picked K-slot from local
         # window's curr_nbr_local, but env needs global flat idx to compute world coords
@@ -211,6 +236,9 @@ class Explorer:
 
         node_xy = self.graph.node_xy
         tgt_xy  = node_xy[chosen]   # [N, M, 2]
+
+        # Stall detection — snapshot pre-move position; compared after the sub-step loop.
+        pos_entry = self.pos.clone()                                   # [N, M, 2]
 
         K_sub = self.cfg.num_sim_steps
         min_agent_dist = float(self.cfg.nr)  # agents must stay >= 1 lattice spacing apart
@@ -225,15 +253,27 @@ class Explorer:
             ).view(self.N, self.M)
             collide_wall = (gt_at == GT_OBST)
             sub_pos = torch.where(collide_wall.unsqueeze(-1), self.pos, sub_pos)
-            # Agent-agent collision: revert both agents when too close.
-            # Hard env constraint — robots physically cannot overlap.
+            # Agent-agent collision: asymmetric yield. Robots physically cannot overlap, but
+            # reverting BOTH deadlocks adjacent agents contesting the same cell. Instead the
+            # lower-priority agent (higher _collision_key) yields (holds prev pos) while the
+            # winner advances. The winner reverts too only if it is STILL within min_dist of
+            # the loser's hold cell (true blockage, e.g. loser sits on the only path).
             if self.M > 1:
+                key = self._collision_key                              # [N, M] lower = wins
                 for i in range(self.M):
                     for j in range(i + 1, self.M):
-                        d = (sub_pos[:, i] - sub_pos[:, j]).norm(dim=-1)  # [N]
-                        collide_pair = (d < min_agent_dist).unsqueeze(-1)  # [N, 1]
-                        sub_pos[:, i] = torch.where(collide_pair, self.pos[:, i], sub_pos[:, i])
-                        sub_pos[:, j] = torch.where(collide_pair, self.pos[:, j], sub_pos[:, j])
+                        d = (sub_pos[:, i] - sub_pos[:, j]).norm(dim=-1)   # [N]
+                        collide = (d < min_agent_dist)                     # [N]
+                        i_wins = key[:, i] <= key[:, j]                    # [N]; tie → i (deterministic)
+                        i_loser = (collide & ~i_wins).unsqueeze(-1)        # [N, 1]
+                        j_loser = (collide & i_wins).unsqueeze(-1)
+                        sub_pos[:, i] = torch.where(i_loser, self.pos[:, i], sub_pos[:, i])
+                        sub_pos[:, j] = torch.where(j_loser, self.pos[:, j], sub_pos[:, j])
+                        # Winner still blocked by loser's hold cell → revert winner too.
+                        d2 = (sub_pos[:, i] - sub_pos[:, j]).norm(dim=-1)  # [N]
+                        still = (collide & (d2 < min_agent_dist)).unsqueeze(-1)
+                        sub_pos[:, i] = torch.where(still, self.pos[:, i], sub_pos[:, i])
+                        sub_pos[:, j] = torch.where(still, self.pos[:, j], sub_pos[:, j])
             self.pos = sub_pos
             self.world.set_positions(self.pos)
             self.world.scan()
@@ -246,6 +286,53 @@ class Explorer:
         self.t = self.t + 1
         # Fix B: remember last action K-slot for next obs.
         self.last_action = action.clone()
+
+        # ------ Objective second-guessing penalty (B+D, graph-tree) ------------
+        # All quantities below live in the PRE-step frame (tree rooted at the node the
+        # agent occupied when it made this decision) → self._last_obs + the cached
+        # bf_dist_from_curr (self._dist_curr_prev), both built by the previous _refresh_obs.
+        target_switch_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        if target_choice is not None:
+            obs0      = self._last_obs
+            cand_idx0 = obs0["cand_idx"]                                  # [N, M, K_cand] global node
+            cbfh0     = obs0["cand_bf_first_hop"]                         # [N, M, K_cand, K=8] one-hot
+            parent0   = obs0["bf_parent_from_curr"]                       # [N, M, N_max]
+            curr_g    = obs0["curr_idx_global"]                          # [N, M]
+            nbr_g     = obs0["curr_nbr_global"]                          # [N, M, K=8]
+            K_cand    = cand_idx0.shape[-1]
+            tc        = target_choice.clamp(0, K_cand - 1)               # [N, M]
+            # Current target node + its first-hop branch (slot 0..7).
+            g_t = torch.gather(cand_idx0, 2, tc.unsqueeze(-1)).squeeze(-1)               # [N, M]
+            fh_t = torch.gather(
+                cbfh0, 2, tc.view(self.N, self.M, 1, 1).expand(self.N, self.M, 1, self.K)
+            ).squeeze(2)                                                                 # [N, M, K=8]
+            branch_t       = fh_t.argmax(-1)                                             # [N, M]
+            branch_t_valid = fh_t.sum(-1) > 0                                            # [N, M]
+            # Previous target node — re-derive its first-hop branch in the CURRENT tree.
+            g_prev = self._prev_target_node                                              # [N, M]
+            cur = g_prev.clamp(min=0)
+            for _walk in range(self.N_max):
+                par = torch.gather(parent0, 2, cur.unsqueeze(-1)).squeeze(-1)            # [N, M]
+                stop = (par == curr_g) | (par < 0)
+                cur = torch.where(stop, cur, par)
+                if bool(stop.all().item()):
+                    break
+            match_prev = (cur.unsqueeze(-1) == nbr_g)                                    # [N, M, K=8]
+            branch_prev       = match_prev.float().argmax(-1)                            # [N, M]
+            branch_prev_valid = match_prev.any(-1)                                       # [N, M]
+            # D gate: only penalize while prev target was still pursuable.
+            bf_dist = self._dist_curr_prev                                               # [N, M, N_max]
+            d_prev  = torch.gather(bf_dist, 2, g_prev.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+            reached_thresh   = float(self.cfg.nr) * 1.5
+            prev_exists      = g_prev >= 0
+            prev_reached     = (curr_g == g_prev) | (d_prev <= reached_thresh)
+            prev_unreachable = ~torch.isfinite(d_prev)
+            prev_pursuable = (prev_exists & ~prev_reached & ~prev_unreachable
+                              & branch_prev_valid & branch_t_valid)
+            flip = branch_t != branch_prev
+            target_switch_pen = (prev_pursuable & flip).float()                          # [N, M]
+            # Carry target forward; keep prev on a transient invalid pick (g_t < 0).
+            self._prev_target_node = torch.where(g_t >= 0, g_t, self._prev_target_node)
 
         # ------ Phase D — node-level set-op reward, baselined at last comm ------
         # Snapshot post-scan, pre-fusion node-level FREE per agent.
@@ -318,11 +405,13 @@ class Explorer:
                     )
 
         # revisit_pen: chosen node revisited within last W steps by same agent.
+        # Graduated by recency: penalty = (W − age)/W ∈ (0, 1] so tighter loops hurt more.
         W_rev = max(1, int(self.cfg.revisit_window))
         prev_visit_for_chosen = self._prev_visit_for_revisit                                # [N, M]
         t_now_per_m = (self.t - 1).view(self.N, 1).expand(self.N, self.M)                   # [N, M]
-        is_recent_revisit = (prev_visit_for_chosen >= 0) & ((t_now_per_m - prev_visit_for_chosen) < W_rev)
-        revisit_pen = is_recent_revisit.float()
+        age = (t_now_per_m - prev_visit_for_chosen).clamp(min=0)                            # [N, M]
+        is_recent_revisit = (prev_visit_for_chosen >= 0) & (age < W_rev)
+        revisit_pen = is_recent_revisit.float() * ((W_rev - age).clamp(min=0).float() / W_rev)
 
         # G.4.b — per-step proximity penalty when teammate within sensor_range AND in comm.
         # Gated by comm_mask → "visible teammate too close" only. Decentralized.
@@ -339,6 +428,11 @@ class Explorer:
                     too_close = (d < prox_r).float() * comm_mask[:, i, j].float()    # [N]
                     proximity_pen[:, i] = proximity_pen[:, i] + too_close
 
+        # Stall penalty — no net displacement this step (collision-revert hold or
+        # invalid/curr-node pick). step_disp also feeds the coverage-efficiency metric.
+        step_disp = (self.pos - pos_entry).norm(dim=-1)                  # [N, M]
+        stall_pen = (step_disp < float(self.cfg.nr) * 0.5).float()       # [N, M]
+
         terminated_now = explored_rate >= self.cfg.done_explored_thresh
         step_penalty = self.cfg.step_penalty_coef / max(1, self.cfg.max_episode_steps)
         a_scan  = self.cfg.scan_reward_weight
@@ -348,6 +442,8 @@ class Explorer:
         eta_lap = self.cfg.overlap_penalty_coef
         gamma   = self.cfg.revisit_penalty_coef
         eps_prox = self.cfg.proximity_penalty_coef
+        delta_obj = self.cfg.target_switch_penalty_coef
+        delta_stall = self.cfg.stall_penalty_coef
         reward = (a_scan  * scan_self_delta
                   + beta  * team_delta.unsqueeze(-1)
                   + z_give * give_bonus
@@ -355,8 +451,50 @@ class Explorer:
                   - eta_lap * overlap_pen
                   - gamma   * revisit_pen
                   - eps_prox * proximity_pen
+                  - delta_obj * target_switch_pen
+                  - delta_stall * stall_pen
                   + terminated_now.float().unsqueeze(-1) * self.cfg.completion_bonus
                   - step_penalty)
+
+        # ---- Telemetry: per-step means of each reward COMPONENT (signed contribution) ----
+        # For W&B + tuning. Means over [N, M]. Cheap; detached scalars.
+        reward_terms = {
+            "scan":          (a_scan * scan_self_delta).mean(),
+            "team":          (beta * team_delta).mean(),
+            "give":          (z_give * give_bonus).mean(),
+            "recv":          (z_recv * recv_bonus).mean(),
+            "overlap":       (-eta_lap * overlap_pen).mean(),
+            "revisit":       (-gamma * revisit_pen).mean(),
+            "proximity":     (-eps_prox * proximity_pen).mean(),
+            "target_switch": (-delta_obj * target_switch_pen).mean(),
+            "stall":         (-delta_stall * stall_pen).mean(),
+        }
+
+        # ---- Exploration-quality metrics (per-step scalars; driver aggregates) ----
+        # redundancy = (Σ_a own_free − union_free) / union_free  (overlap; low = good).
+        # MUST use PRE-fusion per-agent maps: post-fusion both in-comm agents share an
+        # identical map → own_sum ≈ M·union → redundancy pinned near M−1 (measures map
+        # sharing, not redundant exploration). free_node_pre is each agent's own holdings
+        # before this step's fusion, so it reflects genuine independent coverage divergence.
+        own_free_sum = free_node_pre.float().sum(-1).sum(-1)                                 # [N]
+        union_node_pre = free_node_pre.any(dim=1).float().sum(-1)                            # [N]
+        redundancy = ((own_free_sum - union_node_pre) / union_node_pre.clamp(min=1.0))       # [N]
+        # mean pairwise inter-agent distance / canvas_diag (separation; chase = low).
+        canvas_diag = float((self.H ** 2 + self.W ** 2) ** 0.5)
+        if self.M > 1:
+            pd = torch.cdist(self.pos, self.pos)                                             # [N, M, M]
+            triu = torch.triu(torch.ones(self.M, self.M, device=self.dev), diagonal=1).bool()
+            mean_pair_dist = (pd[:, triu].mean(-1) / canvas_diag)                             # [N]
+        else:
+            mean_pair_dist = torch.zeros(self.N, device=self.dev)
+        metrics = {
+            "redundancy":     redundancy.mean(),
+            "stall_rate":     stall_pen.mean(),
+            "revisit_rate":   is_recent_revisit.float().mean(),
+            "mean_pair_dist": mean_pair_dist.mean(),
+            "team_delta_sum": team_delta.sum(),                   # Σ_N Δunion frac this step (efficiency num)
+            "step_disp_sum":  step_disp.sum(),                    # Σ_{N,M} displacement px (efficiency denom)
+        }
 
         self._refresh_obs(comm_mask)
 
@@ -368,6 +506,8 @@ class Explorer:
             "terminated":    terminated,
             "truncated":     truncated,
             "step":          self.t.clone(),
+            "reward_terms":  reward_terms,
+            "metrics":       metrics,
         }
         if bool(done.any().item()):
             idx = torch.nonzero(done, as_tuple=False).flatten().cpu().numpy().tolist()
@@ -550,6 +690,15 @@ class Explorer:
             out[i] = node_xy[flat]
         return out
 
+    def _spawn_degenerate(self, agent_pos: torch.Tensor) -> bool:
+        """True if any two of the M start positions are co-located (< nr·0.5 apart) —
+        i.e. `_spread_starts_graph` fell back to the anchor for lack of adjacent FREE nodes."""
+        if self.M < 2:
+            return False
+        pd = torch.cdist(agent_pos.unsqueeze(0), agent_pos.unsqueeze(0))[0]   # [M, M]
+        eye = torch.eye(self.M, dtype=torch.bool, device=agent_pos.device)
+        return bool((pd[~eye] < float(self.cfg.nr) * 0.5).any().item())
+
     def _reset_all(self) -> None:
         self._reset_envs(list(range(self.N)))
 
@@ -584,6 +733,8 @@ class Explorer:
         self._dist_curr_prev[idx_t]                   = float("inf")
         self.t_last_comm[idx_t]                       = 0
         self.last_action[idx_t]                       = -1
+        self._collision_key[idx_t]                    = torch.rand((1, self.M), device=self.dev)
+        self._prev_target_node[idx_t]                 = -1
         # Place agents using new map's start.
         row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
         agent_pos = self._spread_starts_graph(row0, col0, env_idx=env_idx)
@@ -633,10 +784,35 @@ class Explorer:
         # (see loop below), so all pairs are "freshly in comm" at t=0.
         self.t_last_comm[idx_t]                       = 0
         self.last_action[idx_t]                       = -1
+        # Re-draw collision priority + clear objective-commitment memory.
+        self._collision_key[idx_t]                    = torch.rand((n, self.M), device=self.dev)
+        self._prev_target_node[idx_t]                 = -1
 
         for j_env, e in enumerate(idx):
             row0, col0 = int(starts_new[j_env, 0]), int(starts_new[j_env, 1])
             agent_pos = self._spread_starts_graph(row0, col0, env_idx=e)  # [M, 2] on GPU
+            # Reject degenerate spawns — if a map cannot fit M adjacent FREE nodes,
+            # `_spread_starts_graph` pads with the anchor → agents CO-LOCATED → instant
+            # collision/stall. Resample a different map (≤8 tries) instead. On train/easy
+            # M=2 this never fires (audited 0%); matters on dense / M>2 splits.
+            if self.M > 1:
+                tries = 0
+                while tries < 8 and self._spawn_degenerate(agent_pos):
+                    tries += 1
+                    r = int(self.rng.integers(0, self.split.n))
+                    g2, s2, f2 = sample_batch(
+                        self.split, 1, indices=np.array([r]),
+                        seed=int(self.rng.integers(0, 1 << 31)), device=self.dev,
+                    )
+                    et = torch.tensor([e], dtype=torch.long, device=self.dev)
+                    self.world.gt_torch[et]                = g2
+                    self.world.occupancy_torch[et]         = 0
+                    self.world.occupancy_logodds_torch[et] = 0.0
+                    self.free_total[et]                    = f2.float()
+                    self.starts[et]                        = s2
+                    self.map_indices[et]                   = r
+                    row0, col0 = int(s2[0, 0]), int(s2[0, 1])
+                    agent_pos = self._spread_starts_graph(row0, col0, env_idx=e)
             self.pos[e] = agent_pos
             # All agents know all actual start positions (in comm range at reset)
             for ag in range(self.M):

@@ -47,6 +47,18 @@ class TrainCfg:
     #   0–30%: (1.0, 0.0).  30–60%: (0.7, 0.3).  60–100%: (0.5, 0.5).
     curriculum: bool = False
     curriculum_splits: tuple = ("train/easy", "train/difficult")
+    # Weights & Biases (off by default → no network unless --wandb). For sweeps the agent
+    # passes hyperparameters as CLI flags; everything here is logged as the run config.
+    wandb: bool = False
+    wandb_project: str = "marlauder"
+    wandb_entity: str | None = None
+    wandb_group: str | None = None
+    wandb_run_name: str | None = None
+    wandb_mode: str = "online"          # online | offline | disabled
+    wandb_tags: tuple = ()
+    # Composite efficiency score (sweep target): ep_end − w_red·redundancy − w_stall·stall_rate.
+    eff_w_redundancy: float = 0.5
+    eff_w_stall: float = 0.5
 
 
 def _normalize_cfg(cfg: TrainCfg) -> None:
@@ -98,7 +110,19 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
     to ensure completions.
     """
     obs = env.obs
+    N = buf.N
+    dev = env.dev
     ep_end_explored: list[float] = []
+    # Per-step metric/reward-term running sums (averaged at the end).
+    term_sums: dict[str, float] = {}
+    metric_sums: dict[str, float] = {}
+    # First-crossing step per env for steps_to_X (−1 = not yet crossed this rollout).
+    # free_at_* records that env's free-cell count at the crossing, to normalize for map
+    # size (bigger maps need more steps to cover the same FRACTION).
+    steps_to_50 = torch.full((N,), -1.0, device=dev)
+    steps_to_90 = torch.full((N,), -1.0, device=dev)
+    free_at_50  = torch.ones((N,), device=dev)
+    free_at_90  = torch.ones((N,), device=dev)
     for t in range(buf.T):
         with torch.no_grad():
             out = model.act(obs, h_act, h_crit, deterministic=False)
@@ -106,9 +130,23 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         logp = out["logp"]
         v_norm = out["value"]
         value = vnorm.denormalize(v_norm)
-        obs_next, reward, done, info = env.step(action)
+        obs_next, reward, done, info = env.step(action, target_choice=out["target_choice"])
         buf.store(t, obs, action, logp, value, reward, done, out["target_choice"])
         er = info["explored_rate"]
+        stp = info["step"].float()
+        # Accumulate reward-term + metric scalars.
+        for k, v in info["reward_terms"].items():
+            term_sums[k] = term_sums.get(k, 0.0) + float(v.item())
+        for k, v in info["metrics"].items():
+            metric_sums[k] = metric_sums.get(k, 0.0) + float(v.item())
+        # steps_to_X — first time each env crosses the coverage threshold this rollout.
+        free_now = env.free_total.clamp(min=1.0)
+        newly50 = (er >= 0.5) & (steps_to_50 < 0)
+        steps_to_50 = torch.where(newly50, stp, steps_to_50)
+        free_at_50  = torch.where(newly50, free_now, free_at_50)
+        newly90 = (er >= 0.9) & (steps_to_90 < 0)
+        steps_to_90 = torch.where(newly90, stp, steps_to_90)
+        free_at_90  = torch.where(newly90, free_now, free_at_90)
         # Capture explored_rate at end-of-episode moments BEFORE auto-reset.
         if bool(done.any().item()):
             done_idx = done.nonzero(as_tuple=True)[0]
@@ -126,7 +164,29 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         v_last = vnorm.denormalize(out["value"])
     buf.last_value.copy_(v_last)
     ep_end_mean = sum(ep_end_explored) / len(ep_end_explored) if ep_end_explored else float("nan")
-    return h_act, h_crit, ep_end_mean, len(ep_end_explored)
+
+    T = buf.T
+    agg = {f"reward/{k}": v / T for k, v in term_sums.items()}
+    for k, v in metric_sums.items():
+        if k in ("team_delta_sum", "step_disp_sum"):
+            continue   # combined below
+        agg[f"metric/{k}"] = v / T
+    # coverage_per_dist = Σ Δunion-frac / Σ displacement-px (exploration efficiency).
+    agg["metric/coverage_per_dist"] = metric_sums.get("team_delta_sum", 0.0) / max(
+        1e-6, metric_sums.get("step_disp_sum", 0.0))
+
+    def _masked_mean(x: torch.Tensor) -> float:
+        m = x >= 0
+        return float(x[m].mean().item()) if bool(m.any()) else float("nan")
+    agg["metric/steps_to_50"] = _masked_mean(steps_to_50)
+    agg["metric/steps_to_90"] = _masked_mean(steps_to_90)
+    # Size-normalized speed: steps per 1k free cells (map-size invariant → comparable
+    # across maps of different free area). Lower = faster exploration.
+    agg["metric/steps_to_50_per_kfree"] = _masked_mean(
+        torch.where(steps_to_50 >= 0, steps_to_50 * 1000.0 / free_at_50, steps_to_50))
+    agg["metric/steps_to_90_per_kfree"] = _masked_mean(
+        torch.where(steps_to_90 >= 0, steps_to_90 * 1000.0 / free_at_90, steps_to_90))
+    return h_act, h_crit, ep_end_mean, len(ep_end_explored), agg
 
 
 def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx: int) -> None:
@@ -179,6 +239,20 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr_actor)
     h_act, h_crit = model.init_hidden(cfg.n_envs, cfg.device)
 
+    # Weights & Biases (optional). Guarded import → absent package / --wandb off = no-op.
+    wb = None
+    if cfg.wandb:
+        try:
+            import wandb as wb
+            flat_cfg = cfg.__dict__ | {"env": cfg.env.__dict__, "ppo": cfg.ppo.__dict__}
+            wb.init(project=cfg.wandb_project, entity=cfg.wandb_entity,
+                    group=cfg.wandb_group, name=cfg.wandb_run_name,
+                    mode=cfg.wandb_mode, tags=list(cfg.wandb_tags),
+                    config=flat_cfg)
+        except Exception as exc:
+            print(f"[wandb] disabled ({exc})")
+            wb = None
+
     sample_obs = env.obs
     buf = Rollout(sample_obs, T=cfg.rollout_len, N=cfg.n_envs, M=cfg.n_agents,
                   d_hidden=cfg.d_hidden, device=cfg.device)
@@ -200,7 +274,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
         buf.h_actor_init.copy_(h_act.detach())
         buf.h_critic_init.copy_(h_crit.detach())
         t_collect = time.time()
-        h_act, h_crit, ep_end_mean, ep_end_n = collect_rollout(env, model, buf, h_act, h_crit, vnorm)
+        h_act, h_crit, ep_end_mean, ep_end_n, agg = collect_rollout(env, model, buf, h_act, h_crit, vnorm)
         t_update = time.time()
         stats = ppo_update(model, optimizer, vnorm, buf, cfg.ppo, cfg.device)
         if torch.cuda.is_available():
@@ -215,16 +289,35 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
         coll_pct = 100.0 * (t_update - t_collect) / max(1e-6, iter_time)
         coll_sps = steps_per_iter / max(1e-6, t_update - t_collect)
         upd_sps  = steps_per_iter / max(1e-6, t_end - t_update)
+        # Composite efficiency (sweep target): coverage − overlap − standing-still.
+        # Uses ep_end when available, else current-rollout mean explored proxy via redundancy.
+        ep_for_eff = ep_end_mean if ep_end_n > 0 else float("nan")
+        redundancy = agg.get("metric/redundancy", 0.0)
+        stall_rate = agg.get("metric/stall_rate", 0.0)
+        efficiency = (ep_for_eff - cfg.eff_w_redundancy * redundancy
+                      - cfg.eff_w_stall * stall_rate)
         if it % log_every == 0:
-            # H.1 — ep_end is the only exploration metric: mean explored_rate at terminal
-            # step over all episodes that ENDED during this rollout. `ended` = # episodes.
+            # H.1 — ep_end: mean explored_rate at terminal step over episodes that ENDED.
             ep_str = f"ep_end={ep_end_mean*100:5.1f}%(ended={ep_end_n:3d})" if ep_end_n > 0 else "ep_end=   n/a       "
             print(f"[it {it:4d}/{n_iters}] "
                   f"{ep_str}  "
                   f"pg={stats['pg_loss']:+.4f}  v={stats['v_loss']:.4f}  "
                   f"ent={stats['entropy']:.3f}  kl={stats['kl']:+.4f}  "
                   f"clip={stats['clipfrac']*100:.1f}%  "
-                  f"sps={sps_iter:.0f}({sps_all:.0f}avg) coll={coll_sps:.0f} upd={upd_sps:.0f}")
+                  f"redun={redundancy:.2f} stall={stall_rate*100:.0f}% "
+                  f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
+                  f"sps={sps_iter:.0f}({sps_all:.0f}avg)")
+        if wb is not None:
+            log = {
+                "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
+                "train/entropy": stats["entropy"], "train/kl": stats["kl"],
+                "train/clipfrac": stats["clipfrac"], "perf/sps": sps_iter,
+                "perf/coll_sps": coll_sps, "perf/upd_sps": upd_sps,
+                "explore/ep_end": ep_end_mean, "explore/ep_end_n": ep_end_n,
+                "explore/efficiency": efficiency, "iter": it,
+            }
+            log.update(agg)
+            wb.log(log, step=total_env_steps)
         if it in milestones:
             pct = milestones[it]
             ckpt_path = cfg.out_dir / f"ckpt_{pct:03d}.pt"
@@ -258,3 +351,5 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                                "n_agents": cfg.n_agents},
     }, cfg.out_dir / "final.pt")
     print(f"[done] {cfg.out_dir/'final.pt'}")
+    if wb is not None:
+        wb.finish()

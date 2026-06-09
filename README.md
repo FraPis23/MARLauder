@@ -194,7 +194,11 @@ The most-used `run_train.py` flags:
 | `--n-hops` | `2` | Ego-centric encoder window radius |
 | `--top-k` | `16` | Strategic-head frontier candidates per agent |
 | `--path-bias-floor` | `1.5` | Floor on target-following bias |
-| `--yield-scale` / `--overlap-pen` / `--proximity-pen` | `3.0` / `3.0` / `0.005` | Anti-chase knobs |
+| `--yield-scale` / `--overlap-pen` / `--proximity-pen` | `3.0` / `3.0` / `0.05` | Anti-chase knobs |
+| `--revisit-pen` / `--stall-pen` | `0.05` / `0.1` | Anti-loop (graduated) / anti-standing-still |
+| `--target-switch-pen` | `0.05` | δ_obj: objective second-guessing penalty (BF-tree branch flip while prev target still pursuable) |
+| `--clip-eps` / `--k-epochs` / `--gae-lambda` / `--gamma` / `--vf-coef` / `--tbptt-steps` | `0.2` / `4` / `0.95` / `0.99` / `0.5` / `16` | MAPPO knobs (exposed for sweeps) |
+| `--wandb` (+ `--wandb-project/-entity/-group/-run-name/-mode/-tags`) | off | Log metrics to Weights & Biases |
 | `--force-full-pos-sharing` / `--force-full-occupancy-sharing` | off | Debug: perfect teammate positions / synced maps |
 | `--curriculum` | off | Ramp easy→difficult mix (needs same-canvas splits) |
 | `--compile` | off | `torch.compile` the encoder (~2× update speedup) |
@@ -218,15 +222,54 @@ reward[a] = α_scan · scan_self_delta[a]      # cells I LiDAR-scanned this step
           − η_lap  · overlap[a]               # we BOTH scanned same area since last meeting
           − γ      · revisit_pen[a]           # node visited within last W=8 steps
           − ε_prox · proximity_pen[a]         # teammate within sensor_range AND visible
+          − δ_obj  · target_switch_pen[a]     # objective second-guessing (BF-tree branch flip)
+          − δ_stall· stall_pen[a]             # standing still (no net displacement this step)
           + 1{terminated} · completion_bonus
           − step_penalty
 ```
 
-Defaults: `α_scan=1.0, β=0.3, ζ_give=1.5, ζ_recv=0.5, η_lap=3.0, γ=0.02, ε_prox=0.005, completion_bonus=10.0, step_penalty_coef=0.1`.
+Defaults: `α_scan=1.0, β=0.3, ζ_give=1.5, ζ_recv=0.5, η_lap=3.0, γ=0.05, ε_prox=0.05, δ_obj=0.05, δ_stall=0.1, completion_bonus=10.0, step_penalty_coef=0.1`.
+
+`stall_pen[a] = 1` when the agent makes **no net displacement** this step (`‖Δpos‖ < nr·0.5`) — catches both collision-revert holds and invalid/curr-node picks. Heavily weighted (`δ_stall=0.1`) to break chase/standoff deadlocks and force separation. `revisit_pen` is now **graduated** by recency (`(W−age)/W`, tighter loops hurt more) and `proximity_pen` is strengthened (`ε_prox=0.05`). These three are the anti-chase / anti-loop / anti-stall knobs the W&B sweep tunes (see below).
+
+`target_switch_pen[a] = 1` when the agent **flips its committed branch** of the BF-from-curr tree toward the strategic target while the previous target was still **reachable + not-yet-reached** (B+D). Same-direction shifts (frontier receding down the same branch) cost 0 — the penalty keys on graph *direction* (first-hop branch), not target-node identity. Curbs constant re-planning ("second-guessing") without freezing legitimate adaptation. Off at eval (`target_choice` not plumbed).
 
 Each agent gets its **own** scalar reward. GAE computes per-agent advantages with a shared CTDE value baseline. Anti-chase comes from `overlap`/`proximity` penalties plus the strategic head's `cand_own_minus_team` (yield) and `team_alt_score` (joint distribution) features — all smooth, no hard thresholds. A floored+learnable `path_bias` keeps the actor following its chosen target so grid-utility doesn't dominate.
 
 Full reward derivation + decentralization properties: [DOCS.md §4](DOCS.md).
+
+---
+
+## Weights & Biases + hyperparameter sweeps
+
+Training logs to W&B when `--wandb` is set (off by default → no network). Each iter logs
+`train/*` (pg, v, ent, kl, clipfrac), `perf/*` (sps), `reward/*` (per-term signed
+contributions), `metric/*` (exploration quality, below), and `explore/efficiency` — the
+composite sweep target `ep_end − 0.5·redundancy − 0.5·stall_rate`.
+
+**Exploration-quality metrics** (logged each iter; also printed in the iter line as
+`redun`/`stall`/`pair`):
+
+| Metric | Meaning | Good direction |
+|---|---|---|
+| `metric/redundancy` | `(Σ own_free − union)/union` on **pre-fusion** maps | low (less overlap) |
+| `metric/stall_rate` | fraction of steps with no net displacement | low |
+| `metric/revisit_rate` | fraction of steps revisiting a recent node | low |
+| `metric/mean_pair_dist` | mean pairwise inter-agent distance / canvas diag | higher = separated, not chasing |
+| `metric/coverage_per_dist` | Δunion-explored per pixel travelled | high (efficient) |
+| `metric/steps_to_50` / `steps_to_90` | steps to reach 50/90% coverage | low (fast) |
+| `metric/steps_to_*_per_kfree` | steps-to-coverage ÷ (free cells/1000), **map-size-normalized** | low (fast, comparable across maps) |
+
+**Sweeps** — `sweep.yaml` (repo root) is a Bayesian sweep over MAPPO knobs + coordination
+coefficients, maximizing `explore/efficiency`:
+
+```bash
+docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb login && wandb sweep sweep.yaml'
+docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb agent <ENTITY/PROJECT/SWEEP_ID>'
+```
+
+Every swept key matches a CLI flag (dashed names). `wandb` is in `requirements.txt`; if the
+image predates it, `pip install wandb` inside the container.
 
 ---
 
@@ -244,7 +287,7 @@ When the condition holds, on the same step:
 
 When out of range, agents drift with their own partial maps. The `last_known_pos` entries become stale until the next rendezvous. Feature `node_feat[..., 5]` exposes a one-hot at the lattice node nearest each known teammate position.
 
-Agent–agent collision is enforced at the env level: if a planned sub-step move would bring two agents within `nr` pixels, both revert to their previous positions. Same as wall collision.
+Agent–agent collision is enforced at the env level: if a planned sub-step move would bring two agents within `nr` pixels, the lower-priority agent (**higher** per-episode `_collision_key`) yields — it holds its previous position while the winner advances. The winner reverts too only if it is **still** within `nr` of the loser's hold cell (true blockage). Priority is re-drawn randomly each episode, so there is no systematic role bias; it is decentralized (derivable from a shared per-episode seed at deploy). This replaces the old symmetric both-revert rule, which deadlocked adjacent agents contesting the same cell.
 
 ---
 

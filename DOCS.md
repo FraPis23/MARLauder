@@ -32,7 +32,7 @@ MARLauder/
 | `maps.py` | Load preprocessed `data/<split>/maps.npy` + `meta.npz`; sample N maps to GPU. `MultiSplit` wrapper (weighted union of splits, used by curriculum). `sample_batch` accepts `Split` or `MultiSplit`. |
 | `frontier.py` | Torch conv2d frontier detector. `compute_frontier(occupancy)` → bool [N,H,W]. Frontier = FREE cell with 2..7 UNKNOWN neighbors. |
 | `graph_lattice.py` | Core graph manager. 8-neighbor lattice on free cells, reachability flood-fill, collision-checked edges, integral-image utility. `bf_from_target(info, target, dist_init)` — overwrite-mode warm-startable Bellman-Ford from any source node (used for guidepost target, BF-from-curr, BF-from-teammate). `extract_topk_candidates(util, valid, curr_xy, K, bf_dist)` — top-K frontier candidates with BF distances. `build_guidepost_v2`. `curr_idx` from O(1) floor-divide. |
-| `explorer.py` | Vectorized environment. Per-agent occupancy + positions + `last_known_pos[N,M,M,2]` + `visited_step` + reward-baseline caches (`last_meeting_node_mask`, `last_own_free_node`) + BF warm-start caches (`_dist_curr_prev`, `_dist_team_prev`). `step(action)`: sub-step LiDAR move, wall + agent-agent collision revert, `_comm_check` (Euclidean range + Bresenham LOS), `fuse_maps`, **per-agent set-op reward**, `_refresh_obs`. `_refresh_obs` builds per-agent graph + BF-from-curr + BF-from-teammate + top-K candidates + strategic features. `reload_map(env_idx, map_idx)` does a full reset for eval. `_spread_starts_graph` places M agents on adjacent FREE lattice nodes (BFS + segment-clear). `EnvCfg.from_ckpt_dict(d, **overrides)` rebuilds cfg from a saved checkpoint dict. |
+| `explorer.py` | Vectorized environment. Per-agent occupancy + positions + `last_known_pos[N,M,M,2]` + `visited_step` + reward-baseline caches (`last_meeting_node_mask`, `last_own_free_node`) + BF warm-start caches (`_dist_curr_prev`, `_dist_team_prev`). `step(action)`: sub-step LiDAR move, wall revert + **asymmetric agent-agent collision** (lower-priority agent yields via per-episode `_collision_key`; winner advances, reverts too only if still blocked), `_comm_check` (Euclidean range + Bresenham LOS), `fuse_maps`, **per-agent set-op reward** (incl. objective second-guessing penalty via `_prev_target_node` + `target_choice`), `_refresh_obs`. `_refresh_obs` builds per-agent graph + BF-from-curr + BF-from-teammate + top-K candidates + strategic features. `reload_map(env_idx, map_idx)` does a full reset for eval. `_spread_starts_graph` places M agents on adjacent FREE lattice nodes (BFS + segment-clear). `EnvCfg.from_ckpt_dict(d, **overrides)` rebuilds cfg from a saved checkpoint dict. |
 | `teammate_belief.py` | Stub for v0.7 ToM teammate-state estimator. Unused. |
 
 ### models/
@@ -171,9 +171,15 @@ give[i]    = |B_ij ∧ ¬M_j| / N_max             # NEW cells I bring to j (j do
 recv[i]    = |B_ji ∧ ¬M_i| / N_max             # NEW cells I receive from j
 overlap[i] = |B_ij ∧ B_ji|  / N_max             # we BOTH scanned same area since last meeting
 
-# Anti-loop / anti-chase:
-revisit_pen[a]   = 1 if chosen node was visited in last W=8 steps
+# Anti-loop / anti-chase / anti-stall:
+revisit_pen[a]   = (W − age)/W  if chosen node visited within last W steps (graduated by recency)
 proximity_pen[a] = 1 if teammate within sensor_range AND visible (comm)
+stall_pen[a]     = 1 if ‖pos_after − pos_before‖ < nr·0.5  (no net displacement this step)
+
+# Objective second-guessing (graph-tree, B+D):
+target_switch_pen[a] = 1 if  branch(g_t) ≠ branch(g_{t-1})  AND  g_{t-1} still pursuable
+                       branch(g) = first-hop slot off curr toward g in the BF-from-curr tree
+                       pursuable = reachable (bf_dist finite) AND not reached (bf_dist > 1.5·nr)
 
 # Final reward:
 reward[a] = α_scan · scan_self_delta[a]
@@ -183,11 +189,23 @@ reward[a] = α_scan · scan_self_delta[a]
           − η_lap  · Σ_j overlap[a]
           − γ      · revisit_pen[a]
           − ε_prox · proximity_pen[a]
+          − δ_obj  · target_switch_pen[a]
+          − δ_stall· stall_pen[a]
           + 1{terminated} · completion_bonus
           − step_penalty
 ```
 
-Defaults: `α_scan=1.0`, `β=0.3`, `ζ_give=1.5`, `ζ_recv=0.5`, `η_lap=3.0`, `γ=0.02`, `ε_prox=0.005`, `W=8`, `completion_bonus=10.0`, `step_penalty_coef=0.1`.
+Defaults: `α_scan=1.0`, `β=0.3`, `ζ_give=1.5`, `ζ_recv=0.5`, `η_lap=3.0`, `γ=0.05`, `ε_prox=0.05`, `δ_obj=0.05`, `δ_stall=0.1`, `W=8`, `completion_bonus=10.0`, `step_penalty_coef=0.1`.
+
+**Stall penalty (anti-standing-still)**: physical no-progress detector — snapshot `pos` at the
+top of `step()`, compare after the sub-step loop; `‖Δpos‖ < nr·0.5` → `stall_pen=1`. Catches
+BOTH collision-revert holds (asymmetric-collision loser) and invalid/curr-node picks. Heavily
+weighted (`δ_stall=0.1` ≫ old revisit) to break chase/standoff deadlocks and push agents to
+reroute / separate. `revisit_pen` is now **graduated** (`(W−age)/W`) so tighter loops cost
+more; `ε_prox` raised 0.005→0.05. These plus `δ_stall` are the primary anti-degenerate knobs
+the W&B sweep tunes (§12).
+
+**Objective second-guessing penalty (B+D, graph-tree)**: treats the BF-from-curr parent tree (`bf_parent_from_curr`) as the exploration tree. The strategic target `g_t` lives in some first-hop branch off the current node; `branch(g)` = walk `bf_parent` from `g` back to a curr-neighbor. Penalty fires only when the committed branch **flips** AND the previous target was still **reachable + unreached** (D gate via cached `bf_dist_from_curr`). A target that shifts *forward along the same branch* (receding frontier) keeps the same first-hop → **0 penalty**, regardless of how far it jumped — the term keys on graph *direction*, not node identity. Reaching / invalidating the old target opens free re-selection. Computed in the PRE-step frame (tree rooted where the decision was made), from `self._last_obs` + `self._prev_target_node`. Requires `target_choice` plumbed from `model.act` → `env.step`; eval/baseline pass nothing → term off. Agent-local → decentralized, real-robot-safe.
 
 **Why per-agent**:
 - Phase A v2's strategic head needs per-agent gradient signal to differentiate yielding.
@@ -245,15 +263,27 @@ Both are saved in the checkpoint cfg and propagated to eval so renders reflect t
 | `--give-bonus` | `1.5` | ζ_give: NEW cells brought to teammate at comm |
 | `--recv-bonus` | `0.5` | ζ_recv: NEW cells received at comm |
 | `--overlap-pen` | `3.0` | η_lap: redundant parallel-scan penalty |
-| `--revisit-pen` | `0.02` | γ: revisit penalty per step |
+| `--revisit-pen` | `0.05` | γ: revisit penalty per step (graduated by recency) |
 | `--revisit-window` | `8` | W: revisit lookback steps |
 | `--yield-scale` | `3.0` | amplify `cand_own_minus_team` yield feature |
-| `--proximity-pen` | `0.005` | per-step penalty when teammate visible within sensor_range |
+| `--proximity-pen` | `0.05` | per-step penalty when teammate visible within sensor_range |
+| `--target-switch-pen` | `0.05` | δ_obj: objective second-guessing penalty (BF-tree branch flip while prev target still pursuable) |
+| `--stall-pen` | `0.1` | δ_stall: heavy penalty for standing still (no net displacement this step) |
 | `--path-bias-floor` | `1.5` | fixed floor on target-following bias (actor logits toward strategic pick's BF first-hop) |
+| `--clip-eps` | `0.2` | PPO clip ε (→ `MAPPOCfg`) |
+| `--k-epochs` | `4` | PPO epochs per rollout |
+| `--gae-lambda` | `0.95` | GAE λ |
+| `--gamma` | `0.99` | discount factor |
+| `--vf-coef` | `0.5` | value loss weight |
+| `--tbptt-steps` | `16` | TBPTT chunk length |
+| `--lr` | `3e-4` | Adam LR (now wired to `lr_actor`) |
+| `--wandb` | off | Log to Weights & Biases. `--wandb-project/-entity/-group/-run-name/-mode/-tags` |
 
 **On `--seed`**: seeds torch RNG (action sampling, init) only. Map sampling RNG uses fresh entropy each run, so training and eval see different maps regardless of `--seed`. `eval_final.py --seed N` accepts an int for reproducible map selection.
 
-Knobs not on the CLI (lattice spacing, GAT width, PPO clip, etc.): see [§11](#11-currently-hardcoded-knobs-not-on-the-cli).
+MAPPO knobs (`clip-eps`, `k-epochs`, `gae-lambda`, `gamma`, `vf-coef`, `tbptt-steps`) and the
+reward coefs above are all exposed precisely so the W&B sweep (§12) can tune them. Remaining
+hardcoded knobs (lattice spacing, GAT width, ...): see [§11](#11-currently-hardcoded-knobs-not-on-the-cli).
 
 ---
 
@@ -360,10 +390,10 @@ Trained policy on `train/easy` should beat the random baseline by ≥ 2× to cou
 
 ## 8. Diagnostics — what good and bad training look like
 
-Per-iter log line (v0.4):
+Per-iter log line:
 
 ```
-[it   N/T] ep_end=XX.X%(ended=K)  pg=±0.0NNN  v=N.NNNN  ent=N.NNN  kl=±0.0NNN  clip=N.N%  sps=NNN(NNNavg) coll=NNNN upd=NNN
+[it   N/T] ep_end=XX.X%(ended=K)  pg=±0.0NNN  v=N.NNNN  ent=N.NNN  kl=±0.0NNN  clip=N.N%  redun=N.NN stall=N% pair=N.NN sps=NNN(NNNavg)
 ```
 
 | Metric | Meaning / Healthy | Warning sign |
@@ -374,7 +404,15 @@ Per-iter log line (v0.4):
 | `ent` | decays smoothly | crashes to ~0 within a few iters (collapse) |
 | `kl` | < 0.02 | > 0.1 (clip ineffective) |
 | `clip` | 5-20% | > 50% (lr too high) or 0% (too low) |
+| `redun` | redundancy `(Σ own_free − union)/union`. Lower over training = agents stop overlapping | stays high / rises (chasing, scanning same area) |
+| `stall` | fraction of steps with no net displacement. Should fall toward 0 | stays high (deadlocks / standing still) |
+| `pair` | mean pairwise inter-agent distance / canvas-diag. Rises as agents separate | stays low (chasing / clustered) |
 | `coll`/`upd` sps | flat across run | dropping (memory pressure / recompile / oom) |
+
+Full exploration-quality metric set (logged to W&B, §12): `metric/redundancy`,
+`metric/stall_rate`, `metric/revisit_rate`, `metric/mean_pair_dist`,
+`metric/coverage_per_dist`, `metric/steps_to_50`, `metric/steps_to_90`, plus per-term reward
+contributions under `reward/*` and the composite `explore/efficiency`.
 
 **ep_end populated only when episodes finish in the rollout.** With `rollout-len < max-episode-steps`, most iters show `n/a` (only 99%-threshold completions land). Match them for a number every iter.
 
@@ -516,18 +554,61 @@ These defaults live in dataclass definitions and are not exposed as CLI flags. E
 
 | Name | Default | Effect |
 |---|---|---|
-| `clip_eps` | `0.2` | PPO clip ε |
-| `vf_coef` | `0.5` | Value loss weight |
-| `ent_coef` | `0.01` | Entropy bonus weight (overridden by `--ent-coef` CLI) |
-| `k_epochs` | `4` | PPO epochs per rollout. Reduce to 2 if KL > 0.02 |
-| `tbptt_steps` | `16` | TBPTT chunk length for hidden-state truncation |
-| `n_minibatches` | `1` | PPO minibatches per epoch (overridden by `--minibatches` CLI). Must divide `n-envs` |
-| `gamma` | `0.99` | Discount factor |
-| `gae_lambda` | `0.95` | GAE λ |
+| `clip_eps` | `0.2` | PPO clip ε (`--clip-eps`) |
+| `vf_coef` | `0.5` | Value loss weight (`--vf-coef`) |
+| `ent_coef` | `0.01` | Entropy bonus weight (`--ent-coef`) |
+| `k_epochs` | `4` | PPO epochs per rollout (`--k-epochs`). Reduce to 2 if KL > 0.02 |
+| `tbptt_steps` | `16` | TBPTT chunk length for hidden-state truncation (`--tbptt-steps`) |
+| `n_minibatches` | `1` | PPO minibatches per epoch (`--minibatches`). Must divide `n-envs` |
+| `gamma` | `0.99` | Discount factor (`--gamma`) |
+| `lam` | `0.95` | GAE λ (`--gae-lambda`) |
 | `grad_clip` | `0.5` | Global gradient clip norm |
 | `clip_vloss` | `True` | Clipped value loss (max of unclipped and `V_old±clip_eps` error). MAPPO paper §3.3 / Alg.1 |
 | `huber_delta` | `10.0` | Value-loss Huber delta (paper Tab.7). `0.0` = squared error. Robust to return-spike outliers |
 
 **Weight init**: all `nn.Linear` / `nn.GRUCell` use orthogonal init (gain √2), policy/strategic logits gain 0.01, value head gain 1.0 — MAPPO paper Tab.7 (`models/init_utils.py`). Was torch-default before.
+
+---
+
+## 12. Weights & Biases + hyperparameter sweeps
+
+`wandb` is in `requirements.txt` (pip-installable in the running container if the image
+predates it). Logging is **off by default** — pass `--wandb` (no network otherwise).
+
+**Per-iter logging** (`train.driver.train`, guarded import → silent no-op if `--wandb` off or
+package missing): `train/{pg_loss,v_loss,entropy,kl,clipfrac}`, `perf/{sps,coll_sps,upd_sps}`,
+`explore/{ep_end,ep_end_n,efficiency}`, `reward/*` (per-term signed contributions from
+`info["reward_terms"]`), `metric/*` (exploration quality from `info["metrics"]`, aggregated
+over the rollout in `collect_rollout`). `wandb.init(config=…)` flattens the full `TrainCfg`
+(incl. `env` + `ppo`).
+
+**Composite efficiency** (sweep target): `explore/efficiency = ep_end − w_red·redundancy −
+w_stall·stall_rate` (`TrainCfg.eff_w_redundancy`, `eff_w_stall`, both `0.5`). Captures coverage
+while penalizing overlap and standing still.
+
+**Exploration metrics** (`env.explorer.step` → `info["metrics"]`, all GPU):
+
+| Key | Definition |
+|---|---|
+| `redundancy` | `(Σ_a own_free − union_free)/union_free` on **PRE-fusion** per-agent maps (overlap; low good). Pre-fusion is essential — post-fusion in-comm agents share an identical map → metric pinned at M−1 |
+| `stall_rate` | mean of `stall_pen` (fraction of steps with no net displacement) |
+| `revisit_rate` | fraction of steps revisiting a node within `W` |
+| `mean_pair_dist` | mean pairwise `‖pos_i−pos_j‖` / canvas-diag (separation; chase = low). Clean — unaffected by fusion |
+| `coverage_per_dist` | `Σ team_delta / Σ step_disp` (Δunion per pixel travelled; efficiency, size-invariant) |
+| `steps_to_50` / `steps_to_90` | first step each env crosses 50/90% coverage this rollout (raw speed) |
+| `steps_to_50_per_kfree` / `_90_per_kfree` | above ÷ (free cells / 1000) → **map-size-normalized** speed (comparable across maps with different free area) |
+
+Residual caveat on `redundancy`: even pre-fusion, each agent's map carries cells fused in *past* rendezvous, so the metric reflects current map *divergence* rather than pure independent-scan overlap. `mean_pair_dist` + `coverage_per_dist` are the cleaner, fusion-free chase/efficiency signals — cross-check all three.
+
+**Sweeps** — `sweep.yaml` (repo root), Bayesian, maximizes `explore/efficiency` over MAPPO
+knobs (`lr`, `ent-coef`, `clip-eps`, `k-epochs`, `gae-lambda`, `gamma`, `minibatches`) and
+coordination coefs (`overlap-pen`, `proximity-pen`, `revisit-pen`, `target-switch-pen`,
+`stall-pen`, `yield-scale`, `give-bonus`, `recv-bonus`, `scan-weight`, `team-weight`). Param
+keys are the exact dashed CLI flags (W&B emits `--<key>=<value>`).
+
+```bash
+docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb login && wandb sweep sweep.yaml'
+docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb agent <ENTITY/PROJECT/SWEEP_ID>'
+```
 
 To change any of these, edit the dataclass directly. There is no in-place override — values are stamped into the checkpoint's `cfg` field at save time.

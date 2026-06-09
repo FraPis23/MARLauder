@@ -56,22 +56,38 @@ def main() -> None:
     ap.add_argument("--recv-bonus",      type=float, default=0.5,  help="ζ_recv: NEW cells received at rendezvous")
     ap.add_argument("--overlap-pen",     type=float, default=3.0,  help="η_lap: redundant parallel scan penalty")
     ap.add_argument("--yield-scale",     type=float, default=3.0,  help="G.4.a: scale on cand_own_minus_team yield feature")
-    ap.add_argument("--proximity-pen",   type=float, default=0.005,help="G.4.b: per-step penalty for being within sensor_range of teammate (gated by comm)")
+    ap.add_argument("--proximity-pen",   type=float, default=0.05, help="G.4.b: per-step penalty for being within sensor_range of teammate (gated by comm)")
     ap.add_argument("--path-bias-floor", type=float, default=1.5,  help="I.3: fixed floor on target-following bias (actor logits)")
-    ap.add_argument("--revisit-pen",     type=float, default=0.02, help="γ: revisit penalty per step")
+    ap.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
     ap.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
+    ap.add_argument("--target-switch-pen", type=float, default=0.05, help="δ_obj: objective second-guessing penalty (BF-tree branch flip while prev target still pursuable)")
+    ap.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
     ap.add_argument("--n-hops", type=int, default=2,
                     help="Ego-centric encoder window radius. Window side = 2·n_hops + 3 "
                          "(49 nodes at 2, 121 at 4, 225 at 6). GAT n_layers tied to n_hops.")
-    # --- learning ---
+    # --- learning (MAPPO knobs — exposed for W&B sweeps) ---
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--ent-coef", type=float, default=0.01)
+    ap.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip ε")
+    ap.add_argument("--k-epochs", type=int, default=4, help="PPO epochs per rollout")
+    ap.add_argument("--gae-lambda", type=float, default=0.95, help="GAE λ")
+    ap.add_argument("--gamma", type=float, default=0.99, help="discount factor")
+    ap.add_argument("--vf-coef", type=float, default=0.5, help="value loss weight")
+    ap.add_argument("--tbptt-steps", type=int, default=16, help="TBPTT chunk length")
     # --- flags ---
     ap.add_argument("--compile", action="store_true", help="torch.compile encoder (CUDA only)")
     ap.add_argument("--eval-on-ckpt", action="store_true",
                     help="Emit 2 eval GIFs at each milestone (25/50/75/100%%)")
     ap.add_argument("--eval-steps", type=int, default=-1,
                     help="G.2: episode length for eval-on-ckpt GIFs. -1 = same as --max-episode-steps")
+    # --- Weights & Biases ---
+    ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
+    ap.add_argument("--wandb-project", default="marlauder")
+    ap.add_argument("--wandb-entity", default=None)
+    ap.add_argument("--wandb-group", default=None)
+    ap.add_argument("--wandb-run-name", default=None)
+    ap.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
+    ap.add_argument("--wandb-tags", nargs="*", default=[])
     args = ap.parse_args()
 
     cfg = TrainCfg(
@@ -82,6 +98,7 @@ def main() -> None:
         n_agents=args.n_agents,
         rollout_len=args.rollout_len,
         n_hops=args.n_hops,
+        lr_actor=args.lr,
         path_bias_floor=args.path_bias_floor,
         device=args.device,
         seed=args.seed,
@@ -93,6 +110,13 @@ def main() -> None:
         ),
         eval_steps=(args.max_episode_steps if args.eval_steps < 0 else args.eval_steps),
         curriculum=args.curriculum,
+        wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_group=args.wandb_group,
+        wandb_run_name=args.wandb_run_name,
+        wandb_mode=args.wandb_mode,
+        wandb_tags=tuple(args.wandb_tags),
         env=EnvCfg(
             n_envs=args.n_envs,
             n_agents=args.n_agents,
@@ -113,10 +137,18 @@ def main() -> None:
             proximity_penalty_coef=args.proximity_pen,
             revisit_penalty_coef=args.revisit_pen,
             revisit_window=args.revisit_window,
+            target_switch_penalty_coef=args.target_switch_pen,
+            stall_penalty_coef=args.stall_pen,
         ),
         ppo=MAPPOCfg(
             ent_coef=args.ent_coef,
             n_minibatches=args.minibatches,
+            clip_eps=args.clip_eps,
+            k_epochs=args.k_epochs,
+            lam=args.gae_lambda,
+            gamma=args.gamma,
+            vf_coef=args.vf_coef,
+            tbptt_steps=args.tbptt_steps,
         ),
     )
     train(cfg, log_every=1)

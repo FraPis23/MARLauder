@@ -1,0 +1,107 @@
+# W&B hyperparameter sweep for MARLauder.
+#
+# Usage (inside the marlauder container):
+#   wandb login                       # once
+#   wandb sweep sweep.yaml            # prints a SWEEP_ID
+#   wandb agent <ENTITY/PROJECT/SWEEP_ID>   # run one or more agents
+#
+# Optimizes the composite efficiency score logged by the trainer:
+#   efficiency = ep_end − 0.5·redundancy − 0.5·stall_rate
+# (high coverage, low overlap, no standing still).
+#
+# Fixed scale args keep each trial short enough to compare; raise --total-steps for
+# the final long runs. Every swept key has a matching CLI flag in scripts/run_train.py.
+
+program: scripts/run_train.py
+method: bayes
+metric:
+  name: explore/efficiency
+  goal: maximize
+
+# Kill weak trials early instead of running every config to 2M steps. Hyperband counts
+# logged iters (one wandb.log per training iter). Brackets at ~30/60/120 iters; bottom
+# configs are stopped at 30 → big GPU-hour savings, good configs train full length.
+early_terminate:
+  type: hyperband
+  min_iter: 30
+  eta: 2
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --split=train/easy
+  - --n-envs=64
+  - --n-agents=2
+  - --comm-range=120
+  - --rollout-len=256
+  - --max-episode-steps=256
+  - --total-steps=2000000
+  - --compile
+  - --wandb
+  - --wandb-project=marlauder-sweep
+  - ${args}
+
+# NOTE: parameter keys MUST be the exact CLI flag names (dashed). W&B expands ${args}
+# as `--<key>=<value>`; argparse does not accept underscore variants of dashed flags.
+parameters:
+  # --- MAPPO ---
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.001
+  ent-coef:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.05
+  clip-eps:
+    values: [0.1, 0.2, 0.3]
+  k-epochs:
+    values: [2, 4, 6]
+  gae-lambda:
+    values: [0.9, 0.95, 0.98]
+  gamma:
+    values: [0.98, 0.99, 0.995]
+  minibatches:
+    values: [2, 4, 8]
+  # --- coordination / anti-degenerate ---
+  overlap-pen:
+    distribution: uniform
+    min: 1.0
+    max: 5.0
+  proximity-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.2
+  revisit-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.15
+  target-switch-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.2
+  stall-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.3
+  yield-scale:
+    distribution: uniform
+    min: 1.0
+    max: 5.0
+  give-bonus:
+    distribution: uniform
+    min: 0.5
+    max: 3.0
+  recv-bonus:
+    distribution: uniform
+    min: 0.0
+    max: 2.0
+  scan-weight:
+    distribution: uniform
+    min: 0.5
+    max: 2.0
+  team-weight:
+    distribution: uniform
+    min: 0.0
+    max: 1.0
