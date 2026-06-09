@@ -227,7 +227,7 @@ Both are saved in the checkpoint cfg and propagated to eval so renders reflect t
 | `--comm-range` | `120.0` | Communication range (px). Set 0 to disable comm entirely |
 | `--rollout-len` | `128` | T per PPO update |
 | `--max-episode-steps` | `512` | Episode truncation (typically ≥ rollout-len) |
-| `--minibatches` | `1` | PPO minibatches per epoch. Must divide `n-envs`. 4 is a good default at `n-envs=32` |
+| `--minibatches` | `1` | PPO minibatches per epoch. Must divide `n-envs`. **Keep at 1** (max 2): MAPPO paper Suggestion 3 (Fig.5b) shows 4 minibatches fails to solve maps while 1 is best on 22/23 — avoid splitting the batch |
 | `--lr` | `3e-4` | Adam learning rate for actor |
 | `--ent-coef` | `0.01` | Entropy bonus weight |
 | `--compile` | off | `torch.compile` the encoder (~2× update speedup) |
@@ -268,7 +268,7 @@ docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python s
     --n-envs 64 --n-agents 2 \
     --comm-range 120 \
     --rollout-len 256 --max-episode-steps 256 \
-    --minibatches 4 \
+    --minibatches 1 \
     --lr 3e-4 --ent-coef 0.01 \
     --path-bias-floor 1.5 \
     --compile --eval-on-ckpt \
@@ -525,5 +525,9 @@ These defaults live in dataclass definitions and are not exposed as CLI flags. E
 | `gamma` | `0.99` | Discount factor |
 | `gae_lambda` | `0.95` | GAE λ |
 | `grad_clip` | `0.5` | Global gradient clip norm |
+| `clip_vloss` | `True` | Clipped value loss (max of unclipped and `V_old±clip_eps` error). MAPPO paper §3.3 / Alg.1 |
+| `huber_delta` | `10.0` | Value-loss Huber delta (paper Tab.7). `0.0` = squared error. Robust to return-spike outliers |
+
+**Weight init**: all `nn.Linear` / `nn.GRUCell` use orthogonal init (gain √2), policy/strategic logits gain 0.01, value head gain 1.0 — MAPPO paper Tab.7 (`models/init_utils.py`). Was torch-default before.
 
 To change any of these, edit the dataclass directly. There is no in-place override — values are stamped into the checkpoint's `cfg` field at save time.

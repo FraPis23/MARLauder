@@ -31,6 +31,40 @@ class MAPPOCfg:
     n_minibatches: int = 1
     max_grad_norm: float = 0.5
     use_amp: bool = True
+    # MAPPO paper §3.3 / Alg.1 — clipped value loss (max of unclipped and
+    # V_old-clipped squared error). Clip range reuses clip_eps, in the
+    # value-normalized space (same space as the MSE target returns_norm).
+    clip_vloss: bool = True
+    # Huber delta for the value loss (paper Tab.7 = 10.0). 0.0 → plain squared
+    # error. Robust to value-target outliers; with value normalization it rarely
+    # triggers but caps the gradient on return spikes.
+    huber_delta: float = 10.0
+
+
+def _value_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    v_old: torch.Tensor,
+    clip_eps: float,
+    clip_vloss: bool,
+    huber_delta: float,
+) -> torch.Tensor:
+    """PPO value loss. Optionally V_old-clipped (max of the two errors) and/or Huber.
+
+    All tensors are in the value-normalized space. `v_old` is the rollout-time
+    critic output (re-normalized by the caller).
+    """
+    def err(x: torch.Tensor) -> torch.Tensor:
+        if huber_delta > 0.0:
+            return F.huber_loss(x, target, delta=huber_delta, reduction="none")
+        return (x - target) ** 2
+
+    loss_unclipped = err(pred)
+    if not clip_vloss:
+        return loss_unclipped.mean()
+    pred_clipped = v_old + (pred - v_old).clamp(-clip_eps, clip_eps)
+    loss_clipped = err(pred_clipped)
+    return torch.max(loss_unclipped, loss_clipped).mean()
 
 
 def _slice_obs(obs: dict, env_idx: torch.Tensor) -> dict:
@@ -134,7 +168,15 @@ def ppo_update(
                         unclipped = ratio * adv_t
                         clipped = ratio.clamp(1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_t
                         pg = -torch.min(unclipped, clipped).mean()
-                        vl = F.mse_loss(new_val, ret_t)
+                        # V_old (rollout-time critic output, stored denormalized)
+                        # → renormalize into the target space for clipped value loss.
+                        v_old_norm = vnorm.normalize(rollout.values[t, env_idx])
+                        vl = _value_loss(
+                            new_val, ret_t, v_old_norm,
+                            clip_eps=cfg.clip_eps,
+                            clip_vloss=cfg.clip_vloss,
+                            huber_delta=cfg.huber_delta,
+                        )
                         ent = new_ent.mean()
                         chunk_pg = chunk_pg + pg
                         chunk_vl = chunk_vl + vl

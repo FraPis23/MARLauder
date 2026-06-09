@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 from models.gat import GATEncoder
+from models.init_utils import apply_orthogonal, orthogonal_
 
 F_IN = 7
 K = 8
@@ -161,6 +162,13 @@ class MarlActorCritic(nn.Module):
             [5, 6, 7],     # dr= 1
         ], dtype=torch.long)
         self.register_buffer("_kdir_table", _t, persistent=False)
+
+        # MAPPO paper Tab.7 — orthogonal init for every Linear/GRUCell, then
+        # override output heads: policy logits near-uniform (small gain) for
+        # healthy initial exploration; value head at unit gain.
+        apply_orthogonal(self)
+        orthogonal_(self.strategic_head.score, gain=0.01)   # strategic target logits
+        orthogonal_(self.critic_head[-1], gain=1.0)         # V(s) output
 
     @property
     def path_bias(self) -> torch.Tensor:

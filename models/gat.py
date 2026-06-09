@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.init_utils import apply_orthogonal
+
 
 class MaskedGATLayer(nn.Module):
     """Single GAT-style layer with K=8 fixed neighbor padding."""
@@ -95,6 +97,8 @@ class GATEncoder(nn.Module):
         self.layers = nn.ModuleList([MaskedGATLayer(d, d, n_heads=n_heads) for _ in range(n_layers)])
         self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
         self.act = nn.GELU()
+        # MAPPO paper Tab.7 — orthogonal init across all GAT projections.
+        apply_orthogonal(self)
 
     def forward(
         self,
