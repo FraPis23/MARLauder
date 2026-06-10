@@ -135,7 +135,13 @@ obs dict [N, M, ...] → MarlActorCritic.act(obs, h_act, h_crit)
 
 Invalid nodes have feature row zeroed. Edges to invalid neighbors masked in GAT attention. The GAT encoder runs on the ego-centric window `(2·n_hops+3)²` centered on `curr`, not the full lattice.
 
-Utility computed via integral image of the frontier mask (one prefix sum + 4 corner gathers per node), square window approximation of disk, edge-clipped (border nodes underestimate — acceptable).
+**Utility (v2, wall-aware)**: the old (2·UR+1)² raw integral window counted frontier pixels
+**through walls** (a node beside a wall scored frontier in the corridor on the other side,
+poisoning the GAT feature, the strategic candidate ranking and the guidepost argmax). Now:
+(a) per-node frontier indicator from a tiny ~NR/2-px window (integral image, leak negligible),
+(b) h=⌈UR/NR⌉=2 rounds of graph diffusion of that indicator along **collision-checked
+`edge_valid` edges** — frontier mass only flows through passable edges, so walls block it by
+construction. Normalized to [0,1] by 2^h; typical max ≈ 0.1.
 
 ### 3.1 Strategic candidate features (CAND_FEAT_DIM = 8)
 
@@ -181,9 +187,13 @@ target_switch_pen[a] = 1 if  branch(g_t) ≠ branch(g_{t-1})  AND  g_{t-1} still
                        branch(g) = first-hop slot off curr toward g in the BF-from-curr tree
                        pursuable = reachable (bf_dist finite) AND not reached (bf_dist > 1.5·nr)
 
-# Final reward:
-reward[a] = α_scan · scan_self_delta[a]
-          + β     · team_delta
+# v2 — privileged novel-scan credit (IR2-style r_f). union = team union FREE-node mask:
+novel_scan[a] = |cells a scanned this step ∧ ¬union_prev| / scan_norm_nodes(=50)
+team_delta_node = |union_now ∧ ¬union_prev| / scan_norm_nodes
+
+# Final reward (v2):
+reward[a] = α_novel · novel_scan[a]
+          + β     · team_delta_node
           + ζ_give · Σ_j give[a]
           + ζ_recv · Σ_j recv[a]
           − η_lap  · Σ_j overlap[a]
@@ -195,7 +205,25 @@ reward[a] = α_scan · scan_self_delta[a]
           − step_penalty
 ```
 
-Defaults: `α_scan=1.0`, `β=0.3`, `ζ_give=1.5`, `ζ_recv=0.5`, `η_lap=3.0`, `γ=0.05`, `ε_prox=0.05`, `δ_obj=0.05`, `δ_stall=0.1`, `W=8`, `completion_bonus=10.0`, `step_penalty_coef=0.1`.
+Defaults: `α_novel=1.0`, `β=0.3`, `ζ_give=1.5`, `ζ_recv=0.5`, `η_lap=3.0`, `γ=0.05`, `ε_prox=0.05`, `δ_obj=0.01`, `δ_stall=0.1`, `W=8`, `completion_bonus=10.0`, `step_penalty_coef=0.1`.
+
+**v2 novel-scan credit**: pays only cells **new to the team union** — a follower scanning a
+leader's wake earns 0, so splitting up is the highest-paying policy by construction (the old
+`scan_self + shared team_delta` paid the follower a β commission on the leader's work →
+chasing was rational). Privileged (training-only, CTDE; deployed actor never sees the union).
+`scan_self_delta` remains as the logged diagnostic `reward/scan_self_diag`. Both-scan-same-cell
+ties credit both agents (simultaneous discovery). Spawn scans are baseline, not credited.
+Relationship to give/recv/overlap: those are the **rendezvous accounting** (fire at comm
+events, baselined at last meeting); novel-scan is **instantaneous credit at scan time** —
+complementary, and under `--force-full-occupancy-sharing` (per-step fusion) the rendezvous
+terms degenerate to ≈0 leaving novel-scan as the only per-agent channel (exploited by the
+Stage-1 sweep, §12). Dense normalization `scan_norm_nodes=50` (≈ one sensor disk) replaces
+/N_max≈1200 so shaping is O(0.1), not O(0.001), vs the completion bonus.
+
+**v2 target_switch**: env receives the strategic head's **argmax intent** (`target_argmax`
+from `model.act`), not the Gumbel-sampled `target_choice` — sampling noise no longer counts
+as second-guessing. Default coef 0.05→0.01 (sweep v1: sampled variant dominated the dense
+reward 10–50×, `reward/target_switch` = −0.007…−0.054/step vs scan +0.0004…+0.0018).
 
 **Stall penalty (anti-standing-still)**: physical no-progress detector — snapshot `pos` at the
 top of `step()`, compare after the sub-step loop; `‖Δpos‖ < nr·0.5` → `stall_pen=1`. Catches
@@ -258,7 +286,8 @@ Both are saved in the checkpoint cfg and propagated to eval so renders reflect t
 | `--force-full-occupancy-sharing` | off | Debug: maps fused every step (occupancy synced across agents) |
 | `--curriculum` | off | Ramp train/easy → train/difficult mix (0–30% easy, 30–60% 70/30, 60–100% 50/50). Requires same-canvas splits |
 | `--eval-split` | = `--split` | Split for eval-on-ckpt GIFs (defaults to `test/complex` when `--curriculum`) |
-| `--scan-weight` | `1.0` | α_scan: per-agent scan-delta coef |
+| `--scan-weight` | `1.0` | (v2: diagnostic only — scan_self no longer in the reward) |
+| `--novel-scan-weight` | `1.0` | α_novel: privileged team-union novel-scan credit (v2 core reward term) |
 | `--team-weight` | `0.3` | β: shared Δunion coef (cooperation anchor) |
 | `--give-bonus` | `1.5` | ζ_give: NEW cells brought to teammate at comm |
 | `--recv-bonus` | `0.5` | ζ_recv: NEW cells received at comm |
@@ -267,7 +296,7 @@ Both are saved in the checkpoint cfg and propagated to eval so renders reflect t
 | `--revisit-window` | `8` | W: revisit lookback steps |
 | `--yield-scale` | `3.0` | amplify `cand_own_minus_team` yield feature |
 | `--proximity-pen` | `0.05` | per-step penalty when teammate visible within sensor_range |
-| `--target-switch-pen` | `0.05` | δ_obj: objective second-guessing penalty (BF-tree branch flip while prev target still pursuable) |
+| `--target-switch-pen` | `0.01` | δ_obj: objective second-guessing penalty (v2: argmax intent, default lowered from 0.05) |
 | `--stall-pen` | `0.1` | δ_stall: heavy penalty for standing still (no net displacement this step) |
 | `--path-bias-floor` | `1.5` | fixed floor on target-following bias (actor logits toward strategic pick's BF first-hop) |
 | `--clip-eps` | `0.2` | PPO clip ε (→ `MAPPOCfg`) |
@@ -582,9 +611,19 @@ package missing): `train/{pg_loss,v_loss,entropy,kl,clipfrac}`, `perf/{sps,coll_
 over the rollout in `collect_rollout`). `wandb.init(config=…)` flattens the full `TrainCfg`
 (incl. `env` + `ppo`).
 
-**Composite efficiency** (sweep target): `explore/efficiency = ep_end − w_red·redundancy −
-w_stall·stall_rate` (`TrainCfg.eff_w_redundancy`, `eff_w_stall`, both `0.5`). Captures coverage
-while penalizing overlap and standing still.
+**Fixed eval suite (v2 — the sweep's scoring source)**: every `TrainCfg.eval_every=10` iters,
+`_run_eval_suite` runs the policy **deterministically** on the 8 hardcoded validation maps
+`EVAL_MAP_IDX` (same for every run/machine — "same exam") in a persistent 1-env Explorer that
+mirrors the training cfg (force flags incl.). Logs `eval/{coverage_auc, contrib_imbalance,
+sensing_overlap, comm_duty, success_rate, steps_to_90, score}` where
+`eval/score = coverage_auc − 0.5·contrib_imbalance − 0.25·sensing_overlap`
+(`TrainCfg.score_w_imbalance/score_w_overlap`). AUC pads early success with the final
+explored_rate so finishing sooner scores strictly higher. `contrib_imbalance` =
+`max_a(novel share) − 1/M` from `info["novel_cells_ep"]`. These 8 maps are validation —
+final reporting must use fresh random maps / `test/*` splits. Cost ≈ 5% wall time.
+
+Legacy rollout-based `explore/efficiency` (= ep_end − 0.5·redundancy − 0.5·stall_rate) is
+still logged but is NOT the sweep target anymore (it saturated in sweep v1).
 
 **Exploration metrics** (`env.explorer.step` → `info["metrics"]`, all GPU):
 
@@ -600,11 +639,23 @@ while penalizing overlap and standing still.
 
 Residual caveat on `redundancy`: even pre-fusion, each agent's map carries cells fused in *past* rendezvous, so the metric reflects current map *divergence* rather than pure independent-scan overlap. `mean_pair_dist` + `coverage_per_dist` are the cleaner, fusion-free chase/efficiency signals — cross-check all three.
 
-**Sweeps** — `sweep.yaml` (repo root), Bayesian, maximizes `explore/efficiency` over MAPPO
-knobs (`lr`, `ent-coef`, `clip-eps`, `k-epochs`, `gae-lambda`, `gamma`, `minibatches`) and
-coordination coefs (`overlap-pen`, `proximity-pen`, `revisit-pen`, `target-switch-pen`,
-`stall-pen`, `yield-scale`, `give-bonus`, `recv-bonus`, `scan-weight`, `team-weight`). Param
-keys are the exact dashed CLI flags (W&B emits `--<key>=<value>`).
+**Sweeps v2 — two stages, MAPPO frozen** (sweep v1 over 17 dims produced no signal: saturated
+metric, dominated reward, no MAPPO separation, k_epochs=6 KL blowups). Both stages maximize
+`eval/score`; Hyperband `min_iter: 3` counts eval-suite logs (≈ train iter 30). Frozen MAPPO:
+lr 3e-4, ent 0.005, clip 0.2, k 4, λ 0.95, γ 0.99, mb 4, tbptt 16.
+
+1. **`sweep.yaml` — Stage 1, division of labor under perfect information.** Trials run with
+   `--force-full-occupancy-sharing --force-full-pos-sharing` (rendezvous terms degenerate →
+   novel-scan is the only per-agent credit). Swept: `novel-scan-weight [0.5,2]`,
+   `team-weight [0,0.5]`, `proximity-pen [0,0.2]`, `target-switch-pen [0,0.05]`,
+   `n-hops {2,4,6}` (window 49/121/225 nodes, n_layers tied; peak VRAM measured 6.5 GB at
+   h=6 / n-envs 64 — fits the 12 GB 4080).
+2. **`sweep_stage2.yaml` — Stage 2, rendezvous economy at comm-range 120.** Paste Stage-1
+   winners into the marked command block; sweep only `overlap-pen [0.5,3]` (lowered — novel
+   scan already zero-pays redundant cells), `give-bonus [0.5,3]`, `recv-bonus [0,1.5]`.
+   `comm_duty_cycle` becomes meaningful here (Stage 1 pins it at 1.0).
+
+Param keys are the exact dashed CLI flags (W&B emits `--<key>=<value>`).
 
 ```bash
 docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb login && wandb sweep sweep.yaml'

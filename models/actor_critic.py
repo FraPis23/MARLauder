@@ -317,6 +317,10 @@ class MarlActorCritic(nn.Module):
             "hidden_critic": h_crit_out,
             "target_choice": target_idx.view(N, M),                  # K-slot in cand list
             "target_logits": target_logits.view(N, M, K_cand),
+            # A3 — deterministic strategic intent (masked-logit argmax, no Gumbel noise).
+            # Used by the env's target_switch penalty so exploration noise in the sampled
+            # pick doesn't register as "second-guessing".
+            "target_argmax": target_logits.argmax(dim=-1).view(N, M),
         }
 
     # ---------------- evaluate (for PPO update) ----------------

@@ -50,7 +50,8 @@ def main() -> None:
     ap.add_argument("--top-k", type=int, default=16,
                     help="Phase A v2: top-K frontier candidates per agent for strategic head")
     # Phase D reward shaping (lattice-level set ops, baselined at last comm).
-    ap.add_argument("--scan-weight",     type=float, default=1.0,  help="α_scan: LiDAR-scanned node delta coef")
+    ap.add_argument("--scan-weight",     type=float, default=1.0,  help="(diagnostic only since v2; scan_self no longer in reward)")
+    ap.add_argument("--novel-scan-weight", type=float, default=1.0, help="α_novel: privileged team-union novel-scan credit (v2 core reward)")
     ap.add_argument("--team-weight",     type=float, default=0.3,  help="β: shared Δunion_free coef")
     ap.add_argument("--give-bonus",      type=float, default=1.5,  help="ζ_give: NEW cells brought to teammate")
     ap.add_argument("--recv-bonus",      type=float, default=0.5,  help="ζ_recv: NEW cells received at rendezvous")
@@ -60,7 +61,7 @@ def main() -> None:
     ap.add_argument("--path-bias-floor", type=float, default=1.5,  help="I.3: fixed floor on target-following bias (actor logits)")
     ap.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
     ap.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
-    ap.add_argument("--target-switch-pen", type=float, default=0.05, help="δ_obj: objective second-guessing penalty (BF-tree branch flip while prev target still pursuable)")
+    ap.add_argument("--target-switch-pen", type=float, default=0.01, help="δ_obj: objective second-guessing penalty (argmax intent; v2 default 0.01 — v1's 0.05+sampled pick dominated the dense reward)")
     ap.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
     ap.add_argument("--n-hops", type=int, default=2,
                     help="Ego-centric encoder window radius. Window side = 2·n_hops + 3 "
@@ -129,6 +130,7 @@ def main() -> None:
             force_full_occupancy_sharing=args.force_full_occupancy_sharing,
             top_k_candidates=args.top_k,
             scan_reward_weight=args.scan_weight,
+            novel_scan_weight=args.novel_scan_weight,
             team_reward_weight=args.team_weight,
             give_bonus_coef=args.give_bonus,
             recv_bonus_coef=args.recv_bonus,

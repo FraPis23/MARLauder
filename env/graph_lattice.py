@@ -243,22 +243,41 @@ class GraphLattice:
         edge_valid = endpoints_valid & collision_free
         edge_idx = torch.where(edge_valid, edge_idx, torch.full_like(edge_idx, -1))
 
-        # 4) Utility via integral image of frontier (square window approximation of disk).
+        # 4) Utility — WALL-AWARE (v2). The old version summed frontier pixels in a raw
+        # (2·UR+1)² integral-image window with NO wall check: a node beside a wall counted
+        # frontier in the corridor on the other side, poisoning the GAT utility feature,
+        # the strategic candidate ranking and the guidepost argmax. Now:
+        #   (a) per-node frontier indicator from a TINY window (~NR/2 px — wall leak
+        #       negligible at one half lattice spacing), same integral-image trick;
+        #   (b) diffuse that indicator h rounds along COLLISION-CHECKED edges (edge_valid):
+        #       frontier mass can only flow through passable edges → walls block it
+        #       by construction. h ≈ UR/NR keeps the old spatial reach.
         fr = frontier.float()                                     # [N, H, W]
         ii = F.pad(fr, (1, 0, 1, 0)).cumsum(-1).cumsum(-2)        # [N, H+1, W+1]
-        UR = self.UR
-        x0 = (node_x - UR).clamp(0, W)
-        x1 = (node_x + UR + 1).clamp(0, W)
-        y0 = (node_y - UR).clamp(0, H)
-        y1 = (node_y + UR + 1).clamp(0, H)
+        r_ind = max(2, self.NR // 2)
+        x0 = (node_x - r_ind).clamp(0, W)
+        x1 = (node_x + r_ind + 1).clamp(0, W)
+        y0 = (node_y - r_ind).clamp(0, H)
+        y1 = (node_y + r_ind + 1).clamp(0, H)
         def _gather_ii(ys, xs):
             lin = ys * (W + 1) + xs
             lin = lin.view(1, self.N_max).expand(N, -1)
             return torch.gather(ii.view(N, -1), 1, lin)
-        util = (_gather_ii(y1, x1) - _gather_ii(y0, x1)
-                - _gather_ii(y1, x0) + _gather_ii(y0, x0))
-        util_max = float((2 * UR + 1) ** 2)
-        utility_norm = (util / util_max).clamp(0, 1)
+        f_count = (_gather_ii(y1, x1) - _gather_ii(y0, x1)
+                   - _gather_ii(y1, x0) + _gather_ii(y0, x0))     # [N, N_max]
+        # Frontier is a ~1 px ribbon → normalize by the window SIDE (max plausible ribbon
+        # length through the window), not its area, so f_ind actually spans [0, 1].
+        f_ind = (f_count / float(2 * r_ind + 1)).clamp(0, 1) * node_valid.float()
+        # Graph diffusion along valid edges only.
+        h_diff = max(1, round(self.UR / self.NR))
+        u = f_ind
+        ev_f = edge_valid.float()                                  # [N, N_max, K]
+        deg = ev_f.sum(-1).clamp(min=1.0)                          # [N, N_max]
+        for _ in range(h_diff):
+            u_nbr = torch.gather(u, 1, nbr_idx_safe.view(N, -1)).view(N, self.N_max, K)
+            u = u + (u_nbr * ev_f).sum(-1) / deg
+        # Normalize: h rounds of (self + nbr-mean) bound u by 2^h · max(f_ind) = 2^h.
+        utility_norm = (u / float(2 ** h_diff)).clamp(0, 1)
         utility_norm = utility_norm * node_valid.float()
 
         # 5) curr_idx: O(1) analytic lookup.

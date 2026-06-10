@@ -62,6 +62,15 @@ class EnvCfg:
     n_hops: int = 2                     # ego-centric encoder window radius (window_side = 2·n_hops + 3)
     # Phase D — per-agent reward shaping (lattice-level set ops, baselined at last comm).
     scan_reward_weight: float = 1.0         # α_scan: cells I LiDAR-scanned this step
+    # v2 reward — privileged novel-scan credit (IR2-style r_f): pay only cells the agent
+    # scanned that are NEW to the TEAM UNION map. Follower scanning a leader's wake earns 0
+    # → removes the chase/free-ride incentive at the source. Training-only privileged signal
+    # (CTDE); the deployed actor never sees the union. Replaces scan_self in the reward;
+    # scan_self stays as a logged diagnostic.
+    novel_scan_weight: float = 1.0          # α_novel
+    # Dense-term normalization: ~one sensor disk worth of lattice nodes per productive step.
+    # The old /N_max (≈1200) crushed dense terms to O(0.001) vs completion bonus 10.
+    scan_norm_nodes: float = 50.0
     team_reward_weight: float = 0.3         # β: shared Δunion (cooperation anchor)
     give_bonus_coef: float = 1.5            # ζ_give: NEW cells I bring to teammate at rendezvous
     recv_bonus_coef: float = 0.5            # ζ_recv: NEW cells I get from teammate at rendezvous
@@ -76,7 +85,9 @@ class EnvCfg:
     # BF-from-curr first-hop BRANCH toward its strategic target while the previous target
     # was still reachable + unreached (B+D). Same-direction target shifts (frontier
     # receding down the same branch) cost 0; only genuine mid-route fork-flips are taxed.
-    target_switch_penalty_coef: float = 0.05    # δ_obj
+    # v2: 0.05 → 0.01 (sweep v1 showed it dominating the dense reward 10–50×) and the
+    # caller now passes the ARGMAX strategic intent, not the Gumbel-sampled pick.
+    target_switch_penalty_coef: float = 0.01    # δ_obj
     # G.4.a — amplify cand_own_minus_team feature (yield signal). Higher scale → faster
     # learning of yielding behavior (smooth, no oscillation).
     cand_own_minus_team_scale: float = 3.0
@@ -193,6 +204,12 @@ class Explorer:
         )
         # Phase D — lattice-level per-agent free count after last step (post-fusion).
         self.last_own_free_node = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        # v2 reward — privileged team-union FREE-node mask (last step) + per-agent post-fusion
+        # own mask (last step), for novel-scan attribution. Episode accumulator of novel cells
+        # per agent feeds the contribution-share metrics.
+        self.union_node_mask = torch.zeros((self.N, self.N_max), dtype=torch.bool, device=self.dev)
+        self.own_node_mask_prev = torch.zeros((self.N, self.M, self.N_max), dtype=torch.bool, device=self.dev)
+        self.novel_cells_ep = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         # Per-pair last-meeting node-level FREE mask (union snapshot at last comm event).
         # [N, M, M, N_max] bool ≈ 154 KB at default (N=32, M=2, N_max≈1200).
         self.last_meeting_node_mask = torch.zeros(
@@ -361,11 +378,30 @@ class Explorer:
         self.last_union = union_free
 
         # scan_self_delta: cells I LiDAR-scanned this step (node level, pre-fusion).
+        # v2: DIAGNOSTIC ONLY — no longer in the reward (novel_scan replaces it).
         denom = float(max(1, N_max))
         own_free_post_scan_node = free_node_pre.float().sum(-1)                            # [N, M]
         scan_self_delta = ((own_free_post_scan_node - self.last_own_free_node) / denom).clamp(min=0.0)
         # Update last_own_free_node to post-fusion (next step's baseline).
         self.last_own_free_node = free_node_post.float().sum(-1)
+
+        # ------ v2 — privileged novel-scan credit + node-level team delta -------
+        # novel[a] = cells a scanned THIS STEP that were new to the TEAM UNION map.
+        # my_new: vs my own post-fusion map of last step (so cells received via fusion
+        # don't count as "scanned by me"). Both-scan-same-new-cell ties credit both
+        # (simultaneous discovery — rare, acceptable).
+        scan_norm = float(max(1.0, self.cfg.scan_norm_nodes))
+        union_prev = self.union_node_mask                                                  # [N, N_max]
+        my_new = free_node_pre & ~self.own_node_mask_prev                                  # [N, M, N_max]
+        novel_count = (my_new & ~union_prev.unsqueeze(1)).float().sum(-1)                  # [N, M]
+        novel_scan = novel_count / scan_norm
+        self.novel_cells_ep = self.novel_cells_ep + novel_count
+        # Node-level team delta on the SAME normalization (β term; pixel team_delta stays
+        # for explored_rate / completion below).
+        union_now = union_prev | free_node_post.any(dim=1)                                 # [N, N_max]
+        team_delta_node = (union_now & ~union_prev).float().sum(-1) / scan_norm            # [N]
+        self.union_node_mask = union_now
+        self.own_node_mask_prev = free_node_post
 
         # Per-pair: contribution / reception / overlap with last-meeting baseline.
         give_bonus  = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
@@ -435,7 +471,7 @@ class Explorer:
 
         terminated_now = explored_rate >= self.cfg.done_explored_thresh
         step_penalty = self.cfg.step_penalty_coef / max(1, self.cfg.max_episode_steps)
-        a_scan  = self.cfg.scan_reward_weight
+        a_novel = self.cfg.novel_scan_weight
         beta    = self.cfg.team_reward_weight
         z_give  = self.cfg.give_bonus_coef
         z_recv  = self.cfg.recv_bonus_coef
@@ -444,8 +480,8 @@ class Explorer:
         eps_prox = self.cfg.proximity_penalty_coef
         delta_obj = self.cfg.target_switch_penalty_coef
         delta_stall = self.cfg.stall_penalty_coef
-        reward = (a_scan  * scan_self_delta
-                  + beta  * team_delta.unsqueeze(-1)
+        reward = (a_novel * novel_scan
+                  + beta  * team_delta_node.unsqueeze(-1)
                   + z_give * give_bonus
                   + z_recv * recv_bonus
                   - eta_lap * overlap_pen
@@ -459,8 +495,9 @@ class Explorer:
         # ---- Telemetry: per-step means of each reward COMPONENT (signed contribution) ----
         # For W&B + tuning. Means over [N, M]. Cheap; detached scalars.
         reward_terms = {
-            "scan":          (a_scan * scan_self_delta).mean(),
-            "team":          (beta * team_delta).mean(),
+            "novel":         (a_novel * novel_scan).mean(),
+            "scan_self_diag": scan_self_delta.mean(),     # diagnostic only, not in reward
+            "team":          (beta * team_delta_node).mean(),
             "give":          (z_give * give_bonus).mean(),
             "recv":          (z_recv * recv_bonus).mean(),
             "overlap":       (-eta_lap * overlap_pen).mean(),
@@ -487,11 +524,23 @@ class Explorer:
             mean_pair_dist = (pd[:, triu].mean(-1) / canvas_diag)                             # [N]
         else:
             mean_pair_dist = torch.zeros(self.N, device=self.dev)
+        # comm_duty_cycle: fraction of pairs currently in comm (off-diagonal mean).
+        # Persistent ≈1.0 = chase signature. sensing_overlap: pair LiDAR disks physically
+        # overlap (dist < 2·sensor_range) — MARVEL's overlap ratio; immune to fusion history.
+        if self.M > 1:
+            offdiag = ~torch.eye(self.M, dtype=torch.bool, device=self.dev)
+            comm_duty = comm_mask[:, offdiag].float().mean()
+            sens_overlap = (pd[:, triu] < 2.0 * self.cfg.sensor_range_px).float().mean()
+        else:
+            comm_duty = torch.zeros((), device=self.dev)
+            sens_overlap = torch.zeros((), device=self.dev)
         metrics = {
             "redundancy":     redundancy.mean(),
             "stall_rate":     stall_pen.mean(),
             "revisit_rate":   is_recent_revisit.float().mean(),
             "mean_pair_dist": mean_pair_dist.mean(),
+            "comm_duty_cycle":     comm_duty,
+            "sensing_overlap":     sens_overlap,
             "team_delta_sum": team_delta.sum(),                   # Σ_N Δunion frac this step (efficiency num)
             "step_disp_sum":  step_disp.sum(),                    # Σ_{N,M} displacement px (efficiency denom)
         }
@@ -508,6 +557,9 @@ class Explorer:
             "step":          self.t.clone(),
             "reward_terms":  reward_terms,
             "metrics":       metrics,
+            # Per-agent union-new cells found so far this episode [N, M] — snapshot taken
+            # BEFORE auto-reset so episode-end contribution shares are readable at done.
+            "novel_cells_ep": self.novel_cells_ep.clone(),
         }
         if bool(done.any().item()):
             idx = torch.nonzero(done, as_tuple=False).flatten().cpu().numpy().tolist()
@@ -749,6 +801,9 @@ class Explorer:
         occ_flat = self.world.occupancy_torch[idx_t].view(1, self.M, -1)
         free_node = occ_flat[:, :, self._node_flat_idx] == _FREE
         self.last_own_free_node[idx_t] = free_node.float().sum(-1)
+        self.own_node_mask_prev[idx_t] = free_node
+        self.union_node_mask[idx_t]    = free_node.any(dim=1)
+        self.novel_cells_ep[idx_t]     = 0.0
         union_node = free_node.any(dim=1, keepdim=False)
         self.last_meeting_node_mask[idx_t] = union_node.view(1, 1, 1, self.N_max).expand(
             -1, self.M, self.M, -1).contiguous()
@@ -826,6 +881,10 @@ class Explorer:
         occ_flat_reset = self.world.occupancy_torch[idx_t].view(n, self.M, -1)              # [n, M, H*W]
         free_node_reset = occ_flat_reset[:, :, self._node_flat_idx] == _FREE                # [n, M, N_max]
         self.last_own_free_node[idx_t] = free_node_reset.float().sum(-1)
+        # v2 — novel-scan baselines: spawn scans are baseline, not credited.
+        self.own_node_mask_prev[idx_t] = free_node_reset
+        self.union_node_mask[idx_t]    = free_node_reset.any(dim=1)
+        self.novel_cells_ep[idx_t]     = 0.0
         # Baseline per pair = node-level UNION of all agents' initial scans.
         # Treats reset as a "virtual rendezvous" where everyone knows what's been scanned.
         union_node_reset = free_node_reset.any(dim=1, keepdim=False)                        # [n, N_max]

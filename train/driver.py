@@ -56,9 +56,15 @@ class TrainCfg:
     wandb_run_name: str | None = None
     wandb_mode: str = "online"          # online | offline | disabled
     wandb_tags: tuple = ()
-    # Composite efficiency score (sweep target): ep_end − w_red·redundancy − w_stall·stall_rate.
+    # Composite efficiency score (legacy, rollout-based): ep_end − w_red·redundancy − w_stall·stall.
     eff_w_redundancy: float = 0.5
     eff_w_stall: float = 0.5
+    # v2 — fixed eval suite (sweep scoring): every eval_every iters run the policy
+    # DETERMINISTICALLY on the fixed EVAL_MAP_IDX maps and log eval/*. The sweep maximizes
+    # eval/score = coverage_auc − w_imb·contrib_imbalance − w_ov·sensing_overlap.
+    eval_every: int = 10
+    score_w_imbalance: float = 0.5
+    score_w_overlap: float = 0.25
 
 
 def _normalize_cfg(cfg: TrainCfg) -> None:
@@ -130,7 +136,7 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         logp = out["logp"]
         v_norm = out["value"]
         value = vnorm.denormalize(v_norm)
-        obs_next, reward, done, info = env.step(action, target_choice=out["target_choice"])
+        obs_next, reward, done, info = env.step(action, target_choice=out["target_argmax"])
         buf.store(t, obs, action, logp, value, reward, done, out["target_choice"])
         er = info["explored_rate"]
         stp = info["step"].float()
@@ -222,6 +228,78 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
     print(f"[eval] {out}  map={map_idx}  final_explored={stats['final_explored']*100:.1f}%  frames={stats['n_frames']}")
 
 
+# v2 — fixed validation maps for the eval suite. Same 8 indices for every run/trial on
+# every machine → cross-trial scores are comparable ("same exam"). These become validation
+# maps: final reporting must use fresh random maps / test splits, not these.
+EVAL_MAP_IDX = (120, 1543, 2877, 4012, 5530, 7211, 8650, 9904)
+
+
+@torch.no_grad()
+def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -> dict:
+    """Deterministic episodes on the fixed EVAL_MAP_IDX maps → eval/* metrics + eval/score.
+
+    Coverage AUC pads an early (successful) finish with its final explored_rate so finishing
+    sooner scores strictly higher. contrib_imbalance = max agent share − 1/M of union-new
+    cells. sensing_overlap / comm_duty averaged over realized steps.
+    """
+    was_training = model.training
+    model.eval()
+    M = cfg.n_agents
+    T = eval_env.cfg.max_episode_steps
+    aucs, succ, imbs, ovs, duties, s90s = [], [], [], [], [], []
+    for midx in EVAL_MAP_IDX:
+        eval_env.reload_map(env_idx=0, map_idx=int(midx))
+        h_act, h_crit = model.init_hidden(1, cfg.device)
+        obs = eval_env.obs
+        er_curve: list[float] = []
+        ov_sum = 0.0
+        duty_sum = 0.0
+        novel_final = None
+        success = False
+        s90 = float(T)
+        for t in range(T):
+            out = model.act(obs, h_act, h_crit, deterministic=True)
+            # No target_choice → target_switch penalty off at eval (reward unused anyway).
+            obs, _r, done, info = eval_env.step(out["action"])
+            h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
+            er = float(info["explored_rate"][0].item())
+            er_curve.append(er)
+            ov_sum += float(info["metrics"]["sensing_overlap"].item())
+            duty_sum += float(info["metrics"]["comm_duty_cycle"].item())
+            novel_final = info["novel_cells_ep"][0]
+            if er >= 0.9 and s90 >= float(T):
+                s90 = float(t + 1)
+            if bool(done[0].item()):
+                success = bool(info["terminated"][0].item())
+                break
+        steps = len(er_curve)
+        aucs.append((sum(er_curve) + er_curve[-1] * (T - steps)) / T)
+        succ.append(1.0 if success else 0.0)
+        ovs.append(ov_sum / max(1, steps))
+        duties.append(duty_sum / max(1, steps))
+        s90s.append(s90)
+        total_novel = float(novel_final.sum().item())
+        if total_novel > 0:
+            imbs.append(float(novel_final.max().item()) / total_novel - 1.0 / M)
+        else:
+            imbs.append(0.0)
+    if was_training:
+        model.train()
+    n = float(len(EVAL_MAP_IDX))
+    out = {
+        "eval/coverage_auc":      sum(aucs) / n,
+        "eval/contrib_imbalance": sum(imbs) / n,
+        "eval/sensing_overlap":   sum(ovs) / n,
+        "eval/comm_duty":         sum(duties) / n,
+        "eval/success_rate":      sum(succ) / n,
+        "eval/steps_to_90":       sum(s90s) / n,
+    }
+    out["eval/score"] = (out["eval/coverage_auc"]
+                         - cfg.score_w_imbalance * out["eval/contrib_imbalance"]
+                         - cfg.score_w_overlap * out["eval/sensing_overlap"])
+    return out
+
+
 def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50, 75, 100)) -> None:
     import time
     import numpy as np
@@ -256,6 +334,13 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
     sample_obs = env.obs
     buf = Rollout(sample_obs, T=cfg.rollout_len, N=cfg.n_envs, M=cfg.n_agents,
                   d_hidden=cfg.d_hidden, device=cfg.device)
+
+    # v2 — persistent 1-env eval environment for the fixed eval suite. Mirrors the full
+    # training env cfg (force flags, top_k, n_hops, ...) so eval behavior matches training.
+    eval_env_cfg = EnvCfg.from_ckpt_dict(cfg.env.__dict__, n_envs=1, n_agents=cfg.n_agents)
+    eval_suite_split = load_split(
+        cfg.curriculum_splits[0] if cfg.curriculum else cfg.split, device=cfg.device)
+    eval_env = Explorer(eval_suite_split, eval_env_cfg, seed=0)
 
     steps_per_iter = cfg.n_envs * cfg.rollout_len
     n_iters = max(1, cfg.total_steps // steps_per_iter)
@@ -307,6 +392,18 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                   f"redun={redundancy:.2f} stall={stall_rate*100:.0f}% "
                   f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
                   f"sps={sps_iter:.0f}({sps_all:.0f}avg)")
+        # v2 — fixed eval suite: deterministic episodes on EVAL_MAP_IDX. The sweep
+        # maximizes eval/score (comparable across trials — same maps, no sampling noise).
+        eval_stats: dict = {}
+        if it % cfg.eval_every == 0 or it == n_iters:
+            eval_stats = _run_eval_suite(model, eval_env, cfg)
+            print(f"[evalsuite it={it:4d}] score={eval_stats['eval/score']:+.3f}  "
+                  f"auc={eval_stats['eval/coverage_auc']:.3f}  "
+                  f"imb={eval_stats['eval/contrib_imbalance']:.3f}  "
+                  f"ov={eval_stats['eval/sensing_overlap']:.2f}  "
+                  f"duty={eval_stats['eval/comm_duty']:.2f}  "
+                  f"succ={eval_stats['eval/success_rate']:.2f}  "
+                  f"s90={eval_stats['eval/steps_to_90']:.0f}")
         if wb is not None:
             log = {
                 "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
@@ -317,6 +414,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                 "explore/efficiency": efficiency, "iter": it,
             }
             log.update(agg)
+            log.update(eval_stats)
             wb.log(log, step=total_env_steps)
         if it in milestones:
             pct = milestones[it]

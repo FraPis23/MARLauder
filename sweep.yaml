@@ -1,29 +1,34 @@
-# W&B hyperparameter sweep for MARLauder.
+# W&B sweep v2 — STAGE 1: division of labor under perfect information.
+#
+# Trials run with --force-full-occupancy-sharing --force-full-pos-sharing: maps fuse every
+# step, so the rendezvous reward terms (give/recv/overlap, baselined at last meeting)
+# degenerate to ~0 and the privileged novel-scan credit is the ONLY per-agent channel —
+# the sweep isolates pure division-of-labor coefficients.
+#
+# Metric = eval/score, computed on the FIXED 8-map eval suite (train/driver.py
+# EVAL_MAP_IDX) with a deterministic policy every 10 iters:
+#   eval/score = coverage_auc − 0.5·contrib_imbalance − 0.25·sensing_overlap
+# Same maps + no sampling noise → cross-trial scores actually comparable.
+#
+# MAPPO frozen (sweep v1: no signal across lr/clip/λ/γ; k_epochs=6 caused KL blowups):
+#   lr 3e-4, ent-coef 0.005, clip-eps 0.2, k-epochs 4, gae-lambda 0.95, gamma 0.99,
+#   minibatches 4, tbptt 16.
 #
 # Usage (inside the marlauder container):
-#   wandb login                       # once
-#   wandb sweep sweep.yaml            # prints a SWEEP_ID
-#   wandb agent <ENTITY/PROJECT/SWEEP_ID>   # run one or more agents
-#
-# Optimizes the composite efficiency score logged by the trainer:
-#   efficiency = ep_end − 0.5·redundancy − 0.5·stall_rate
-# (high coverage, low overlap, no standing still).
-#
-# Fixed scale args keep each trial short enough to compare; raise --total-steps for
-# the final long runs. Every swept key has a matching CLI flag in scripts/run_train.py.
+#   wandb sweep sweep.yaml          → SWEEP_ID
+#   wandb agent <ENTITY/PROJECT/SWEEP_ID>     (one agent per machine/GPU)
 
 program: scripts/run_train.py
 method: bayes
 metric:
-  name: explore/efficiency
+  name: eval/score
   goal: maximize
 
-# Kill weak trials early instead of running every config to 2M steps. Hyperband counts
-# logged iters (one wandb.log per training iter). Brackets at ~30/60/120 iters; bottom
-# configs are stopped at 30 → big GPU-hour savings, good configs train full length.
+# Hyperband over eval/score history (logged every 10 train iters → 1 "iter" here ≈ 10
+# train iters). min_iter 3 ≈ train iter 30: weak configs die early.
 early_terminate:
   type: hyperband
-  min_iter: 30
+  min_iter: 3
   eta: 2
 
 command:
@@ -33,75 +38,40 @@ command:
   - --split=train/easy
   - --n-envs=64
   - --n-agents=2
-  - --comm-range=120
   - --rollout-len=256
   - --max-episode-steps=256
   - --total-steps=2000000
+  - --force-full-occupancy-sharing
+  - --force-full-pos-sharing
+  - --lr=0.0003
+  - --ent-coef=0.005
+  - --clip-eps=0.2
+  - --k-epochs=4
+  - --gae-lambda=0.95
+  - --gamma=0.99
+  - --minibatches=4
   - --compile
   - --wandb
-  - --wandb-project=marlauder-sweep
+  - --wandb-project=marlauder-sweep2
   - ${args}
 
-# NOTE: parameter keys MUST be the exact CLI flag names (dashed). W&B expands ${args}
-# as `--<key>=<value>`; argparse does not accept underscore variants of dashed flags.
+# Keys MUST be exact dashed CLI flags (W&B expands ${args} as --<key>=<value>).
 parameters:
-  # --- MAPPO ---
-  lr:
-    distribution: log_uniform_values
-    min: 0.00005
-    max: 0.001
-  ent-coef:
-    distribution: log_uniform_values
-    min: 0.001
-    max: 0.05
-  clip-eps:
-    values: [0.1, 0.2, 0.3]
-  k-epochs:
-    values: [2, 4, 6]
-  gae-lambda:
-    values: [0.9, 0.95, 0.98]
-  gamma:
-    values: [0.98, 0.99, 0.995]
-  minibatches:
-    values: [2, 4, 8]
-  # --- coordination / anti-degenerate ---
-  overlap-pen:
-    distribution: uniform
-    min: 1.0
-    max: 5.0
-  proximity-pen:
-    distribution: uniform
-    min: 0.0
-    max: 0.2
-  revisit-pen:
-    distribution: uniform
-    min: 0.0
-    max: 0.15
-  target-switch-pen:
-    distribution: uniform
-    min: 0.0
-    max: 0.2
-  stall-pen:
-    distribution: uniform
-    min: 0.0
-    max: 0.3
-  yield-scale:
-    distribution: uniform
-    min: 1.0
-    max: 5.0
-  give-bonus:
-    distribution: uniform
-    min: 0.5
-    max: 3.0
-  recv-bonus:
-    distribution: uniform
-    min: 0.0
-    max: 2.0
-  scan-weight:
+  novel-scan-weight:
     distribution: uniform
     min: 0.5
     max: 2.0
   team-weight:
     distribution: uniform
     min: 0.0
-    max: 1.0
+    max: 0.5
+  proximity-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.2
+  target-switch-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.05
+  n-hops:
+    values: [2, 4, 6]
