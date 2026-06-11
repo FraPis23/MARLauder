@@ -259,19 +259,18 @@ class GraphLattice:
         # build_optim_graph (set True only for M>1) so single-agent pays nothing.
         edge_valid_optim = None
         if self.build_optim_graph:
-            is_trav_lat = (node_occ != OBSTACLE).view(N, self.LH, self.LW)        # FREE∪UNKNOWN
-            reach_o = (seed > 0).float() * is_trav_lat.float()                    # root at robot cell
-            for _ in range(self.flood_max_iters):
-                dil = F.conv2d(reach_o.unsqueeze(1), self._dilate_k, padding=1).squeeze(1)
-                new = (dil > 0).float() * is_trav_lat.float()
-                if torch.equal(new, reach_o):
-                    break
-                reach_o = new
-            node_valid_optim = (reach_o.view(N, self.N_max) > 0)                  # [N, N_max]
-            nbr_node_valid_o = torch.gather(
-                node_valid_optim, dim=1, index=nbr_idx_safe.view(N, -1)
+            # Optimistic node validity = simply "not a KNOWN obstacle" (FREE∪UNKNOWN). NO
+            # reachability flood: the teammate-rooted BF over this edge set already returns
+            # +inf for nodes its source cannot reach, so connectivity is handled for free.
+            # The earlier flood expanded through FREE∪UNKNOWN (≈the whole map early in an
+            # episode) → ~diameter iterations every build/agent/step → the dominant cost.
+            # collision_free (already != OBSTACLE) still blocks edges crossing KNOWN walls,
+            # so optimism cannot leak across seen obstacles.
+            is_trav_node = (node_occ != OBSTACLE)                                 # [N, N_max]
+            nbr_trav = torch.gather(
+                is_trav_node, dim=1, index=nbr_idx_safe.view(N, -1)
             ).view(N, self.N_max, K)
-            endpoints_valid_o = node_valid_optim.unsqueeze(-1) & nbr_node_valid_o & nbr_valid_geom
+            endpoints_valid_o = is_trav_node.unsqueeze(-1) & nbr_trav & nbr_valid_geom
             edge_valid_optim = endpoints_valid_o & collision_free                 # [N, N_max, K]
 
         # 4) Utility — WALL-AWARE (v2). The old version summed frontier pixels in a raw
