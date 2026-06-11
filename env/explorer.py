@@ -166,6 +166,7 @@ class Explorer:
         self.t            = torch.zeros(self.N,                        dtype=torch.long,    device=self.dev)
         self.last_union   = torch.zeros(self.N,                        dtype=torch.float32, device=self.dev)
         self.curr_idx     = torch.zeros((self.N, self.M),              dtype=torch.long,    device=self.dev)
+        self.curr_idx_global = torch.zeros((self.N, self.M),           dtype=torch.long,    device=self.dev)
         # last known position: agent i's knowledge of agent j's position
         self.last_known_pos = torch.zeros((self.N, self.M, self.M, 2), dtype=torch.float32, device=self.dev)
         # B1-redo: per-agent guidepost cache for warm-start BF from target.
@@ -250,7 +251,10 @@ class Explorer:
         curr_nbr_valid  = self._last_obs["curr_nbr_valid"]             # [N, M, K] (local-edge validity)
         chosen       = torch.gather(curr_nbr_global, dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
         chosen_valid = torch.gather(curr_nbr_valid,  dim=-1, index=action.unsqueeze(-1)).squeeze(-1)
-        chosen = torch.where(chosen_valid, chosen, self.curr_idx).clamp(min=0)
+        # Invalid action → stay put on the GLOBAL current node. self.curr_idx is the LOCAL
+        # window-center constant (≈window²/2) and must NOT be used as a global index here —
+        # doing so teleported agents to node_xy[that_constant].
+        chosen = torch.where(chosen_valid, chosen, self.curr_idx_global).clamp(min=0)
 
         node_xy = self.graph.node_xy
         tgt_xy  = node_xy[chosen]   # [N, M, 2]
@@ -1202,6 +1206,7 @@ class Explorer:
         curr_idx_global      = torch.stack(curr_idx_global_list, dim=1)   # [N, M]
 
         self.curr_idx = curr_idx
+        self.curr_idx_global = curr_idx_global   # [N, M] real lattice node — invalid-action fallback
         if comm_mask is None:
             comm_mask = torch.eye(
                 self.M, dtype=torch.bool, device=self.dev

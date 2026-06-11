@@ -75,11 +75,24 @@ def _mark_pos_free(
     logodds: wp.array3d(dtype=wp.float32),  # [NM, H, W]
     pos:     wp.array1d(dtype=wp.vec2),     # [NM]
 ):
+    # The robot occupies FREE space by definition. The lidar loop starts at t=1.0 so it
+    # never marks the origin, and a single LO_FREE add lands at exactly LO_FREE_TH (0.40),
+    # failing the strict `v > LO_FREE_TH` FREE test → the agent's own cell stayed UNKNOWN,
+    # which invalidated its current graph node (node_valid floods FROM the robot cell) and
+    # left it with no legal moves. Mark a small footprint with evidence well above the
+    # threshold so the current node — and its immediate neighbours — are reliably FREE.
     nm = wp.tid()
     p = pos[nm]
-    iy = wp.int32(p[1] + 0.5)
-    ix = wp.int32(p[0] + 0.5)
-    wp.atomic_add(logodds, nm, iy, ix, LO_FREE)
+    H = logodds.shape[1]
+    W = logodds.shape[2]
+    cx = wp.int32(p[0] + 0.5)
+    cy = wp.int32(p[1] + 0.5)
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            ix = cx + dx
+            iy = cy + dy
+            if ix >= 0 and iy >= 0 and ix < W and iy < H:
+                wp.atomic_add(logodds, nm, iy, ix, LO_FREE + LO_FREE)
 
 
 @wp.kernel
