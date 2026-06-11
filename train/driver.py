@@ -247,6 +247,8 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
     M = cfg.n_agents
     T = eval_env.cfg.max_episode_steps
     aucs, succ, imbs, ovs, duties, s90s = [], [], [], [], [], []
+    fairs, score_maps = [], []          # D2: Jain fairness + per-map score (map-luck/noise)
+    imb_denom = (1.0 - 1.0 / M) if M > 1 else 1.0   # max possible imbalance → normalize to [0,1]
     for midx in EVAL_MAP_IDX:
         eval_env.reload_map(env_idx=0, map_idx=int(midx))
         h_act, h_crit = model.init_hidden(1, cfg.device)
@@ -280,23 +282,38 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
         s90s.append(s90)
         total_novel = float(novel_final.sum().item())
         if total_novel > 0:
-            imbs.append(float(novel_final.max().item()) / total_novel - 1.0 / M)
+            imb_m = float(novel_final.max().item()) / total_novel - 1.0 / M
+            # Jain fairness over per-agent novel shares ∈ [1/M, 1]; 1 = perfect equity.
+            ss = float((novel_final.float() ** 2).sum().item())
+            fair_m = (total_novel ** 2) / (M * ss) if ss > 0 else 1.0
         else:
-            imbs.append(0.0)
+            imb_m, fair_m = 0.0, 1.0
+        imbs.append(imb_m)
+        fairs.append(fair_m)
+        # D2: per-map score on the NORMALIZED imbalance so equity is on the same [0,1]
+        # footing as coverage_auc (raw imb spans only ~[0, 1−1/M] → was a near-free rider).
+        score_maps.append(aucs[-1]
+                          - cfg.score_w_imbalance * (imb_m / imb_denom)
+                          - cfg.score_w_overlap * ovs[-1])
     if was_training:
         model.train()
     n = float(len(EVAL_MAP_IDX))
+    mean_imb = sum(imbs) / n
+    mean_score = sum(score_maps) / n
+    var_score = sum((s - mean_score) ** 2 for s in score_maps) / n
     out = {
         "eval/coverage_auc":      sum(aucs) / n,
-        "eval/contrib_imbalance": sum(imbs) / n,
+        "eval/contrib_imbalance": mean_imb,                       # raw (kept for continuity)
+        "eval/contrib_imbalance_norm": mean_imb / imb_denom,      # [0,1] — drives the score
+        "eval/fairness":          sum(fairs) / n,                 # Jain index, 1 = equal
         "eval/sensing_overlap":   sum(ovs) / n,
         "eval/comm_duty":         sum(duties) / n,
         "eval/success_rate":      sum(succ) / n,
         "eval/steps_to_90":       sum(s90s) / n,
+        "eval/score_std":         var_score ** 0.5,               # cross-map spread = map-luck
     }
-    out["eval/score"] = (out["eval/coverage_auc"]
-                         - cfg.score_w_imbalance * out["eval/contrib_imbalance"]
-                         - cfg.score_w_overlap * out["eval/sensing_overlap"])
+    # Score = mean of per-map scores (equity normalized to [0,1] inside each map).
+    out["eval/score"] = mean_score
     return out
 
 
@@ -397,9 +414,11 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
         eval_stats: dict = {}
         if it % cfg.eval_every == 0 or it == n_iters:
             eval_stats = _run_eval_suite(model, eval_env, cfg)
-            print(f"[evalsuite it={it:4d}] score={eval_stats['eval/score']:+.3f}  "
+            print(f"[evalsuite it={it:4d}] score={eval_stats['eval/score']:+.3f}"
+                  f"±{eval_stats['eval/score_std']:.3f}  "
                   f"auc={eval_stats['eval/coverage_auc']:.3f}  "
-                  f"imb={eval_stats['eval/contrib_imbalance']:.3f}  "
+                  f"imbN={eval_stats['eval/contrib_imbalance_norm']:.3f}  "
+                  f"fair={eval_stats['eval/fairness']:.3f}  "
                   f"ov={eval_stats['eval/sensing_overlap']:.2f}  "
                   f"duty={eval_stats['eval/comm_duty']:.2f}  "
                   f"succ={eval_stats['eval/success_rate']:.2f}  "
@@ -439,6 +458,11 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                 for gi, midx in enumerate(map_indices):
                     gif_path = cfg.out_dir / f"eval_ckpt_{pct:03d}_m{gi}.gif"
                     _emit_eval_gif(model, cfg, gif_path, int(midx))
+                    # Surface behavior in the W&B dashboard (not just on-disk files).
+                    if wb is not None:
+                        wb.log({f"behavior/rollout_m{gi}": wb.Video(str(gif_path), fps=12,
+                                                                    format="gif")},
+                               step=total_env_steps)
     # final — include cfg so eval can mirror the env config (I.2).
     torch.save({
         "iter": n_iters,

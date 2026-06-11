@@ -1,13 +1,21 @@
-# W&B sweep v2 — STAGE 2: rendezvous economy under realistic comm (range 120 px + LOS).
+# W&B sweep v2 — STAGE 2 (D3): MAP-DIVERGENT coordination, positions still shared.
 #
-# Run AFTER Stage 1 (sweep.yaml). Paste the Stage-1 winner values for the labor-division
-# coefficients below (marked WINNER), then sweep only the comm-gated rendezvous knobs
-# that were inert under full sharing: give/recv bonuses + overlap penalty.
-# overlap-pen range is LOWER than v1 ([0.5, 3]) because novel-scan already zero-pays
-# redundant cells — overlap at rendezvous is now a second tax on the same behavior.
+# Decentralization step 1: drop occupancy sharing, KEEP position sharing
+# (--force-full-pos-sharing). Maps now diverge → the rendezvous terms (give/recv/overlap,
+# baselined at last meeting) go LIVE, and teammate-distance BF relies on the D1 optimistic
+# graph (teammate often sits in this agent's UNKNOWN region). Exact positions isolate
+# "coordinate with divergent maps" from "estimate where the teammate is" (that's step 2,
+# below — drop --force-full-pos-sharing then).
 #
-# Metric identical to Stage 1 (eval/score on the fixed 8-map suite); comm_duty_cycle is
-# meaningful again here — watch it fall mid-episode (split) and spike at rendezvous.
+# Run AFTER Stage 1 (sweep.yaml). Winner labor-division coefs are pasted below (breezy-12);
+# sweep only the comm-gated rendezvous knobs that were inert under full sharing:
+# give/recv bonuses + overlap penalty. overlap-pen range is LOWER ([0.5, 3]) because
+# novel-scan already zero-pays redundant cells — overlap is a second tax on the same thing.
+#
+# Metric identical to Stage 1 (eval/score on the fixed 8-map suite; D2: equity normalized,
+# now a first-class term). comm_duty is NOT meaningful here (positions force-shared); it
+# becomes meaningful in step 2 (realistic position) — watch it fall mid-episode, spike at
+# rendezvous there.
 
 program: scripts/run_train.py
 method: bayes
@@ -28,6 +36,7 @@ command:
   - --n-envs=64
   - --n-agents=2
   - --comm-range=120
+  - --force-full-pos-sharing          # step 1: positions shared, maps NOT (drop for step 2)
   - --rollout-len=256
   - --max-episode-steps=256
   - --total-steps=2000000
@@ -38,13 +47,13 @@ command:
   - --gae-lambda=0.95
   - --gamma=0.99
   - --minibatches=4
-  # ---- WINNER values from Stage 1 — EDIT BEFORE LAUNCH ----
-  - --novel-scan-weight=1.0
-  - --team-weight=0.3
-  - --proximity-pen=0.05
-  - --target-switch-pen=0.01
-  - --n-hops=2
-  # ---------------------------------------------------------
+  # ---- WINNER values from Stage 1 (breezy-sweep-12: score 0.640, stable KL) ----
+  - --novel-scan-weight=0.9
+  - --team-weight=0.42
+  - --proximity-pen=0.15
+  - --target-switch-pen=0.015
+  - --n-hops=6
+  # ------------------------------------------------------------------------------
   - --compile
   - --wandb
   - --wandb-project=marlauder-sweep2

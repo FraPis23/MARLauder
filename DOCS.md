@@ -95,7 +95,7 @@ WarpWorld.gt_torch  +  WarpWorld.occupancy_logodds_torch  +  WarpWorld.occupancy
    │   compute_frontier(occupancy)                 (torch conv2d)
    │   GraphLattice.build()                        (flood-fill + collision + utility)
    │   bf_from_target(curr)  → bf_dist_from_curr   (warm-started)
-   │   bf_from_target(teammate lkp) → bf_dist_team (warm-started, per teammate)
+   │   bf_from_target(teammate lkp, edge_valid=edge_valid_optim) → bf_dist_team (per teammate)
    │   extract_topk_candidates(util, valid, curr_xy, K=16, bf_dist)
    │   build cand_feat[N,M,K,8] + cand_bf_first_hop + ego-centric window
    ▼
@@ -240,6 +240,8 @@ the W&B sweep tunes (§12).
 - Set-op decomposition gives the policy credit for the right behavior: scan-self, bring info, receive info, avoid overlap, avoid backtrack, avoid chasing.
 
 **Decentralization**: each term computed from agent-local state (own occupancy, own visited, own last_known_pos) or via comm-gated set ops on rendezvous events.
+
+**Optimistic teammate-distance graph** (`edge_valid_optim`, built in `graph_lattice.build()` when M>1): BF-from-teammate is rooted at the teammate's `last_known_pos` in the agent's OWN map. Once agents split, the teammate usually sits in the agent's UNKNOWN region; on the FREE graph (`node_valid` = `occ==FREE` ∧ reachable) that node is invalid/disconnected, so `bf_from_target` returns `+inf` for every candidate and the `team_alt_score` / `cand_own_minus_team` coordination signals go silent — exactly when map-sharing is off. Fix: a second edge graph flooded through FREE∪UNKNOWN (`occ != OBSTACLE`) from the robot cell, reusing the same `!= OBSTACLE` collision check. The teammate BF passes this graph via `bf_from_target(..., edge_valid=info["edge_valid_optim"])`. Result: exact geodesic through known-free space, ≈Euclidean through unknown, and `+inf` ONLY when a KNOWN wall separates the pair (pure Euclidean would lie there). Used for the teammate-distance heuristic only; the agent's own navigation BF (`bf_from_curr`, target pick) stays on the FREE graph. `bf_from_target` reads geometric edge indices (`edge_idx_static`) masked by the active `edge_valid` so both graphs resolve neighbours correctly.
 
 **Last-meeting baseline**: `last_meeting_node_mask[i, j]` snapshots the post-fusion union at the most recent comm between i and j. Set ops are over "new scans since last meeting", so initial co-spawn overlap doesn't keep firing.
 
@@ -615,12 +617,20 @@ over the rollout in `collect_rollout`). `wandb.init(config=…)` flattens the fu
 `_run_eval_suite` runs the policy **deterministically** on the 8 hardcoded validation maps
 `EVAL_MAP_IDX` (same for every run/machine — "same exam") in a persistent 1-env Explorer that
 mirrors the training cfg (force flags incl.). Logs `eval/{coverage_auc, contrib_imbalance,
-sensing_overlap, comm_duty, success_rate, steps_to_90, score}` where
-`eval/score = coverage_auc − 0.5·contrib_imbalance − 0.25·sensing_overlap`
-(`TrainCfg.score_w_imbalance/score_w_overlap`). AUC pads early success with the final
-explored_rate so finishing sooner scores strictly higher. `contrib_imbalance` =
-`max_a(novel share) − 1/M` from `info["novel_cells_ep"]`. These 8 maps are validation —
-final reporting must use fresh random maps / `test/*` splits. Cost ≈ 5% wall time.
+contrib_imbalance_norm, fairness, sensing_overlap, comm_duty, success_rate, steps_to_90,
+score, score_std}`.
+**D2 — equity rebalance**: `eval/score` is the mean of per-map scores, each
+`= coverage_auc − w_imb·(contrib_imbalance / (1−1/M)) − w_ov·sensing_overlap`. The
+imbalance is **normalized to [0,1]** before weighting (raw `contrib_imbalance` spans only
+`[0, 1−1/M]` ≈ [0, 0.5] for M=2, so at the old weight it was a near-free rider and the
+sweep optimized ~90% raw coverage — that's why a mechanical `proximity_pen` won). Weights
+exposed as `--score-w-imbalance` (0.5) / `--score-w-overlap` (0.25) flags. `eval/fairness`
+= Jain index over per-agent novel shares (1 = perfectly equal) — scale-robust cooperation
+read. `eval/score_std` = cross-map spread of per-map score → exposes map-luck/noise
+(motivates seed replicas, D5). AUC pads early success with the final explored_rate so
+finishing sooner scores strictly higher. `contrib_imbalance` = `max_a(novel share) − 1/M`
+from `info["novel_cells_ep"]`. These 8 maps are validation — final reporting must use fresh
+random maps / `test/*` splits. Cost ≈ 5% wall time.
 
 Legacy rollout-based `explore/efficiency` (= ep_end − 0.5·redundancy − 0.5·stall_rate) is
 still logged but is NOT the sweep target anymore (it saturated in sweep v1).

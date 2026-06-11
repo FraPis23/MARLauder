@@ -65,9 +65,13 @@ class GraphLattice:
         guidepost_iters: int | None = None,
         guidepost_path_max: int | None = None,
         n_hops: int = 2,
+        build_optim_graph: bool = False,
         device: str = "cuda:0",
     ) -> None:
         self.device = device
+        # When True, build() also emits an "optimistic" edge graph (UNKNOWN treated
+        # passable) for teammate-distance BF — see build() step 3b. Only needed M>1.
+        self.build_optim_graph = bool(build_optim_graph)
         self.H, self.W = canvas
         self.NR = int(nr)
         self.LH = self.H // self.NR
@@ -243,6 +247,33 @@ class GraphLattice:
         edge_valid = endpoints_valid & collision_free
         edge_idx = torch.where(edge_valid, edge_idx, torch.full_like(edge_idx, -1))
 
+        # 3b) OPTIMISTIC traversable graph (UNKNOWN treated passable) — for teammate-
+        # distance BF ONLY. A teammate that has split off usually sits in THIS agent's
+        # UNKNOWN region; on the FREE graph above its node is invalid/disconnected and
+        # bf_from_target returns +inf for every candidate, silencing the coordination
+        # channel exactly when map-sharing is off. Flooding through FREE∪UNKNOWN from the
+        # robot gives the honest partial-knowledge geodesic: exact through known-free
+        # space, ≈Euclidean through unknown, and +inf only when a KNOWN wall separates
+        # them (correct — Euclidean would lie there). collision_free is reused as-is
+        # (already != OBSTACLE → edges crossing UNKNOWN already pass it). Gated by
+        # build_optim_graph (set True only for M>1) so single-agent pays nothing.
+        edge_valid_optim = None
+        if self.build_optim_graph:
+            is_trav_lat = (node_occ != OBSTACLE).view(N, self.LH, self.LW)        # FREE∪UNKNOWN
+            reach_o = (seed > 0).float() * is_trav_lat.float()                    # root at robot cell
+            for _ in range(self.flood_max_iters):
+                dil = F.conv2d(reach_o.unsqueeze(1), self._dilate_k, padding=1).squeeze(1)
+                new = (dil > 0).float() * is_trav_lat.float()
+                if torch.equal(new, reach_o):
+                    break
+                reach_o = new
+            node_valid_optim = (reach_o.view(N, self.N_max) > 0)                  # [N, N_max]
+            nbr_node_valid_o = torch.gather(
+                node_valid_optim, dim=1, index=nbr_idx_safe.view(N, -1)
+            ).view(N, self.N_max, K)
+            endpoints_valid_o = node_valid_optim.unsqueeze(-1) & nbr_node_valid_o & nbr_valid_geom
+            edge_valid_optim = endpoints_valid_o & collision_free                 # [N, N_max, K]
+
         # 4) Utility — WALL-AWARE (v2). The old version summed frontier pixels in a raw
         # (2·UR+1)² integral-image window with NO wall check: a node beside a wall counted
         # frontier in the corridor on the other side, poisoning the GAT utility feature,
@@ -326,6 +357,7 @@ class GraphLattice:
             "curr_nbr": curr_nbr,
             "curr_nbr_valid": curr_nbr_valid,
             "utility": utility_norm,
+            "edge_valid_optim": edge_valid_optim,   # [N,N_max,K] or None (M==1 / flag off)
         }
 
     # ---------------------------------------------------------------------- #
@@ -478,6 +510,7 @@ class GraphLattice:
         target: torch.Tensor,                    # [N] long, BF source = target node
         dist_init: torch.Tensor | None = None,   # [N, N_max] warm-start dist (else +inf)
         max_iters: int | None = None,
+        edge_valid: torch.Tensor | None = None,  # override edge set (else info["edge_valid"])
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Overwrite-mode Bellman-Ford from `target` over the lattice.
 
@@ -494,10 +527,18 @@ class GraphLattice:
             parent [N, N_max] long — neighbor index used to reach each node (parent
                                      in the shortest-path tree rooted at target).
         """
-        edge_idx = info["edge_idx"]              # [N, N_max, K]
-        edge_valid = info["edge_valid"]          # [N, N_max, K]
+        # Use the GEOMETRIC edge indices (not info["edge_idx"], which build() overwrote to
+        # -1 wherever the FREE edge_valid is False). For valid FREE edges the two are
+        # identical, so FREE-graph BF is unchanged; but the optimistic override has True
+        # edges where info["edge_idx"] is -1, and gathering through -1 (clamped→0) would
+        # point at the wrong neighbour. The geometric table + the active edge_valid mask
+        # is the only consistent source for both graphs.
+        N = info["edge_idx"].shape[0]
+        edge_idx = self.edge_idx_static.unsqueeze(0).expand(N, -1, -1)   # [N, N_max, K]
+        # Optional override: teammate-distance BF passes the optimistic (UNKNOWN-passable)
+        # graph; None → the FREE graph, identical to prior behaviour.
+        edge_valid = info["edge_valid"] if edge_valid is None else edge_valid  # [N, N_max, K]
 
-        N = edge_idx.shape[0]
         N_max = self.N_max
         K_ = K
         dev = edge_idx.device

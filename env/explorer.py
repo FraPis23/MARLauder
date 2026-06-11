@@ -154,6 +154,7 @@ class Explorer:
             collision_samples=5,
             flood_max_iters=cfg.flood_max_iters,
             n_hops=cfg.n_hops,
+            build_optim_graph=(self.M > 1),   # optimistic teammate-BF graph only when M>1
             device=self.dev,
         )
         self.N_max = self.graph.N_max
@@ -971,6 +972,11 @@ class Explorer:
                     )
                     dist_j, _ = self.graph.bf_from_target(
                         info, target=target_j, dist_init=team_dist_init,
+                        # Optimistic (UNKNOWN-passable) graph: teammate usually sits in
+                        # this agent's unexplored region; the FREE graph would return +inf
+                        # and silence the coordination channel. None-safe (M==1 → key
+                        # absent → FREE graph). See graph_lattice.build() step 3b.
+                        edge_valid=info.get("edge_valid_optim"),
                     )
                     self._team_node_prev[:, a, j] = target_j
                     self._dist_team_prev[:, a, j] = dist_j

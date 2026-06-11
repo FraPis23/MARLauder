@@ -63,6 +63,8 @@ def main() -> None:
     ap.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
     ap.add_argument("--target-switch-pen", type=float, default=0.01, help="δ_obj: objective second-guessing penalty (argmax intent; v2 default 0.01 — v1's 0.05+sampled pick dominated the dense reward)")
     ap.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
+    ap.add_argument("--score-w-imbalance", type=float, default=0.5, help="eval/score weight on NORMALIZED contrib_imbalance (equity; D2: now on [0,1] imb so equity is a first-class term, not a free rider)")
+    ap.add_argument("--score-w-overlap",   type=float, default=0.25, help="eval/score weight on sensing_overlap (redundant sensing)")
     ap.add_argument("--n-hops", type=int, default=2,
                     help="Ego-centric encoder window radius. Window side = 2·n_hops + 3 "
                          "(49 nodes at 2, 121 at 4, 225 at 6). GAT n_layers tied to n_hops.")
@@ -118,6 +120,8 @@ def main() -> None:
         wandb_run_name=args.wandb_run_name,
         wandb_mode=args.wandb_mode,
         wandb_tags=tuple(args.wandb_tags),
+        score_w_imbalance=args.score_w_imbalance,
+        score_w_overlap=args.score_w_overlap,
         env=EnvCfg(
             n_envs=args.n_envs,
             n_agents=args.n_agents,
