@@ -427,7 +427,8 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
             log = {
                 "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
                 "train/entropy": stats["entropy"], "train/kl": stats["kl"],
-                "train/clipfrac": stats["clipfrac"], "perf/sps": sps_iter,
+                "train/clipfrac": stats["clipfrac"], "train/nan_skips": stats.get("nan_skips", 0),
+                "perf/sps": sps_iter,
                 "perf/coll_sps": coll_sps, "perf/upd_sps": upd_sps,
                 "explore/ep_end": ep_end_mean, "explore/ep_end_n": ep_end_n,
                 "explore/efficiency": efficiency, "iter": it,

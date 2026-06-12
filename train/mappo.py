@@ -98,7 +98,8 @@ def ppo_update(
     assert N % n_mb == 0, f"n_envs={N} must be divisible by n_minibatches={n_mb}"
     mb_size = N // n_mb
 
-    stats = {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clipfrac": 0.0, "updates": 0}
+    stats = {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clipfrac": 0.0,
+             "updates": 0, "nan_skips": 0}
 
     for epoch in range(cfg.k_epochs):
         # Shuffle env indices each epoch for minibatching.
@@ -197,11 +198,22 @@ def ppo_update(
                     # to minibatching/epoch choices.
                     loss = (actor_loss + critic_loss) * (chunk_len / T)
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                # NaN/inf guard. Late in training the value targets can spike and, under
+                # fp16 AMP, overflow → v_loss=NaN → the step poisons every weight and the
+                # policy collapses to uniform (entropy=ln|A|) for the rest of the run
+                # (observed in 3 sweep trials). Gate the optimizer step on a finite loss
+                # AND finite grad norm so a single bad minibatch is dropped, not fatal.
+                if torch.isfinite(loss):
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    if torch.isfinite(total_norm):
+                        scaler.step(optimizer)
+                    else:
+                        stats["nan_skips"] += 1
+                    scaler.update()
+                else:
+                    stats["nan_skips"] += 1
 
                 stats["pg_loss"] += float(chunk_pg.detach().item())
                 stats["v_loss"] += float(chunk_vl.detach().item())

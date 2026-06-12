@@ -247,7 +247,18 @@ the W&B sweep tunes (§12).
 
 **v0.4 anti-chase signals**:
 - `overlap` penalty fires at every comm event with overlap (default `η_lap=3.0`).
-- `proximity` penalty fires per-step when teammate is within sensor_range AND visible (default `ε_prox=0.005`).
+- ~~`proximity` penalty~~ **ELIMINATED (default `ε_prox=0.0`, 2026-06-12)**: the raw-distance
+  per-step reflex was the **stalemate/ping-pong driver** — it over-corrected into back-and-forth
+  and punished BOTH agents converging on the last frontier (deadlock). `novel_scan` already pays
+  0 for team-known cells, so anti-chase is covered without it. Flag kept for ablation; optional
+  fallback is a *productivity gate* (`*= novel_scan<=0`) so only freeloading proximity is penalized.
+- **`target_switch_pen` raised 0.01→0.05** (B+D graph-tree branch-flip): commitment to a
+  direction; now on argmax intent so safe to strengthen → punishes uncommitted back-and-forth.
+- **Target-claim at rendezvous** (`last_known_target`, comm-gated): when two agents are in comm,
+  the **lowest agent-ID keeps its target**; a higher-ID agent whose candidate set contains a
+  lower-ID teammate's claimed target has that candidate **masked** (`cand_valid→False`) so it
+  diverts — UNLESS it is the agent's only option (**single-frontier guard**: both commit, never
+  back down). Decentralized (only acts in comm range); out-of-comm division → Phase 2 surplus obs.
 - `cand_own_minus_team` feature (amplified by `--yield-scale 3.0`) → "yield to closer agent".
 - `team_alt_score` feature (H.2) → "take a frontier the teammate has good alternatives for".
 - `path_bias` (fixed floor `--path-bias-floor 1.5` + learnable extra) keeps the actor following the strategic pick's BF first-hop so grid-utility doesn't fully dominate.

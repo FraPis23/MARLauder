@@ -87,12 +87,18 @@ class EnvCfg:
     # receding down the same branch) cost 0; only genuine mid-route fork-flips are taxed.
     # v2: 0.05 → 0.01 (sweep v1 showed it dominating the dense reward 10–50×) and the
     # caller now passes the ARGMAX strategic intent, not the Gumbel-sampled pick.
-    target_switch_penalty_coef: float = 0.01    # δ_obj
+    target_switch_penalty_coef: float = 0.05    # δ_obj: B+D graph-tree branch-flip commitment
+    # penalty. Raised 0.01→0.05 — it was lowered only because the Gumbel-SAMPLED target jittered;
+    # it now receives the argmax intent, so it can punish uncommitted back-and-forth on the tree.
     # G.4.a — amplify cand_own_minus_team feature (yield signal). Higher scale → faster
     # learning of yielding behavior (smooth, no oscillation).
     cand_own_minus_team_scale: float = 3.0
     # G.4.b — per-step proximity penalty when teammate is too close (anti-chase).
-    proximity_penalty_coef: float = 0.05    # ε_prox: reward subtracted per step when close
+    # ELIMINATED (default 0.0): this raw-distance reflex was the limit-cycle driver — it
+    # over-corrected into ping-pong and punished BOTH agents converging on the last frontier
+    # (deadlock). novel_scan already pays 0 for scanning team-known cells, so the anti-chase
+    # incentive is present without it. Kept as a flag for ablation.
+    proximity_penalty_coef: float = 0.0     # ε_prox: reward subtracted per step when close
     proximity_penalty_radius_px: float = -1.0   # <=0 = sensor_range_px
     # A2 — bypass distance / LOS check in comm: every step every agent communicates.
     force_full_comm: bool = False
@@ -154,7 +160,11 @@ class Explorer:
             collision_samples=5,
             flood_max_iters=cfg.flood_max_iters,
             n_hops=cfg.n_hops,
-            build_optim_graph=(self.M > 1),   # optimistic teammate-BF graph only when M>1
+            # Optimistic teammate-BF graph only when it can matter: M>1 AND maps actually
+            # diverge. Under force_full_occupancy_sharing (Stage 1) maps are identical every
+            # step → teammate is always on a known-FREE node → the FREE graph already reaches
+            # it → building the optimistic edge set every step is pure overhead. Skip it.
+            build_optim_graph=(self.M > 1 and not cfg.force_full_occupancy_sharing),
             device=self.dev,
         )
         self.N_max = self.graph.N_max
@@ -169,6 +179,10 @@ class Explorer:
         self.curr_idx_global = torch.zeros((self.N, self.M),           dtype=torch.long,    device=self.dev)
         # last known position: agent i's knowledge of agent j's position
         self.last_known_pos = torch.zeros((self.N, self.M, self.M, 2), dtype=torch.float32, device=self.dev)
+        # Target-claim: last_known_target[i, j] = global node agent i believes j is heading to
+        # (j's strategic target). Updated comm-gated alongside last_known_pos; -1 = unknown.
+        # Used to deconflict targets at rendezvous (lowest agent-ID keeps its target).
+        self.last_known_target = torch.full((self.N, self.M, self.M), -1, dtype=torch.long, device=self.dev)
         # B1-redo: per-agent guidepost cache for warm-start BF from target.
         # _target_prev[N, M]: previous step's target node per agent. -1 = no cache.
         # _dist_prev[N, M, N_max]: previous step's BF dist (rooted at target). +inf = cold.
@@ -635,6 +649,7 @@ class Explorer:
             for i in range(self.M):
                 for j in range(self.M):
                     self.last_known_pos[:, i, j] = self.pos[:, j, :]
+                    self.last_known_target[:, i, j] = self._prev_target_node[:, j]
                     self.t_last_comm[:, i, j] = t_now
             return
         for i in range(self.M):
@@ -646,6 +661,9 @@ class Explorer:
                 mask2d  = can.view(-1, 1)
                 self.last_known_pos[:, i, j] = torch.where(
                     mask2d.expand(-1, 2), new_pos, self.last_known_pos[:, i, j]
+                )
+                self.last_known_target[:, i, j] = torch.where(
+                    can, self._prev_target_node[:, j], self.last_known_target[:, i, j]
                 )
                 self.t_last_comm[:, i, j] = torch.where(
                     can, t_now, self.t_last_comm[:, i, j]
@@ -798,6 +816,7 @@ class Explorer:
         self.pos[env_idx] = agent_pos
         for ag in range(self.M):
             self.last_known_pos[env_idx, :, ag] = agent_pos[ag]
+        self.last_known_target[env_idx] = -1
         self.world.set_positions(self.pos)
         self.world.scan()
         union_free = (self.world.occupancy_torch[idx_t] == _FREE).any(dim=1).view(1, -1).float().sum(-1)
@@ -877,6 +896,7 @@ class Explorer:
             # All agents know all actual start positions (in comm range at reset)
             for ag in range(self.M):
                 self.last_known_pos[e, :, ag] = agent_pos[ag]
+            self.last_known_target[e] = -1
 
         self.world.set_positions(self.pos)
         self.world.scan()
@@ -1151,6 +1171,23 @@ class Explorer:
         # H.3 — BF min-team-dist replaces euclidean. H.2 — alt score for joint distribution.
         cand_min_team_dist = torch.stack([c["cand_min_team_bf_dist"] for c in cand_list], dim=1)  # [N, M, K]
         cand_team_alt_all  = torch.stack([c["cand_team_alt_score"]   for c in cand_list], dim=1)  # [N, M, K]
+
+        # ---- Target-claim deconfliction (in-comm, lowest agent-ID priority) ----
+        # If a LOWER-ID teammate j<i that is in comm has claimed a target node that also
+        # appears among agent i's candidates, mask that candidate so i picks a DIFFERENT
+        # frontier — UNLESS it is i's only option (single-frontier guard: both must commit,
+        # never back down). Decentralized: uses comm-gated last_known_target only.
+        if self.M > 1 and comm_mask is not None:
+            lower = torch.tril(torch.ones(self.M, self.M, dtype=torch.bool, device=self.dev), -1)  # [i,j] True if j<i
+            active = (lower.view(1, self.M, self.M) & comm_mask
+                      & (self.last_known_target >= 0))                                # [N, M, M]
+            claimed = torch.where(active, self.last_known_target,
+                                  torch.full_like(self.last_known_target, -1))        # [N, M, M]
+            match = (cand_idx_all.unsqueeze(2) == claimed.unsqueeze(-1)).any(dim=2)    # [N, M, K]
+            proposed = match & cand_valid_all                                          # only valid slots
+            keep_ok = (cand_valid_all.sum(-1) - proposed.sum(-1)) >= 1                 # leave >=1 valid
+            final_mask = proposed & keep_ok.unsqueeze(-1)
+            cand_valid_all = cand_valid_all & ~final_mask                              # higher-ID diverts
 
         # Comm-gap feature: max over j != a of (t - t_last_comm[a, j]).
         if self.M > 1:

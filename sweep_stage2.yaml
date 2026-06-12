@@ -7,7 +7,7 @@
 # "coordinate with divergent maps" from "estimate where the teammate is" (that's step 2,
 # below — drop --force-full-pos-sharing then).
 #
-# Run AFTER Stage 1 (sweep.yaml). Winner labor-division coefs are pasted below (breezy-12);
+# Run AFTER Stage 1 (sweep.yaml). Winner labor-division coefs are pasted below (summer-6);
 # sweep only the comm-gated rendezvous knobs that were inert under full sharing:
 # give/recv bonuses + overlap penalty. overlap-pen range is LOWER ([0.5, 3]) because
 # novel-scan already zero-pays redundant cells — overlap is a second tax on the same thing.
@@ -33,7 +33,7 @@ command:
   - python
   - ${program}
   - --split=train/easy
-  - --n-envs=64
+  - --n-envs=32          # minibatch=1 at n_hops=6 OOMs >32 envs on a 16GB GPU (verified)
   - --n-agents=2
   - --comm-range=120
   - --force-full-pos-sharing          # step 1: positions shared, maps NOT (drop for step 2)
@@ -46,12 +46,13 @@ command:
   - --k-epochs=4
   - --gae-lambda=0.95
   - --gamma=0.99
-  - --minibatches=4
-  # ---- WINNER values from Stage 1 (breezy-sweep-12: score 0.640, stable KL) ----
-  - --novel-scan-weight=0.9
-  - --team-weight=0.42
-  - --proximity-pen=0.15
-  - --target-switch-pen=0.015
+  - --minibatches=1
+  # ---- WINNER from Stage 1 sweep gh3qj58r — summer-sweep-6 (FIXED env, score 0.528,
+  #      fairness 0.944, success 62.5%; n_hops=6 + team≈0.4 dominated the top) ----
+  - --novel-scan-weight=1.50
+  - --team-weight=0.405
+  - --proximity-pen=0.0      # ELIMINATED (deadlock driver); division via novel_scan + target-claim
+  - --target-switch-pen=0.05 # graph-tree commitment (raised from 0.017)
   - --n-hops=6
   # ------------------------------------------------------------------------------
   - --compile

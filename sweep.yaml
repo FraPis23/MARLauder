@@ -11,8 +11,10 @@
 # Same maps + no sampling noise → cross-trial scores actually comparable.
 #
 # MAPPO frozen (sweep v1: no signal across lr/clip/λ/γ; k_epochs=6 caused KL blowups):
-#   lr 3e-4, ent-coef 0.005, clip-eps 0.2, k-epochs 4, gae-lambda 0.95, gamma 0.99,
-#   minibatches 4, tbptt 16.
+#   lr 3e-4, ent-coef 0.005, clip-eps 0.2, k-epochs 10 (Yu et al. Suggestion 3: 10-15 epochs;
+#   raised from 4 now the teleport-env KL blowups are gone + NaN guard protects), γ.99, λ.95,
+#   minibatches 1 (Yu et al. 2022 "Surprising Effectiveness of PPO in MARL", Suggestion 3:
+#   1 minibatch won 22/23 SMAC maps; >1 hurts), tbptt 16.
 #
 # Usage (inside the marlauder container):
 #   wandb sweep sweep.yaml          → SWEEP_ID
@@ -36,7 +38,7 @@ command:
   - python
   - ${program}
   - --split=train/easy
-  - --n-envs=64
+  - --n-envs=32          # minibatch=1 at n_hops=6 OOMs >32 envs on a 16GB GPU (verified)
   - --n-agents=2
   - --rollout-len=256
   - --max-episode-steps=256
@@ -49,7 +51,7 @@ command:
   - --k-epochs=4
   - --gae-lambda=0.95
   - --gamma=0.99
-  - --minibatches=4
+  - --minibatches=1
   - --compile
   - --wandb
   - --wandb-project=marlauder-sweep2
@@ -65,13 +67,11 @@ parameters:
     distribution: uniform
     min: 0.0
     max: 0.5
-  proximity-pen:
-    distribution: uniform
+  # proximity-pen ELIMINATED (the ping-pong/deadlock driver) — fixed at 0 via run_train default;
+  # no longer swept. Division is handled by novel_scan + target-claim + (Phase 2) surplus obs.
+  target-switch-pen:                 # graph-tree branch-flip commitment penalty (now the
+    distribution: uniform            # anti-oscillation knob; raised range, default 0.05)
     min: 0.0
-    max: 0.2
-  target-switch-pen:
-    distribution: uniform
-    min: 0.0
-    max: 0.05
+    max: 0.1
   n-hops:
     values: [2, 4, 6]
