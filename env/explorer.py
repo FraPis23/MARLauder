@@ -205,6 +205,10 @@ class Explorer:
         # -1 = none yet (episode start). Reset on episode done. Used by the B+D branch-flip
         # penalty to detect mid-route fork switches in the BF-from-curr tree.
         self._prev_target_node = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
+        # Committed BF-tree first-hop branch (slot 0..7) of last step's target. Fed back as the
+        # cand_prev_branch_match observation so the (feedforward) strategic head sees its own
+        # last direction → learned commitment, no hysteresis. -1 = none yet.
+        self._prev_branch = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
         # Option A — BF-from-curr cache. Warm-start when curr unchanged step-to-step.
         self._curr_prev = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
         self._dist_curr_prev = torch.full(
@@ -369,6 +373,8 @@ class Explorer:
             target_switch_pen = (prev_pursuable & flip).float()                          # [N, M]
             # Carry target forward; keep prev on a transient invalid pick (g_t < 0).
             self._prev_target_node = torch.where(g_t >= 0, g_t, self._prev_target_node)
+            # Carry committed branch forward for the cand_prev_branch_match observation.
+            self._prev_branch = torch.where(branch_t_valid, branch_t, self._prev_branch)
 
         # ------ Phase D — node-level set-op reward, baselined at last comm ------
         # Snapshot post-scan, pre-fusion node-level FREE per agent.
@@ -810,6 +816,7 @@ class Explorer:
         self.last_action[idx_t]                       = -1
         self._collision_key[idx_t]                    = torch.rand((1, self.M), device=self.dev)
         self._prev_target_node[idx_t]                 = -1
+        self._prev_branch[idx_t]                      = -1
         # Place agents using new map's start.
         row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
         agent_pos = self._spread_starts_graph(row0, col0, env_idx=env_idx)
@@ -866,6 +873,7 @@ class Explorer:
         # Re-draw collision priority + clear objective-commitment memory.
         self._collision_key[idx_t]                    = torch.rand((n, self.M), device=self.dev)
         self._prev_target_node[idx_t]                 = -1
+        self._prev_branch[idx_t]                      = -1
 
         for j_env, e in enumerate(idx):
             row0, col0 = int(starts_new[j_env, 0]), int(starts_new[j_env, 1])
@@ -1209,6 +1217,16 @@ class Explorer:
         # strategic head a stronger yield signal (faster learning, no hard threshold).
         cand_own_minus_team_raw = (cand_euclid_all - cand_min_team_dist) / canvas_diag
         cand_own_minus_team = cand_own_minus_team_raw * float(self.cfg.cand_own_minus_team_scale)
+        # prev_branch_match: 1.0 if this candidate's BF first-hop branch equals the branch the
+        # agent committed to last step → gives the feedforward strategic head memory of its own
+        # direction so it stops re-thrashing the target every step (the deterministic limit cycle).
+        cand_branch = cand_bf_first_hop_all.argmax(-1)                           # [N, M, K]
+        cand_branch_valid = cand_bf_first_hop_all.sum(-1) > 0                    # [N, M, K]
+        prev_branch_match = (
+            (cand_branch == self._prev_branch.unsqueeze(-1))
+            & cand_branch_valid
+            & (self._prev_branch >= 0).unsqueeze(-1)
+        ).float()                                                                # [N, M, K]
         cand_feat_all = torch.stack([
             cand_rel_xy_all[..., 0] / canvas_diag,
             cand_rel_xy_all[..., 1] / canvas_diag,
@@ -1218,7 +1236,8 @@ class Explorer:
             (cand_max_comm_gap / max(1.0, float(self.cfg.max_episode_steps))).clamp(max=1.0),
             cand_own_minus_team.clamp(-1.0, 1.0),                   # Fix A — yielding signal
             cand_team_alt_all.clamp(0.0, 1.0),                       # H.2 — joint alt score
-        ], dim=-1)                                                  # [N, M, K, 8]
+            prev_branch_match,                                       # direction commitment memory
+        ], dim=-1)                                                  # [N, M, K, 9]
         # Mask out invalid candidate slots' features (zero them).
         cand_feat_all = cand_feat_all * cand_valid_all.unsqueeze(-1).float()
 

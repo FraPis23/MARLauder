@@ -88,7 +88,7 @@ class EvalRollout:
                             dtype=np.float32,
                         )
                         strategic_path_xy[ag] = xy_arr
-            obs, reward, done, info = env.step(action)
+            obs, reward, done, info = env.step(action, target_choice=out["target_argmax"])
             h_act = out["hidden_actor"]
             h_crit = out["hidden_critic"]
             nonterm = (~done).float()

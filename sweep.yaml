@@ -48,7 +48,7 @@ command:
   - --lr=0.0003
   - --ent-coef=0.005
   - --clip-eps=0.2
-  - --k-epochs=4
+  - --k-epochs=2
   - --gae-lambda=0.95
   - --gamma=0.99
   - --minibatches=1

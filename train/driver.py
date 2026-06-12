@@ -262,7 +262,7 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
         for t in range(T):
             out = model.act(obs, h_act, h_crit, deterministic=True)
             # No target_choice → target_switch penalty off at eval (reward unused anyway).
-            obs, _r, done, info = eval_env.step(out["action"])
+            obs, _r, done, info = eval_env.step(out["action"], target_choice=out["target_argmax"])
             h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
             er = float(info["explored_rate"][0].item())
             er_curve.append(er)

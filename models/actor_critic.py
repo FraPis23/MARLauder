@@ -29,7 +29,10 @@ from models.init_utils import apply_orthogonal, orthogonal_
 
 F_IN = 7
 K = 8
-CAND_FEAT_DIM = 8     # rel_x, rel_y, utility, euclid, min_team_dist, max_comm_gap, own_minus_team, team_alt_score
+CAND_FEAT_DIM = 9     # rel_x, rel_y, utility, euclid, min_team_dist, max_comm_gap, own_minus_team,
+#                       team_alt_score, prev_branch_match (does cand continue last step's committed
+#                       BF-tree first-hop branch → gives the feedforward strategic head memory of its
+#                       own direction so deterministic target selection stops thrashing)
 
 
 class PointerHead(nn.Module):
