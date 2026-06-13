@@ -39,6 +39,19 @@ class MAPPOCfg:
     # error. Robust to value-target outliers; with value normalization it rarely
     # triggers but caps the gradient on return spikes.
     huber_delta: float = 10.0
+    # J.3 — cross-agent target-diversity loss. Penalizes two agents putting policy
+    # mass on the SAME frontier node, gated by frontier spatial spread (availability).
+    # This pressures DIVISION as a penalty on collision rather than a per-agent reward
+    # bonus (the J.1/J.2 bonuses added attraction → clumping). Leaves the value/reward
+    # landscape untouched → coverage governed solely by novel_scan. 0.0 = off.
+    div_coef: float = 0.0
+    # Availability gate: candidate-spread (normalized by canvas diag) at which the gate
+    # is centered. Below → ~one cluster → gate→0 (don't force a split; both may push the
+    # lone frontier → no idle). Above → alternatives exist → gate→1 (penalize collision).
+    div_spread_center: float = 0.20
+    div_spread_k: float = 12.0      # gate sharpness
+    canvas_diag: float = 1.0        # set from env in make_env_model (spread normalizer)
+    node_eps: float = 8.0           # set from env (= nr/2): xy gap below which two cands are the SAME node
 
 
 def _value_loss(
@@ -65,6 +78,52 @@ def _value_loss(
     pred_clipped = v_old + (pred - v_old).clamp(-clip_eps, clip_eps)
     loss_clipped = err(pred_clipped)
     return torch.max(loss_unclipped, loss_clipped).mean()
+
+
+def _diversity_loss(
+    target_logits: torch.Tensor,   # [N, M, Kc] raw strategic logits
+    cand_valid: torch.Tensor,      # [N, M, Kc] bool
+    cand_xy: torch.Tensor,         # [N, M, Kc, 2] world coords
+    canvas_diag: float,
+    node_eps: float,
+    center: float,
+    k: float,
+) -> torch.Tensor:
+    """J.3 — availability-gated cross-agent target-collision penalty.
+
+    For each ordered agent pair (a,b), penalize shared policy mass on the SAME frontier
+    node: collision = Σ_ij p_a(i)·1[same node]·p_b(j). Same node ⇔ candidate world-coords
+    within node_eps (= nr/2; distinct lattice nodes are nr apart). Gated by the spatial
+    SPREAD of the union of valid candidates: spread < center ⇒ ~one cluster ⇒ gate→0 (don't
+    force a split; both may push the lone frontier → no idle). spread > center ⇒ real
+    alternatives ⇒ gate→1 (penalize collision → reactive division). Returns a scalar ≥ 0.
+    """
+    N, M, Kc = target_logits.shape
+    if M < 2:
+        return target_logits.new_zeros(())
+    neg = torch.finfo(target_logits.dtype).min
+    logits = torch.where(cand_valid, target_logits, torch.full_like(target_logits, neg))
+    p = torch.softmax(logits, dim=-1) * cand_valid.float()              # [N, M, Kc]
+
+    # Availability gate from union-candidate spatial spread (detached — gate, not signal).
+    with torch.no_grad():
+        xy = cand_xy.reshape(N, M * Kc, 2)
+        vmask = cand_valid.reshape(N, M * Kc)
+        d = torch.cdist(xy, xy)                                          # [N, MKc, MKc]
+        pair_valid = vmask.unsqueeze(1) & vmask.unsqueeze(2)
+        d = torch.where(pair_valid, d, torch.zeros_like(d))
+        spread = d.amax(dim=(1, 2)) / max(1.0, canvas_diag)             # [N]
+        gate = torch.sigmoid(k * (spread - center))                     # [N]
+
+    total = target_logits.new_zeros(N)
+    for a in range(M):
+        for b in range(a + 1, M):
+            d_ab = torch.cdist(cand_xy[:, a], cand_xy[:, b])            # [N, Kc, Kc]
+            valid_pair = cand_valid[:, a].unsqueeze(2) & cand_valid[:, b].unsqueeze(1)
+            same = (d_ab < node_eps) & valid_pair                       # [N, Kc, Kc]
+            coll = torch.einsum("ni,nij,nj->n", p[:, a], same.float(), p[:, b])
+            total = total + coll
+    return (gate * total).mean()
 
 
 def _slice_obs(obs: dict, env_idx: torch.Tensor) -> dict:
@@ -99,7 +158,7 @@ def ppo_update(
     mb_size = N // n_mb
 
     stats = {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clipfrac": 0.0,
-             "updates": 0, "nan_skips": 0}
+             "div_loss": 0.0, "updates": 0, "nan_skips": 0}
 
     for epoch in range(cfg.k_epochs):
         # Shuffle env indices each epoch for minibatching.
@@ -127,7 +186,7 @@ def ppo_update(
                     nbr_embs_chunk = enc["nbr_embs"]                       # [T_chunk, Nmb, M, K, d]
 
                     chunk_pg = 0.0; chunk_vl = 0.0; chunk_ent = 0.0
-                    chunk_clip = 0.0; chunk_kl = 0.0
+                    chunk_clip = 0.0; chunk_kl = 0.0; chunk_div = 0.0
                     last_h_act = h_act
                     last_h_crit = h_crit
                     for tt in range(chunk_len):
@@ -158,6 +217,7 @@ def ppo_update(
                             prev_action=chunk_obs["prev_action"][tt],
                             stored_choice=stored_choice_t,
                             cand_bf_first_hop=chunk_obs["cand_bf_first_hop"][tt],
+                            guidepost_nbr_bias=chunk_obs["guidepost_nbr_bias"][tt],
                         )
                         new_logp = ev["logp"]
                         new_val = ev["value"]
@@ -182,6 +242,14 @@ def ppo_update(
                         chunk_pg = chunk_pg + pg
                         chunk_vl = chunk_vl + vl
                         chunk_ent = chunk_ent + ent
+                        if cfg.div_coef > 0.0 and ev.get("target_logits") is not None:
+                            chunk_div = chunk_div + _diversity_loss(
+                                ev["target_logits"],
+                                chunk_obs["cand_valid"][tt],
+                                chunk_obs["cand_xy"][tt],
+                                cfg.canvas_diag, cfg.node_eps,
+                                cfg.div_spread_center, cfg.div_spread_k,
+                            )
                         with torch.no_grad():
                             chunk_clip = chunk_clip + ((ratio - 1).abs() > cfg.clip_eps).float().mean()
                             chunk_kl = chunk_kl + (old_logp_t - new_logp).mean()
@@ -190,13 +258,16 @@ def ppo_update(
                     chunk_ent /= chunk_len
                     chunk_clip /= chunk_len
                     chunk_kl /= chunk_len
+                    if cfg.div_coef > 0.0 and not isinstance(chunk_div, float):
+                        chunk_div = chunk_div / chunk_len
 
                     actor_loss = chunk_pg - cfg.ent_coef * chunk_ent
                     critic_loss = cfg.vf_coef * chunk_vl
+                    div_loss = cfg.div_coef * chunk_div
                     # Scale loss by chunk_len/T for unbiased multi-chunk gradients,
                     # and divide by n_mb*k_epochs so total magnitude is invariant
                     # to minibatching/epoch choices.
-                    loss = (actor_loss + critic_loss) * (chunk_len / T)
+                    loss = (actor_loss + critic_loss + div_loss) * (chunk_len / T)
 
                 # NaN/inf guard. Late in training the value targets can spike and, under
                 # fp16 AMP, overflow → v_loss=NaN → the step poisons every weight and the
@@ -220,12 +291,13 @@ def ppo_update(
                 stats["entropy"] += float(chunk_ent.detach().item())
                 stats["kl"] += float(chunk_kl.detach().item())
                 stats["clipfrac"] += float(chunk_clip.detach().item())
+                stats["div_loss"] += float(chunk_div.detach().item()) if not isinstance(chunk_div, float) else 0.0
                 stats["updates"] += 1
                 # Carry hidden across chunks within this minibatch.
                 h_act = last_h_act.detach()
                 h_crit = last_h_crit.detach()
 
     n = max(1, stats["updates"])
-    for k in ("pg_loss", "v_loss", "entropy", "kl", "clipfrac"):
+    for k in ("pg_loss", "v_loss", "entropy", "kl", "clipfrac", "div_loss"):
         stats[k] /= n
     return stats

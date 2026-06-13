@@ -57,14 +57,19 @@ def main() -> None:
     ap.add_argument("--recv-bonus",      type=float, default=0.5,  help="ζ_recv: NEW cells received at rendezvous")
     ap.add_argument("--overlap-pen",     type=float, default=3.0,  help="η_lap: redundant parallel scan penalty")
     ap.add_argument("--yield-scale",     type=float, default=3.0,  help="G.4.a: scale on cand_own_minus_team yield feature")
+    ap.add_argument("--target-yield-weight", type=float, default=0.0, help="J.1: α_yield — reward for CHOOSING a frontier you're closer to than the (live) teammate. One-sided pull (≥0, no repulsion); reactive position-driven division without ping-pong/idle. 0 = off")
     ap.add_argument("--proximity-pen",   type=float, default=0.0,  help="G.4.b: per-step raw-distance penalty (ELIMINATED by default — it caused the ping-pong/deadlock; novel_scan handles anti-chase). >0 only for ablation")
     ap.add_argument("--path-bias-floor", type=float, default=1.5,  help="I.3: fixed floor on target-following bias (actor logits)")
     ap.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
     ap.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
-    ap.add_argument("--target-switch-pen", type=float, default=0.05, help="δ_obj: graph-tree branch-flip commitment penalty (argmax intent). Raised 0.01→0.05 to punish uncommitted back-and-forth on the BF tree")
+    ap.add_argument("--target-switch-pen", type=float, default=0.05, help="δ_obj: graph-tree branch-flip commitment penalty = the deliberation cost; now fires only on genuine (margin-gated) switches")
+    ap.add_argument("--switch-margin", type=float, default=1.0, help="Phase 1: keep committed strategic target unless an alt beats it by > this (logit units). Higher = more commitment")
+    ap.add_argument("--max-steps-on-option", type=int, default=24, help="Phase 1: horizon cap forcing a strategic re-pick (escape an unreachable-but-still-candidate target)")
+    ap.add_argument("--no-strategic-head", action="store_true", help="Phase 3 ablation: bypass the StrategicHead; pointer decides directly, biased by the guidepost (nearest-frontier first-hop). Tests whether the head earns its place")
     ap.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
     ap.add_argument("--score-w-imbalance", type=float, default=0.5, help="eval/score weight on NORMALIZED contrib_imbalance (equity; D2: now on [0,1] imb so equity is a first-class term, not a free rider)")
     ap.add_argument("--score-w-overlap",   type=float, default=0.25, help="eval/score weight on sensing_overlap (redundant sensing)")
+    ap.add_argument("--score-w-idle",      type=float, default=0.25, help="eval/score weight on idle_rate_max (laziest agent idle-step fraction) → selects for BOTH agents actively exploring (no idle/turn-taking)")
     ap.add_argument("--n-hops", type=int, default=2,
                     help="Ego-centric encoder window radius. Window side = 2·n_hops + 3 "
                          "(49 nodes at 2, 121 at 4, 225 at 6). GAT n_layers tied to n_hops.")
@@ -77,6 +82,8 @@ def main() -> None:
     ap.add_argument("--gamma", type=float, default=0.99, help="discount factor")
     ap.add_argument("--vf-coef", type=float, default=0.5, help="value loss weight")
     ap.add_argument("--tbptt-steps", type=int, default=16, help="TBPTT chunk length")
+    ap.add_argument("--div-coef", type=float, default=0.0, help="J.3: cross-agent target-diversity loss weight. Penalizes both agents choosing the SAME frontier node, gated by frontier spread (no penalty when only one cluster exists → both push it, no idle). 0 = off")
+    ap.add_argument("--div-spread-center", type=float, default=0.20, help="J.3: normalized candidate-spread at which the availability gate centers (below = one cluster = gate off)")
     # --- flags ---
     ap.add_argument("--compile", action="store_true", help="torch.compile encoder (CUDA only)")
     ap.add_argument("--eval-on-ckpt", action="store_true",
@@ -103,6 +110,9 @@ def main() -> None:
         n_hops=args.n_hops,
         lr_actor=args.lr,
         path_bias_floor=args.path_bias_floor,
+        switch_margin=args.switch_margin,
+        max_steps_on_option=args.max_steps_on_option,
+        disable_strategic=args.no_strategic_head,
         device=args.device,
         seed=args.seed,
         compile=args.compile,
@@ -122,6 +132,7 @@ def main() -> None:
         wandb_tags=tuple(args.wandb_tags),
         score_w_imbalance=args.score_w_imbalance,
         score_w_overlap=args.score_w_overlap,
+        score_w_idle=args.score_w_idle,
         env=EnvCfg(
             n_envs=args.n_envs,
             n_agents=args.n_agents,
@@ -140,6 +151,7 @@ def main() -> None:
             recv_bonus_coef=args.recv_bonus,
             overlap_penalty_coef=args.overlap_pen,
             cand_own_minus_team_scale=args.yield_scale,
+            target_yield_weight=args.target_yield_weight,
             proximity_penalty_coef=args.proximity_pen,
             revisit_penalty_coef=args.revisit_pen,
             revisit_window=args.revisit_window,
@@ -155,6 +167,8 @@ def main() -> None:
             gamma=args.gamma,
             vf_coef=args.vf_coef,
             tbptt_steps=args.tbptt_steps,
+            div_coef=args.div_coef,
+            div_spread_center=args.div_spread_center,
         ),
     )
     train(cfg, log_every=1)

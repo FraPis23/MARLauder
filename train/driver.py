@@ -29,6 +29,9 @@ class TrainCfg:
     n_hops: int = 2          # ego-centric encoder window radius; n_layers tied to this
     n_layers: int = 2        # GAT layers; default tied to n_hops in make_env_model
     path_bias_floor: float = 1.5   # I.3 — fixed floor on target-following bias (actor logits)
+    switch_margin: float = 1.0     # Phase 1 — strategic target switches only when an alt beats committed by >this
+    max_steps_on_option: int = 24  # Phase 1 — horizon cap forcing a re-pick (escape unreachable target)
+    disable_strategic: bool = False  # Phase 3 — single-pointer ablation (bypass StrategicHead, use guidepost)
     lr_actor: float = 3e-4
     lr_critic: float = 1e-3
     device: str = "cuda:0"
@@ -61,10 +64,14 @@ class TrainCfg:
     eff_w_stall: float = 0.5
     # v2 — fixed eval suite (sweep scoring): every eval_every iters run the policy
     # DETERMINISTICALLY on the fixed EVAL_MAP_IDX maps and log eval/*. The sweep maximizes
-    # eval/score = coverage_auc − w_imb·contrib_imbalance − w_ov·sensing_overlap.
+    # eval/score = coverage_auc − w_imb·contrib_imbalance − w_ov·sensing_overlap − w_idle·idle_rate_max.
     eval_every: int = 10
     score_w_imbalance: float = 0.5
     score_w_overlap: float = 0.25
+    # w_idle penalizes the laziest agent's idle-step fraction → the sweep selects policies where
+    # BOTH agents keep opening new area (user requirement: no idle, no turn-taking). idle_rate_max
+    # ∈ [0,1] already, so it sits on the same footing as the normalized terms.
+    score_w_idle: float = 0.25
 
 
 def _normalize_cfg(cfg: TrainCfg) -> None:
@@ -95,9 +102,15 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
     else:
         split = load_split(cfg.split, device=cfg.device)
         env = Explorer(split, cfg.env, seed=cfg.seed)
+    # J.3 — env-derived scales for the cross-agent diversity loss gate.
+    cfg.ppo.canvas_diag = float((env.H ** 2 + env.W ** 2) ** 0.5)
+    cfg.ppo.node_eps = float(cfg.env.nr) * 0.5
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
                             n_heads=cfg.n_heads, n_layers=cfg.n_layers,
-                            path_bias_floor=cfg.path_bias_floor).to(cfg.device)
+                            path_bias_floor=cfg.path_bias_floor,
+                            switch_margin=cfg.switch_margin,
+                            max_steps_on_option=cfg.max_steps_on_option,
+                            disable_strategic=cfg.disable_strategic).to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead", dynamic=False)
@@ -248,7 +261,13 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
     T = eval_env.cfg.max_episode_steps
     aucs, succ, imbs, ovs, duties, s90s = [], [], [], [], [], []
     fairs, score_maps = [], []          # D2: Jain fairness + per-map score (map-luck/noise)
+    concs, idles = [], []               # temporal co-activity + per-agent idle rate
     imb_denom = (1.0 - 1.0 / M) if M > 1 else 1.0   # max possible imbalance → normalize to [0,1]
+    # Concurrency window: an agent is "active" if it found ≥1 union-new cell in the last
+    # W_CONC steps. concurrency_map = fraction of (post-warmup) steps where ALL agents are
+    # active-in-window. Jain fairness catches one agent idle the WHOLE episode; concurrency
+    # catches agents that ALTERNATE (Jain-fair but never working at the same time).
+    W_CONC = 10
     for midx in EVAL_MAP_IDX:
         eval_env.reload_map(env_idx=0, map_idx=int(midx))
         h_act, h_crit = model.init_hidden(1, cfg.device)
@@ -257,6 +276,8 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
         ov_sum = 0.0
         duty_sum = 0.0
         novel_final = None
+        novel_prev = torch.zeros(M, device=cfg.device)   # per-agent cumulative at t-1
+        active_hist: list[torch.Tensor] = []             # per step: [M] bool, found novel this step
         success = False
         s90 = float(T)
         for t in range(T):
@@ -269,6 +290,10 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
             ov_sum += float(info["metrics"]["sensing_overlap"].item())
             duty_sum += float(info["metrics"]["comm_duty_cycle"].item())
             novel_final = info["novel_cells_ep"][0]
+            # Per-step per-agent novel = Δ cumulative; "active" this step if it found anything.
+            novel_step = (novel_final - novel_prev).clamp(min=0.0)
+            active_hist.append(novel_step > 0.0)
+            novel_prev = novel_final.clone()
             if er >= 0.9 and s90 >= float(T):
                 s90 = float(t + 1)
             if bool(done[0].item()):
@@ -290,11 +315,28 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
             imb_m, fair_m = 0.0, 1.0
         imbs.append(imb_m)
         fairs.append(fair_m)
+        # Temporal concurrency: stack [steps, M], window-OR over the last W_CONC steps,
+        # then require ALL agents active-in-window at each post-warmup step.
+        if M > 1 and steps > W_CONC:
+            act = torch.stack(active_hist, dim=0).float()                 # [steps, M]
+            csum = act.cumsum(dim=0)
+            win = csum.clone()
+            win[W_CONC:] = csum[W_CONC:] - csum[:-W_CONC]                 # rolling-window novel count
+            active_in_win = win[W_CONC:] > 0                              # [steps-W, M]
+            conc_m = float(active_in_win.all(dim=1).float().mean().item())
+            # Per-agent idle rate: fraction of steps an agent found nothing (max over agents
+            # = the laziest agent's idle fraction; 1.0 = one agent never explored).
+            idle_m = float((1.0 - act.mean(dim=0)).max().item())
+        else:
+            conc_m, idle_m = 1.0, 0.0
+        concs.append(conc_m)
+        idles.append(idle_m)
         # D2: per-map score on the NORMALIZED imbalance so equity is on the same [0,1]
         # footing as coverage_auc (raw imb spans only ~[0, 1−1/M] → was a near-free rider).
         score_maps.append(aucs[-1]
                           - cfg.score_w_imbalance * (imb_m / imb_denom)
-                          - cfg.score_w_overlap * ovs[-1])
+                          - cfg.score_w_overlap * ovs[-1]
+                          - cfg.score_w_idle * idle_m)
     if was_training:
         model.train()
     n = float(len(EVAL_MAP_IDX))
@@ -305,7 +347,9 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
         "eval/coverage_auc":      sum(aucs) / n,
         "eval/contrib_imbalance": mean_imb,                       # raw (kept for continuity)
         "eval/contrib_imbalance_norm": mean_imb / imb_denom,      # [0,1] — drives the score
-        "eval/fairness":          sum(fairs) / n,                 # Jain index, 1 = equal
+        "eval/fairness":          sum(fairs) / n,                 # Jain index, 1 = equal (idle catcher)
+        "eval/concurrency":       sum(concs) / n,                 # both active in same window (alternation catcher)
+        "eval/idle_rate_max":     sum(idles) / n,                 # laziest-agent idle-step fraction
         "eval/sensing_overlap":   sum(ovs) / n,
         "eval/comm_duty":         sum(duties) / n,
         "eval/success_rate":      sum(succ) / n,
@@ -406,6 +450,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                   f"pg={stats['pg_loss']:+.4f}  v={stats['v_loss']:.4f}  "
                   f"ent={stats['entropy']:.3f}  kl={stats['kl']:+.4f}  "
                   f"clip={stats['clipfrac']*100:.1f}%  "
+                  f"div={stats.get('div_loss', 0.0):.4f} "
                   f"redun={redundancy:.2f} stall={stall_rate*100:.0f}% "
                   f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
                   f"sps={sps_iter:.0f}({sps_all:.0f}avg)")
@@ -419,6 +464,8 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                   f"auc={eval_stats['eval/coverage_auc']:.3f}  "
                   f"imbN={eval_stats['eval/contrib_imbalance_norm']:.3f}  "
                   f"fair={eval_stats['eval/fairness']:.3f}  "
+                  f"conc={eval_stats['eval/concurrency']:.2f}  "
+                  f"idle={eval_stats['eval/idle_rate_max']:.2f}  "
                   f"ov={eval_stats['eval/sensing_overlap']:.2f}  "
                   f"duty={eval_stats['eval/comm_duty']:.2f}  "
                   f"succ={eval_stats['eval/success_rate']:.2f}  "

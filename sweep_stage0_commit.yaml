@@ -1,0 +1,93 @@
+# DEPRECATED (2026-06-13) — DO NOT RUN. Commitment was found ~thrash-neutral and to HURT
+# post-comm strategic↔tactical alignment (the thrash was fixed by the prev_branch_match obs
+# feature, not commitment). The new Stage 0 is sweep_div.yaml (diversity-loss tuning). Kept
+# for history only.
+#
+# W&B sweep v3 — STAGE 0: interrupting-option COMMITMENT knobs (Phase 1).
+#
+# Run FIRST, before the labor-division (sweep.yaml) and rendezvous (sweep_stage2.yaml)
+# stages. Rationale: the prior sweep gh3qj58r was scored under the deterministic limit-cycle
+# (the strategic head re-argmaxed its target every step), so eval/score measured the
+# oscillation, NOT the reward — its "winner" (summer-6) is NOT trustworthy and must be
+# re-validated in the committed regime. Commitment is the structural fix (Sutton/Precup/Singh
+# 1999 options + interruption; deliberation cost à la Harb et al. 2018), so tune it FIRST;
+# everything downstream assumes the policy no longer thrashes.
+#
+# What it sweeps (the 3 NEW commitment dims only — one group, not all params at once):
+#   switch-margin        — keep committed target unless an alt beats it by >this (logit units).
+#                          Too low → thrash returns; too high → over-commits, can't react to a
+#                          better frontier or a teammate estimate. THE key new knob.
+#   max-steps-on-option  — horizon cap forcing a re-pick (escape an unreachable-but-candidate
+#                          target). Interacts with switch-margin: high margin needs a finite cap.
+#   target-switch-pen    — deliberation cost; now fires ONLY on genuine margin-cleared switches
+#                          (was inert under the old stochastic-only firing), so it is now learnable.
+#
+# Regime = POSITION-ONLY (user preference): maps NOT shared, positions shared. This is the
+# regime the final model uses, so commitment is validated where it will run — not under the
+# degenerate full-occupancy isolation of Stage 1.
+#
+# Labor-division coefs are FIXED at the gh3qj58r values as a PLACEHOLDER baseline only (they
+# get re-swept in Stage 1 under commitment). n-hops FIXED at 4 (faster than 6, richer than 2;
+# its real value is re-decided in Stage 1) so VRAM is predictable and trials are comparable.
+#
+# Metric = eval/score on the fixed 8-map suite — now TRUSTWORTHY (no limit cycle). Watch the
+# new work metrics too: eval/concurrency (both agents active in-window; alternation catcher)
+# and eval/idle_rate_max (laziest agent's idle fraction).
+#
+# Usage (inside the marlauder container):
+#   wandb sweep sweep_stage0_commit.yaml      → SWEEP_ID
+#   wandb agent <ENTITY/PROJECT/SWEEP_ID>     (one agent per machine/GPU)
+
+program: scripts/run_train.py
+method: bayes
+metric:
+  name: eval/score
+  goal: maximize
+
+early_terminate:
+  type: hyperband
+  min_iter: 3
+  eta: 2
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --split=train/easy
+  - --n-envs=32          # n_hops=4 fixed here; 32 keeps a healthy update count (2M/8192≈244 iters)
+  - --n-agents=2
+  - --comm-range=120
+  - --force-full-pos-sharing          # position-only: positions shared, maps NOT
+  - --rollout-len=256
+  - --max-episode-steps=256
+  - --total-steps=2000000
+  - --lr=0.0003
+  - --ent-coef=0.005
+  - --clip-eps=0.2
+  - --k-epochs=2
+  - --gae-lambda=0.95
+  - --gamma=0.99
+  - --minibatches=1
+  # ---- labor-division placeholder (re-swept in Stage 1 under commitment) ----
+  - --novel-scan-weight=1.50
+  - --team-weight=0.405
+  - --proximity-pen=0.0
+  - --n-hops=4
+  # --------------------------------------------------------------------------
+  - --compile
+  - --wandb
+  - --wandb-project=marlauder-sweep2
+  - ${args}
+
+# The 3 commitment dims — exact dashed CLI flags (W&B expands ${args} as --<key>=<value>).
+parameters:
+  switch-margin:
+    distribution: uniform
+    min: 0.25
+    max: 3.0
+  max-steps-on-option:
+    values: [8, 16, 24, 36, 48]
+  target-switch-pen:
+    distribution: uniform
+    min: 0.0
+    max: 0.1

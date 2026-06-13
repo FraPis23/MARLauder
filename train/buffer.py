@@ -57,6 +57,9 @@ class Rollout:
             "pos":                _z((T, N, M, 2),             torch.float32),
             # Fix B — previous-action one-hot per agent.
             "prev_action":        _z((T, N, M, K),             torch.float32),
+            # Phase 3 — guidepost first-hop one-hot (toward nearest frontier); used by the
+            # single-pointer ablation (no strategic head) as the action-bias signal.
+            "guidepost_nbr_bias": _z((T, N, M, K),             torch.float32),
         }
         self.actions       = _z((T, N, M), torch.long)
         # Phase A v2 — strategic K-slot chosen at rollout (for STE replay during PPO).

@@ -97,6 +97,9 @@ class StrategicHead(nn.Module):
         gumbel_tau: float = 1.0,
         stored_choice: torch.Tensor | None = None,   # [B] long; if given, use as hard pick
         sample: bool = True,                          # False at eval → argmax (no Gumbel noise)
+        committed_slot: torch.Tensor | None = None,   # [B] long; current committed cand slot (-1 none)
+        switch_margin: float = 1.0,                   # keep committed unless best beats it by > margin
+        force_repick: torch.Tensor | None = None,     # [B] bool; True → drop commitment (horizon cap)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, K_cand, _ = cand_feat.shape
         q  = self.q_proj(curr_emb).unsqueeze(1)                          # [B, 1, d]
@@ -120,9 +123,27 @@ class StrategicHead(nn.Module):
         else:
             soft = torch.softmax(safe_logits, dim=-1)
         if stored_choice is not None:
-            hard = torch.nn.functional.one_hot(stored_choice.clamp(min=0), num_classes=K_cand).float()
+            # PPO replay: forward the rollout's (already-gated) pick. No commitment logic here.
+            hard_idx = stored_choice.clamp(min=0)
         else:
-            hard = torch.nn.functional.one_hot(soft.argmax(dim=-1), num_classes=K_cand).float()
+            raw_pick = soft.argmax(dim=-1)                                    # [B] greedy/Gumbel pick
+            if committed_slot is not None:
+                # Interrupting-option commitment (Sutton/Precup/Singh 1999; deliberation cost
+                # à la Harb 2018 lives in the env reward). Keep the committed candidate unless a
+                # clearly better one exists (margin), or the commitment is invalid / horizon-capped.
+                cs = committed_slot.clamp(min=0)
+                committed_logit = logits.gather(1, cs.unsqueeze(-1)).squeeze(-1)       # [B]
+                best_logit = logits.max(dim=-1).values                                 # [B]
+                has_c = committed_slot >= 0
+                committed_valid = committed_logit > (NEG / 2)   # committed still a live candidate
+                margin_ok = (best_logit - committed_logit) <= switch_margin
+                keep = has_c & committed_valid & margin_ok
+                if force_repick is not None:
+                    keep = keep & ~force_repick
+                hard_idx = torch.where(keep, cs, raw_pick)
+            else:
+                hard_idx = raw_pick
+        hard = torch.nn.functional.one_hot(hard_idx, num_classes=K_cand).float()
         # Straight-through: hard at forward, gradient flows through soft.
         target_onehot = (hard - soft).detach() + soft                    # [B, K_cand]
         # Pool kv by one-hot mix.
@@ -133,11 +154,25 @@ class StrategicHead(nn.Module):
 
 class MarlActorCritic(nn.Module):
     def __init__(self, n_agents: int = 1, d: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 gumbel_tau: float = 1.0, path_bias_floor: float = 1.5) -> None:
+                 gumbel_tau: float = 1.0, path_bias_floor: float = 1.5,
+                 switch_margin: float = 1.0, max_steps_on_option: int = 24,
+                 disable_strategic: bool = False) -> None:
         super().__init__()
         self.M = n_agents
         self.d = d
         self.gumbel_tau = gumbel_tau           # mutable; trainer anneals via attribute assignment
+        # Phase 3 — single-pointer ablation. When True the StrategicHead is bypassed: the actor
+        # uses a zero strategic embedding + the env guidepost (BF first-hop toward nearest
+        # frontier) as both the actor-input direction and the action-logit bias (ARIADNE/IR2
+        # design). Tests whether the strategic head — followed only ~35-50% of the time — earns
+        # its place, vs collapsing to one pointer decision.
+        self.disable_strategic = disable_strategic
+        # Phase 1 — interrupting-option commitment. switch_margin: strategic target only changes
+        # when an alternative beats the committed one by > this (logit units). max_steps_on_option:
+        # horizon cap forcing a re-pick (escape an unreachable-but-still-candidate target). Both
+        # mutable attributes so the driver/sweep can set them without a ctor change.
+        self.switch_margin = switch_margin
+        self.max_steps_on_option = max_steps_on_option
         self.encoder = GATEncoder(in_dim=F_IN, d=d, n_heads=n_heads, n_layers=n_layers)
         # Phase A v2: strategic head over top-K=16 candidates.
         self.strategic_head = StrategicHead(d, n_heads=n_heads, cand_feat_dim=CAND_FEAT_DIM)
@@ -245,13 +280,45 @@ class MarlActorCritic(nn.Module):
         nr: float,
         stored_choice: torch.Tensor | None = None,
         sample: bool = True,
+        committed_node: torch.Tensor | None = None,   # [B] global node committed last step (-1 none)
+        cand_idx_global: torch.Tensor | None = None,  # [B, K_cand] global node per candidate
+        committed_steps: torch.Tensor | None = None,  # [B] consecutive steps on committed node
+        guidepost_nbr_bias: torch.Tensor | None = None,  # [B, K=8] guidepost first-hop one-hot (ablation)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run strategic head + compute actor input. Returns actor_in, target_logits, target_idx."""
+        # Phase 3 ablation — bypass the strategic head entirely. Zero strategic embedding +
+        # guidepost first-hop as the actor's direction signal. target_logits is None (no head);
+        # target_idx is a 0 sentinel (unused: env penalty off via --target-switch-pen 0).
+        if self.disable_strategic:
+            B = curr_emb.shape[0]
+            zero_emb = curr_emb.new_zeros(B, self.d)
+            gp = (guidepost_nbr_bias if guidepost_nbr_bias is not None
+                  else curr_emb.new_zeros(B, K))
+            actor_in = self.actor_pre(torch.cat([curr_emb, zero_emb, gp, prev_action], dim=-1))
+            target_idx = torch.zeros(B, dtype=torch.long, device=curr_emb.device)
+            return actor_in, None, target_idx
+        # Phase 1 — map the committed GLOBAL node to its current candidate slot (the candidate
+        # list / slot order changes every step, so match by node, not slot). Not found → the
+        # option terminated naturally (target reached or no longer a frontier) → free re-pick.
+        committed_slot = None
+        force_repick = None
+        # max_steps_on_option <= 0 disables commitment entirely (Phase-0 control: original
+        # per-step argmax target selection) — clean A/B on identical code.
+        if self.max_steps_on_option > 0 and committed_node is not None and cand_idx_global is not None:
+            match = (cand_idx_global == committed_node.unsqueeze(-1)) & (committed_node.unsqueeze(-1) >= 0)
+            has = match.any(dim=-1)
+            slot = match.float().argmax(dim=-1)
+            committed_slot = torch.where(has, slot, torch.full_like(slot, -1))
+            if committed_steps is not None:
+                force_repick = committed_steps >= self.max_steps_on_option
         strategic_emb, target_logits, target_onehot = self.strategic_head(
             curr_emb, cand_feat, cand_valid,
             gumbel_tau=self.gumbel_tau,
             stored_choice=stored_choice,
             sample=sample,
+            committed_slot=committed_slot,
+            switch_margin=self.switch_margin,
+            force_repick=force_repick,
         )
         target_xy_chosen = (target_onehot.unsqueeze(-1) * cand_xy).sum(dim=1)   # [B, 2]
         next_hop_onehot = self._next_hop_onehot(target_xy_chosen, pos, nr)      # [B, K=8]
@@ -271,6 +338,8 @@ class MarlActorCritic(nn.Module):
         N, M = obs["curr_idx"].shape
         B = N * M
         h_all, curr_emb, nbr_embs = self._encode(obs)
+        committed_node = obs.get("committed_node")
+        committed_steps = obs.get("committed_steps")
         actor_in, target_logits, target_idx = self._strategic_and_actor_in(
             curr_emb,
             obs["cand_feat"].reshape(B, -1, CAND_FEAT_DIM),
@@ -281,18 +350,27 @@ class MarlActorCritic(nn.Module):
             nr=nr,
             stored_choice=None,
             sample=(not deterministic),
+            committed_node=committed_node.reshape(B) if committed_node is not None else None,
+            cand_idx_global=obs["cand_idx"].reshape(B, -1) if "cand_idx" in obs else None,
+            committed_steps=committed_steps.reshape(B) if committed_steps is not None else None,
+            guidepost_nbr_bias=obs["guidepost_nbr_bias"].reshape(B, K) if "guidepost_nbr_bias" in obs else None,
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)              # [B, d]
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
-        # G.3.c — soft bias toward BF first-hop of strategic pick.
-        cand_bf_first_hop = obs.get("cand_bf_first_hop")
-        if cand_bf_first_hop is not None:
-            cbfh = cand_bf_first_hop.reshape(B, -1, K)                                 # [B, K_cand, K=8]
-            chosen_hop = torch.gather(
-                cbfh, dim=1, index=target_idx.view(B, 1, 1).expand(-1, 1, K)
-            ).squeeze(1)                                                                # [B, K=8]
-            logits = logits + self.path_bias * chosen_hop
+        if self.disable_strategic:
+            # Ablation: bias toward the guidepost first-hop (nearest-frontier direction).
+            gp = obs["guidepost_nbr_bias"].reshape(B, K)
+            logits = logits + self.path_bias * gp
+        else:
+            # G.3.c — soft bias toward BF first-hop of strategic pick.
+            cand_bf_first_hop = obs.get("cand_bf_first_hop")
+            if cand_bf_first_hop is not None:
+                cbfh = cand_bf_first_hop.reshape(B, -1, K)                                 # [B, K_cand, K=8]
+                chosen_hop = torch.gather(
+                    cbfh, dim=1, index=target_idx.view(B, 1, 1).expand(-1, 1, K)
+                ).squeeze(1)                                                                # [B, K=8]
+                logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
@@ -309,7 +387,8 @@ class MarlActorCritic(nn.Module):
         h_crit_out = self.gru_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
 
-        K_cand = target_logits.shape[-1]
+        out_target_logits = (target_logits.view(N, M, target_logits.shape[-1])
+                             if target_logits is not None else None)
         return {
             "action": action.view(N, M),
             "logp": logp.view(N, M),
@@ -318,12 +397,13 @@ class MarlActorCritic(nn.Module):
             "logits": logits.view(N, M, K),
             "hidden_actor": h_act_out.view(N, M, self.d),
             "hidden_critic": h_crit_out,
-            "target_choice": target_idx.view(N, M),                  # K-slot in cand list
-            "target_logits": target_logits.view(N, M, K_cand),
-            # A3 — deterministic strategic intent (masked-logit argmax, no Gumbel noise).
-            # Used by the env's target_switch penalty so exploration noise in the sampled
-            # pick doesn't register as "second-guessing".
-            "target_argmax": target_logits.argmax(dim=-1).view(N, M),
+            "target_choice": target_idx.view(N, M),                  # K-slot in cand list (gated pick)
+            "target_logits": out_target_logits,
+            # Phase 1 — target_argmax now == the COMMITTED (gated) pick, not the raw logit
+            # argmax. The env consumes this for _prev_target_node + the deliberation cost, so
+            # both must reflect the option actually executed (keeping target_choice consistent
+            # for PPO replay). The old raw-argmax intent caused the train/eval mismatch.
+            "target_argmax": target_idx.view(N, M),
         }
 
     # ---------------- evaluate (for PPO update) ----------------
@@ -350,16 +430,21 @@ class MarlActorCritic(nn.Module):
             nr=nr,
             stored_choice=sc,
             sample=False,
+            guidepost_nbr_bias=obs["guidepost_nbr_bias"].reshape(B, K) if "guidepost_nbr_bias" in obs else None,
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
-        # G.3.c — soft path bias on action logits, indexed by stored strategic pick.
-        cand_bf_first_hop = obs.get("cand_bf_first_hop")
-        if cand_bf_first_hop is not None and sc is not None:
-            cbfh = cand_bf_first_hop.reshape(B, -1, K)
-            chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
-            logits = logits + self.path_bias * chosen_hop
+        if self.disable_strategic:
+            if "guidepost_nbr_bias" in obs:
+                logits = logits + self.path_bias * obs["guidepost_nbr_bias"].reshape(B, K)
+        else:
+            # G.3.c — soft path bias on action logits, indexed by stored strategic pick.
+            cand_bf_first_hop = obs.get("cand_bf_first_hop")
+            if cand_bf_first_hop is not None and sc is not None:
+                cbfh = cand_bf_first_hop.reshape(B, -1, K)
+                chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
+                logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
@@ -432,6 +517,7 @@ class MarlActorCritic(nn.Module):
         prev_action: torch.Tensor,     # [N, M, K=8] one-hot
         stored_choice: torch.Tensor,   # [N, M] long — target K-slot stored at rollout
         cand_bf_first_hop: torch.Tensor | None = None,   # G.3.c [N, M, K_cand, K]
+        guidepost_nbr_bias: torch.Tensor | None = None,  # Phase 3 ablation [N, M, K]
         nr: float = 16.0,
     ) -> dict:
         """One PPO-evaluate step given pre-encoded curr/nbr embeddings.
@@ -442,7 +528,8 @@ class MarlActorCritic(nn.Module):
         N, M, _ = curr_emb.shape
         B = N * M
         curr_emb_flat = curr_emb.reshape(B, self.d)
-        actor_in, _, _ = self._strategic_and_actor_in(
+        gp_flat = guidepost_nbr_bias.reshape(B, K) if guidepost_nbr_bias is not None else None
+        actor_in, target_logits, _ = self._strategic_and_actor_in(
             curr_emb_flat,
             cand_feat.reshape(B, -1, CAND_FEAT_DIM),
             cand_valid.reshape(B, -1),
@@ -452,13 +539,17 @@ class MarlActorCritic(nn.Module):
             nr=nr,
             stored_choice=stored_choice.reshape(B),
             sample=False,                # no Gumbel noise at PPO update
+            guidepost_nbr_bias=gp_flat,
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs.reshape(B, K, self.d),
                               action_mask.reshape(B, K))
-        # G.3.c — soft path bias using stored strategic pick.
-        if cand_bf_first_hop is not None:
+        if self.disable_strategic:
+            if gp_flat is not None:
+                logits = logits + self.path_bias * gp_flat
+        elif cand_bf_first_hop is not None:
+            # G.3.c — soft path bias using stored strategic pick.
             cbfh = cand_bf_first_hop.reshape(B, -1, K)
             sc = stored_choice.reshape(B)
             chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
@@ -473,10 +564,15 @@ class MarlActorCritic(nn.Module):
         joint = self.critic_pre(joint)
         h_crit_out = self.gru_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
+        # J.3 — expose strategic target logits for the cross-agent diversity loss (mappo).
+        # None when the head is ablated (no target distribution to diversify).
+        out_tl = (target_logits.view(N, M, target_logits.shape[-1])
+                  if target_logits is not None else None)
         return {
             "logp": logp.view(N, M),
             "entropy": entropy.view(N, M),
             "value": value,
             "hidden_actor": h_act_out.view(N, M, self.d),
             "hidden_critic": h_crit_out,
+            "target_logits": out_tl,
         }

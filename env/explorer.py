@@ -93,6 +93,15 @@ class EnvCfg:
     # G.4.a — amplify cand_own_minus_team feature (yield signal). Higher scale → faster
     # learning of yielding behavior (smooth, no oscillation).
     cand_own_minus_team_scale: float = 3.0
+    # J.1 — yield-gated target bonus (reactive position-driven division). Rewards the agent
+    # for CHOOSING a target frontier it is closer to than the teammate (= "mine"), using the
+    # live teammate position (cand_min_team_dist ← last_known_pos). It is a one-sided PULL:
+    # clamp(team_dist − own_dist, 0) ≥ 0, never negative → no repulsion, no ping-pong. With
+    # one viable frontier the closer agent is paid and the farther agent is simply NOT paid
+    # (0, not penalized) so it still goes (novel_scan dominates) → no idle. With two frontiers
+    # each agent is closer to a different one → both paid → reactive division emerges. Static
+    # split can't fake it: the bonus tracks where the teammate ACTUALLY is. 0.0 = off.
+    target_yield_weight: float = 0.0        # α_yield
     # G.4.b — per-step proximity penalty when teammate is too close (anti-chase).
     # ELIMINATED (default 0.0): this raw-distance reflex was the limit-cycle driver — it
     # over-corrected into ping-pong and punished BOTH agents converging on the last frontier
@@ -209,6 +218,19 @@ class Explorer:
         # cand_prev_branch_match observation so the (feedforward) strategic head sees its own
         # last direction → learned commitment, no hysteresis. -1 = none yet.
         self._prev_branch = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
+        # Phase 1 (interrupting options) — consecutive steps the SAME strategic target node has
+        # been committed. Fed to the strategic head as committed_steps so it can force a re-pick
+        # at the max-horizon cap (prevents pursuing an unreachable-but-still-candidate target
+        # forever). Reset to 0 when the committed node changes; reset to 0 on episode done.
+        self._steps_on_option = torch.zeros((self.N, self.M), dtype=torch.long, device=self.dev)
+        # Phase 1b — True for an agent on the step a map fusion delivered it NEW cells. The
+        # strategic target is already correct after fusion (re-scored on the fused map); the
+        # observed failure is TACTICAL — stale GRU navigation momentum carries the agent into
+        # the teammate's just-received (now-explored) region instead of following its target.
+        # This flag marks "world changed, re-plan from here"; wiring (GRU-hidden refresh vs
+        # path-bias boost vs obs feature) is decided AFTER instrumentation. Gated on cells
+        # ACTUALLY received (not mere comm range) so already-synced neighbors don't trigger.
+        self._comm_event = torch.zeros((self.N, self.M), dtype=torch.bool, device=self.dev)
         # Option A — BF-from-curr cache. Warm-start when curr unchanged step-to-step.
         self._curr_prev = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
         self._dist_curr_prev = torch.full(
@@ -332,6 +354,7 @@ class Explorer:
         # agent occupied when it made this decision) → self._last_obs + the cached
         # bf_dist_from_curr (self._dist_curr_prev), both built by the previous _refresh_obs.
         target_switch_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        yield_bonus = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         if target_choice is not None:
             obs0      = self._last_obs
             cand_idx0 = obs0["cand_idx"]                                  # [N, M, K_cand] global node
@@ -343,6 +366,23 @@ class Explorer:
             tc        = target_choice.clamp(0, K_cand - 1)               # [N, M]
             # Current target node + its first-hop branch (slot 0..7).
             g_t = torch.gather(cand_idx0, 2, tc.unsqueeze(-1)).squeeze(-1)               # [N, M]
+            # J.2 — yield-gated target bonus = OWNERSHIP × exploration VALUE (no distance
+            # magnitude). cand_feat[...,6] = own_minus_team (scaled, clamped [-1,1]): NEGATIVE
+            # = I'm closer than the live teammate → "mine". cand_feat[...,2] = cand_utility ∈
+            # [0,1] = exploration value of the frontier.
+            #   bonus = utility(target) · σ(k·(−own_minus_team − margin))
+            # The σ is a SMOOTH ownership gate (≈1 when clearly mine, ≈0 when teammate is
+            # closer). Crucially the magnitude is the frontier's UTILITY, not its nearness —
+            # so the greedy policy can't game it by grabbing the nearest cell (the J.1 flaw
+            # that collapsed coverage). One-sided: never negative → no repulsion. Single
+            # frontier → margin unmet for the farther agent → 0 (not penalized) → novel_scan
+            # still pulls it in → no idle.
+            if self.M > 1 and self.cfg.target_yield_weight > 0.0:
+                cf0 = obs0["cand_feat"]
+                omt_chosen = torch.gather(cf0[..., 6], 2, tc.unsqueeze(-1)).squeeze(-1)   # [N, M]
+                util_chosen = torch.gather(cf0[..., 2], 2, tc.unsqueeze(-1)).squeeze(-1)  # [N, M]
+                own_gate = torch.sigmoid(8.0 * (-omt_chosen - 0.05))                      # [N, M] ∈(0,1)
+                yield_bonus = util_chosen * own_gate * (g_t >= 0).float()                 # [N, M]
             fh_t = torch.gather(
                 cbfh0, 2, tc.view(self.N, self.M, 1, 1).expand(self.N, self.M, 1, self.K)
             ).squeeze(2)                                                                 # [N, M, K=8]
@@ -371,6 +411,15 @@ class Explorer:
                               & branch_prev_valid & branch_t_valid)
             flip = branch_t != branch_prev
             target_switch_pen = (prev_pursuable & flip).float()                          # [N, M]
+            # Phase 1 — track consecutive steps on the same committed target node. A valid new
+            # pick (g_t >= 0) that equals the carried node → increment; a change → reset to 0.
+            node_changed = (g_t >= 0) & (g_t != self._prev_target_node)
+            self._steps_on_option = torch.where(
+                g_t >= 0,
+                torch.where(node_changed, torch.zeros_like(self._steps_on_option),
+                            self._steps_on_option + 1),
+                self._steps_on_option,
+            )
             # Carry target forward; keep prev on a transient invalid pick (g_t < 0).
             self._prev_target_node = torch.where(g_t >= 0, g_t, self._prev_target_node)
             # Carry committed branch forward for the cand_prev_branch_match observation.
@@ -395,6 +444,11 @@ class Explorer:
         # Post-fusion node-level FREE.
         occ_post_flat = self.world.occupancy_torch.view(self.N, self.M, -1)
         free_node_post = occ_post_flat[:, :, self._node_flat_idx] == _FREE                # [N, M, N_max]
+
+        # Phase 1b — map-exchange event: a node became FREE for agent i via FUSION (not its own
+        # scan) this step → it received teammate map data. Marks "world changed, re-plan from here"
+        # for the strategic/tactical re-planning signal (wiring decided after instrumentation).
+        self._comm_event = (free_node_post & ~free_node_pre).any(dim=-1)                  # [N, M]
 
         # team_delta (pixel-level, for completion check + cooperative term).
         union_free = (self.world.occupancy_torch == _FREE).any(dim=1).view(self.N, -1).float().sum(-1)
@@ -505,10 +559,12 @@ class Explorer:
         eps_prox = self.cfg.proximity_penalty_coef
         delta_obj = self.cfg.target_switch_penalty_coef
         delta_stall = self.cfg.stall_penalty_coef
+        a_yield = self.cfg.target_yield_weight
         reward = (a_novel * novel_scan
                   + beta  * team_delta_node.unsqueeze(-1)
                   + z_give * give_bonus
                   + z_recv * recv_bonus
+                  + a_yield * yield_bonus
                   - eta_lap * overlap_pen
                   - gamma   * revisit_pen
                   - eps_prox * proximity_pen
@@ -525,6 +581,7 @@ class Explorer:
             "team":          (beta * team_delta_node).mean(),
             "give":          (z_give * give_bonus).mean(),
             "recv":          (z_recv * recv_bonus).mean(),
+            "yield":         (a_yield * yield_bonus).mean(),
             "overlap":       (-eta_lap * overlap_pen).mean(),
             "revisit":       (-gamma * revisit_pen).mean(),
             "proximity":     (-eps_prox * proximity_pen).mean(),
@@ -568,6 +625,11 @@ class Explorer:
             "sensing_overlap":     sens_overlap,
             "team_delta_sum": team_delta.sum(),                   # Σ_N Δunion frac this step (efficiency num)
             "step_disp_sum":  step_disp.sum(),                    # Σ_{N,M} displacement px (efficiency denom)
+            # Per-step work proxy: fraction of envs where ALL agents found ≥1 union-new cell
+            # this step (training trend for the alternation/idle problem; eval/concurrency is
+            # the windowed, authoritative version).
+            "both_active":    (novel_count > 0).all(dim=1).float().mean() if self.M > 1
+                              else (novel_count > 0).float().mean(),
         }
 
         self._refresh_obs(comm_mask)
@@ -817,6 +879,8 @@ class Explorer:
         self._collision_key[idx_t]                    = torch.rand((1, self.M), device=self.dev)
         self._prev_target_node[idx_t]                 = -1
         self._prev_branch[idx_t]                      = -1
+        self._steps_on_option[idx_t]                  = 0
+        self._comm_event[idx_t]                       = False
         # Place agents using new map's start.
         row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
         agent_pos = self._spread_starts_graph(row0, col0, env_idx=env_idx)
@@ -874,6 +938,8 @@ class Explorer:
         self._collision_key[idx_t]                    = torch.rand((n, self.M), device=self.dev)
         self._prev_target_node[idx_t]                 = -1
         self._prev_branch[idx_t]                      = -1
+        self._steps_on_option[idx_t]                  = 0
+        self._comm_event[idx_t]                       = False
 
         for j_env, e in enumerate(idx):
             row0, col0 = int(starts_new[j_env, 0]), int(starts_new[j_env, 1])
@@ -1301,6 +1367,10 @@ class Explorer:
             "cand_bf_first_hop":    cand_bf_first_hop_all,  # G.3.c [N, M, K_cand, K=8]
             # Fix B: previous action one-hot per agent.
             "prev_action":          self._prev_action_onehot(),    # [N, M, K=8] float
+            # Phase 1 (interrupting options) — strategic-head commitment state.
+            "committed_node":       self._prev_target_node.clone(),    # [N, M] GLOBAL node last committed (-1 none)
+            "committed_steps":      self._steps_on_option.clone(),     # [N, M] consecutive steps on that node
+            "comm_event":           self._comm_event.clone(),          # [N, M] received teammate map cells this step
         }
 
     def _prev_action_onehot(self) -> torch.Tensor:

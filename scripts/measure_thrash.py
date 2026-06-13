@@ -57,9 +57,14 @@ def main() -> None:
         for _ in range(args.steps):
             o = m.act(obs, ha, hc, deterministic=determ)
             ta = o["target_argmax"][0].tolist()
+            # Compare the committed GLOBAL NODE, not the slot index: the candidate list is
+            # re-sorted every step, so a stable target's slot reorders → slot-change would
+            # report false thrash under Phase-1 commitment. cand_idx maps slot → global node.
+            ci = obs["cand_idx"][0]                                   # [M, K_cand]
+            tnode = [int(ci[a, ta[a]].item()) for a in range(M)]
             if prev is not None:
-                chg += sum(ta[a] != prev[a] for a in range(M))
-            prev = ta
+                chg += sum(tnode[a] != prev[a] for a in range(M))
+            prev = tnode
             p0 = env.pos.clone()
             obs, _, d, info = env.step(o["action"], target_choice=o["target_argmax"])
             ha, hc = o["hidden_actor"], o["hidden_critic"]
