@@ -37,6 +37,10 @@ C_AGENT = (90, 160, 255)
 C_NODE_ACTIVE = (60, 220, 240)
 C_NODE_DEAD = (70, 78, 90)
 C_NODE_CURR = (255, 215, 60)
+# Utility color ramp (per-step normalized): low → dim blue, high → bright amber.
+C_UTIL_LO = np.array([46, 64, 120], dtype=np.float32)
+C_UTIL_HI = np.array([255, 210, 60], dtype=np.float32)
+C_WIN = (255, 255, 255)          # ego-window highlight (box + node rings)
 C_EDGE = (90, 100, 115)
 C_TRAIL = (150, 200, 255)
 C_PATH = (255, 180, 40)        # amber polyline
@@ -119,11 +123,24 @@ def paint_graph(
     draw_edges: bool = False,
     eidx: np.ndarray | None = None,
     evalid: np.ndarray | None = None,
+    win_node_mask: np.ndarray | None = None,   # [N] bool — nodes inside the ego window
+    win_bbox: tuple[float, float, float, float] | None = None,   # (x0,y0,x1,y1)
+    normalize: bool = True,                     # per-step min-max stretch of utility colors
 ) -> Image.Image:
     dr = ImageDraw.Draw(im)
+    nvb = nv.astype(bool)
+    # Per-step utility normalization — raw utility is small (~0.1) and varies step to step;
+    # stretch the valid-node range to [0,1] so the color ramp is readable every frame.
+    if normalize and nvb.any():
+        uv = util[nvb]
+        umin, umax = float(uv.min()), float(uv.max())
+    else:
+        umin, umax = 0.0, 1.0
+    rng = max(1e-6, umax - umin)
+    has_util = umax > 1e-4                        # all-explored frame → keep nodes dim
     if draw_edges and eidx is not None and evalid is not None:
         for k_node in range(nxy.shape[0]):
-            if not nv[k_node]:
+            if not nvb[k_node]:
                 continue
             x0, y0 = float(nxy[k_node, 0]), float(nxy[k_node, 1])
             for kk in range(8):
@@ -135,16 +152,19 @@ def paint_graph(
                 x1, y1 = float(nxy[tgt, 0]), float(nxy[tgt, 1])
                 dr.line([(x0, y0), (x1, y1)], fill=C_EDGE, width=1)
     for k_node in range(nxy.shape[0]):
-        x, y = float(nxy[k_node, 0]), float(nxy[k_node, 1])
-        if not nv[k_node]:
+        if not nvb[k_node]:
             continue
-        u = float(util[k_node])
-        col = (
-            int(C_NODE_ACTIVE[0] * (1 - u) + 255 * u),
-            int(C_NODE_ACTIVE[1] * (1 - u) + 140 * u),
-            int(C_NODE_ACTIVE[2] * (1 - u) + 50 * u),
-        )
-        dr.ellipse([x - 3, y - 3, x + 3, y + 3], fill=col, outline=(0, 0, 0))
+        x, y = float(nxy[k_node, 0]), float(nxy[k_node, 1])
+        t = (float(util[k_node]) - umin) / rng if has_util else 0.0
+        c = C_UTIL_LO * (1 - t) + C_UTIL_HI * t
+        col = (int(c[0]), int(c[1]), int(c[2]))
+        in_win = win_node_mask is not None and bool(win_node_mask[k_node])
+        if in_win:
+            dr.ellipse([x - 4, y - 4, x + 4, y + 4], fill=col, outline=C_WIN)
+        else:
+            dr.ellipse([x - 3, y - 3, x + 3, y + 3], fill=col, outline=(0, 0, 0))
+    if win_bbox is not None:
+        dr.rectangle(list(win_bbox), outline=C_WIN, width=2)
     cx, cy = float(nxy[curr, 0]), float(nxy[curr, 1])
     dr.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], outline=C_NODE_CURR, width=2)
     return im
@@ -194,6 +214,8 @@ def composite_frame(
     draw_edges: bool = False,
     eidx: np.ndarray | None = None,
     evalid: np.ndarray | None = None,
+    win_node_mask: np.ndarray | None = None,
+    win_bbox: tuple[float, float, float, float] | None = None,
     path_xy: np.ndarray | None = None,
     path_valid: np.ndarray | None = None,
     target_xy: tuple[float, float] | None = None,
@@ -209,7 +231,8 @@ def composite_frame(
     rgb = paint_frontier(rgb, frontier)
     im = Image.fromarray(rgb)
     # draw order: edges → comm links → path → nodes → target → agents → text
-    paint_graph(im, nxy, nv, util, curr, draw_edges, eidx, evalid)
+    paint_graph(im, nxy, nv, util, curr, draw_edges, eidx, evalid,
+                win_node_mask=win_node_mask, win_bbox=win_bbox)
     if comm_links:
         for xy0, xy1 in comm_links:
             paint_comm_link(im, xy0, xy1)

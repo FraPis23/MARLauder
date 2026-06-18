@@ -27,7 +27,7 @@ from torch.distributions import Categorical
 from models.gat import GATEncoder
 from models.init_utils import apply_orthogonal, orthogonal_
 
-F_IN = 7
+F_IN = 6
 K = 8
 CAND_FEAT_DIM = 9     # rel_x, rel_y, utility, euclid, min_team_dist, max_comm_gap, own_minus_team,
 #                       team_alt_score, prev_branch_match (does cand continue last step's committed
@@ -156,7 +156,9 @@ class MarlActorCritic(nn.Module):
     def __init__(self, n_agents: int = 1, d: int = 128, n_heads: int = 4, n_layers: int = 2,
                  gumbel_tau: float = 1.0, path_bias_floor: float = 1.5,
                  switch_margin: float = 1.0, max_steps_on_option: int = 24,
-                 disable_strategic: bool = False) -> None:
+                 disable_strategic: bool = False,
+                 strategic_gate_eps: float = 0.0,
+                 target_mode: str = "analytic") -> None:
         super().__init__()
         self.M = n_agents
         self.d = d
@@ -173,6 +175,19 @@ class MarlActorCritic(nn.Module):
         # mutable attributes so the driver/sweep can set them without a ctor change.
         self.switch_margin = switch_margin
         self.max_steps_on_option = max_steps_on_option
+        # Strategic-head GATE. The StrategicHead + BF path-bias are meant to be HIGH-LEVEL: a
+        # distant frontier target consulted only when the local ego window is exhausted. When
+        # strategic_gate_eps > 0, the head's influence (strategic_emb + next-hop dir + path_bias)
+        # is zeroed per-agent on any step where the max utility inside the ego window ≥ eps —
+        # i.e. while the local GAT still sees nearby gain the actor climbs it greedily, and the
+        # strategic pick only steers the actor once no local utility remains. eps == 0 disables
+        # the gate (legacy behavior — head always influences), so old checkpoints are unchanged.
+        # Mutable attribute so the driver/sweep can set it without a ctor change.
+        self.strategic_gate_eps = float(strategic_gate_eps)
+        # Global-target source: "analytic" → follow the env's deterministic rendezvous-aware
+        # guidepost (StrategicHead bypassed, like disable_strategic but the guidepost target is
+        # the analytic pick), gated by local utility. "learned" → the StrategicHead picks.
+        self.target_mode = str(target_mode)
         self.encoder = GATEncoder(in_dim=F_IN, d=d, n_heads=n_heads, n_layers=n_layers)
         # Phase A v2: strategic head over top-K=16 candidates.
         self.strategic_head = StrategicHead(d, n_heads=n_heads, cand_feat_dim=CAND_FEAT_DIM)
@@ -244,6 +259,18 @@ class MarlActorCritic(nn.Module):
         nbr_embs = h[b_arange.unsqueeze(-1).expand(B, K), curr_nbr]  # [B, K, d]
         return h, curr_emb, nbr_embs
 
+    def _strategic_gate(self, obs: dict, B: int) -> torch.Tensor | None:
+        """High-level gate: 1 where the ego window has NO local utility (→ consult strategic
+        head), 0 where local gain remains (→ pure local GAT). Returns [B, 1] float, or None
+        when disabled (strategic_gate_eps <= 0). Deterministic from obs, so act/evaluate agree.
+        """
+        if self.strategic_gate_eps <= 0.0:
+            return None
+        # feat[2] = utility on the windowed node_feat the model actually sees.
+        util = self._flatten_nm(obs["node_feat"])[..., 2]          # [B, N_max_window]
+        local_max = util.max(dim=-1).values                        # [B]
+        return (local_max < self.strategic_gate_eps).float().unsqueeze(-1)   # [B, 1]
+
     # ---------------- actor ----------------
     def _next_hop_onehot(self, target_xy: torch.Tensor, pos: torch.Tensor, nr: float) -> torch.Tensor:
         """Analytic K=8 next-hop direction from agent pos toward chosen target xy.
@@ -284,16 +311,22 @@ class MarlActorCritic(nn.Module):
         cand_idx_global: torch.Tensor | None = None,  # [B, K_cand] global node per candidate
         committed_steps: torch.Tensor | None = None,  # [B] consecutive steps on committed node
         guidepost_nbr_bias: torch.Tensor | None = None,  # [B, K=8] guidepost first-hop one-hot (ablation)
+        gate: torch.Tensor | None = None,             # [B, 1] high-level gate (1=use strategic)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run strategic head + compute actor input. Returns actor_in, target_logits, target_idx."""
         # Phase 3 ablation — bypass the strategic head entirely. Zero strategic embedding +
         # guidepost first-hop as the actor's direction signal. target_logits is None (no head);
         # target_idx is a 0 sentinel (unused: env penalty off via --target-switch-pen 0).
-        if self.disable_strategic:
+        if self.disable_strategic or self.target_mode == "analytic":
+            # Analytic / ablation: bypass the head. Direction = env guidepost first-hop (toward
+            # the deterministic rendezvous-aware target), GATED — suppressed while the local ego
+            # window still has utility (climb locally), applied once it's exhausted.
             B = curr_emb.shape[0]
             zero_emb = curr_emb.new_zeros(B, self.d)
             gp = (guidepost_nbr_bias if guidepost_nbr_bias is not None
                   else curr_emb.new_zeros(B, K))
+            if gate is not None:
+                gp = gp * gate
             actor_in = self.actor_pre(torch.cat([curr_emb, zero_emb, gp, prev_action], dim=-1))
             target_idx = torch.zeros(B, dtype=torch.long, device=curr_emb.device)
             return actor_in, None, target_idx
@@ -322,6 +355,10 @@ class MarlActorCritic(nn.Module):
         )
         target_xy_chosen = (target_onehot.unsqueeze(-1) * cand_xy).sum(dim=1)   # [B, 2]
         next_hop_onehot = self._next_hop_onehot(target_xy_chosen, pos, nr)      # [B, K=8]
+        # High-level gate: suppress the strategic direction signal while local utility remains.
+        if gate is not None:
+            strategic_emb = strategic_emb * gate
+            next_hop_onehot = next_hop_onehot * gate
         actor_in = self.actor_pre(torch.cat(
             [curr_emb, strategic_emb, next_hop_onehot, prev_action], dim=-1))
         target_idx = target_onehot.argmax(dim=-1)
@@ -340,6 +377,7 @@ class MarlActorCritic(nn.Module):
         h_all, curr_emb, nbr_embs = self._encode(obs)
         committed_node = obs.get("committed_node")
         committed_steps = obs.get("committed_steps")
+        gate = self._strategic_gate(obs, B)
         actor_in, target_logits, target_idx = self._strategic_and_actor_in(
             curr_emb,
             obs["cand_feat"].reshape(B, -1, CAND_FEAT_DIM),
@@ -354,13 +392,17 @@ class MarlActorCritic(nn.Module):
             cand_idx_global=obs["cand_idx"].reshape(B, -1) if "cand_idx" in obs else None,
             committed_steps=committed_steps.reshape(B) if committed_steps is not None else None,
             guidepost_nbr_bias=obs["guidepost_nbr_bias"].reshape(B, K) if "guidepost_nbr_bias" in obs else None,
+            gate=gate,
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)              # [B, d]
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
-        if self.disable_strategic:
-            # Ablation: bias toward the guidepost first-hop (nearest-frontier direction).
+        if self.disable_strategic or self.target_mode == "analytic":
+            # Bias toward the (analytic / nearest-frontier) guidepost first-hop, gated by local
+            # utility so it only steers once the ego window is exhausted.
             gp = obs["guidepost_nbr_bias"].reshape(B, K)
+            if gate is not None:
+                gp = gp * gate
             logits = logits + self.path_bias * gp
         else:
             # G.3.c — soft bias toward BF first-hop of strategic pick.
@@ -370,6 +412,8 @@ class MarlActorCritic(nn.Module):
                 chosen_hop = torch.gather(
                     cbfh, dim=1, index=target_idx.view(B, 1, 1).expand(-1, 1, K)
                 ).squeeze(1)                                                                # [B, K=8]
+                if gate is not None:
+                    chosen_hop = chosen_hop * gate
                 logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
@@ -420,6 +464,7 @@ class MarlActorCritic(nn.Module):
         B = N * M
         _, curr_emb, nbr_embs = self._encode(obs)
         sc = stored_choice.reshape(B) if stored_choice is not None else None
+        gate = self._strategic_gate(obs, B)
         actor_in, _, _ = self._strategic_and_actor_in(
             curr_emb,
             obs["cand_feat"].reshape(B, -1, CAND_FEAT_DIM),
@@ -431,19 +476,25 @@ class MarlActorCritic(nn.Module):
             stored_choice=sc,
             sample=False,
             guidepost_nbr_bias=obs["guidepost_nbr_bias"].reshape(B, K) if "guidepost_nbr_bias" in obs else None,
+            gate=gate,
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
-        if self.disable_strategic:
+        if self.disable_strategic or self.target_mode == "analytic":
             if "guidepost_nbr_bias" in obs:
-                logits = logits + self.path_bias * obs["guidepost_nbr_bias"].reshape(B, K)
+                gp = obs["guidepost_nbr_bias"].reshape(B, K)
+                if gate is not None:
+                    gp = gp * gate
+                logits = logits + self.path_bias * gp
         else:
             # G.3.c — soft path bias on action logits, indexed by stored strategic pick.
             cand_bf_first_hop = obs.get("cand_bf_first_hop")
             if cand_bf_first_hop is not None and sc is not None:
                 cbfh = cand_bf_first_hop.reshape(B, -1, K)
                 chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
+                if gate is not None:
+                    chosen_hop = chosen_hop * gate
                 logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
@@ -518,6 +569,7 @@ class MarlActorCritic(nn.Module):
         stored_choice: torch.Tensor,   # [N, M] long — target K-slot stored at rollout
         cand_bf_first_hop: torch.Tensor | None = None,   # G.3.c [N, M, K_cand, K]
         guidepost_nbr_bias: torch.Tensor | None = None,  # Phase 3 ablation [N, M, K]
+        node_feat: torch.Tensor | None = None,           # [N, M, N_max_window, F] for strategic gate
         nr: float = 16.0,
     ) -> dict:
         """One PPO-evaluate step given pre-encoded curr/nbr embeddings.
@@ -529,6 +581,12 @@ class MarlActorCritic(nn.Module):
         B = N * M
         curr_emb_flat = curr_emb.reshape(B, self.d)
         gp_flat = guidepost_nbr_bias.reshape(B, K) if guidepost_nbr_bias is not None else None
+        # High-level gate — must match act() exactly for PPO ratio correctness. Built from the
+        # stored windowed node_feat utility (feat[2]); None when gate disabled or node_feat absent.
+        gate = None
+        if self.strategic_gate_eps > 0.0 and node_feat is not None:
+            util = node_feat.reshape(B, -1, node_feat.shape[-1])[..., 2]   # [B, N_max_window]
+            gate = (util.max(dim=-1).values < self.strategic_gate_eps).float().unsqueeze(-1)
         actor_in, target_logits, _ = self._strategic_and_actor_in(
             curr_emb_flat,
             cand_feat.reshape(B, -1, CAND_FEAT_DIM),
@@ -540,19 +598,23 @@ class MarlActorCritic(nn.Module):
             stored_choice=stored_choice.reshape(B),
             sample=False,                # no Gumbel noise at PPO update
             guidepost_nbr_bias=gp_flat,
+            gate=gate,
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs.reshape(B, K, self.d),
                               action_mask.reshape(B, K))
-        if self.disable_strategic:
+        if self.disable_strategic or self.target_mode == "analytic":
             if gp_flat is not None:
-                logits = logits + self.path_bias * gp_flat
+                gp_b = gp_flat * gate if gate is not None else gp_flat
+                logits = logits + self.path_bias * gp_b
         elif cand_bf_first_hop is not None:
             # G.3.c — soft path bias using stored strategic pick.
             cbfh = cand_bf_first_hop.reshape(B, -1, K)
             sc = stored_choice.reshape(B)
             chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
+            if gate is not None:
+                chosen_hop = chosen_hop * gate
             logits = logits + self.path_bias * chosen_hop
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)

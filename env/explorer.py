@@ -37,6 +37,7 @@ from env.graph_lattice import GraphLattice
 from env.maps import Split, sample_batch
 from env.world_warp import WarpWorld
 
+_UNKNOWN  = 0
 _FREE     = 1
 _OBSTACLE = 2
 GT_FREE   = 1
@@ -51,6 +52,14 @@ class EnvCfg:
     sensor_range_px: float = 60.0
     n_rays: int = 720
     utility_range_px: int = 30
+    visit_age_window: int = 16               # feat[3] recency horizon (steps): walked node ramps 0→1 freshness
+    # Analytic global-target selection (deterministic). score = util/(1+β·d_curr/NR)·(1+λ·w·rdv).
+    target_beta: float = 1.0                 # β: distance discount (per NR node-unit)
+    target_lambda: float = 1.0               # λ: rendezvous pull strength (0 = pure exploration)
+    rdv_offer_frac: float = 0.15             # offer saturates (w→1) at this fraction of map cells gained since sync
+    target_keep_margin: float = 0.2          # commit: keep last target unless a new one beats it by >this fraction
+    progress_reward_coef: float = 0.3        # PBRS-style: reward per node-unit closer to the committed target
+    analytic_target: bool = True             # env owns the deterministic global target (vs learned StrategicHead)
     num_sim_steps: int = 5
     max_episode_steps: int = 512
     flood_max_iters: int = 200
@@ -169,6 +178,7 @@ class Explorer:
             collision_samples=5,
             flood_max_iters=cfg.flood_max_iters,
             n_hops=cfg.n_hops,
+            visit_age_window=cfg.visit_age_window,
             # Optimistic teammate-BF graph only when it can matter: M>1 AND maps actually
             # diverge. Under force_full_occupancy_sharing (Stage 1) maps are identical every
             # step → teammate is always on a known-FREE node → the FREE graph already reaches
@@ -177,6 +187,10 @@ class Explorer:
             device=self.dev,
         )
         self.N_max = self.graph.N_max
+        # Render-only: obs ships just the ego window. When True, _refresh_obs stashes the
+        # full-graph per-agent utility/validity in self._render_global for the GIF. Eval sets it.
+        self.store_render_global = False
+        self._render_global: dict | None = None
         self.P_max = self.graph.guidepost_path_max
         self.K = 8
 
@@ -244,6 +258,9 @@ class Explorer:
         self._dist_team_prev = torch.full(
             (self.N, self.M, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
         )
+        # Rendezvous: agent i's explored-cell count at its last sync with agent j. offer_ij =
+        # (i's explored now − this) = fresh map i holds that j hasn't received. Updated comm-gated.
+        self._own_expl_at_comm = torch.zeros((self.N, self.M, self.M), dtype=torch.float32, device=self.dev)
         # Phase D — lattice-level per-agent free count after last step (post-fusion).
         self.last_own_free_node = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         # v2 reward — privileged team-union FREE-node mask (last step) + per-agent post-fusion
@@ -355,7 +372,10 @@ class Explorer:
         # bf_dist_from_curr (self._dist_curr_prev), both built by the previous _refresh_obs.
         target_switch_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         yield_bonus = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
-        if target_choice is not None:
+        # Analytic-target mode: the env owns the (deterministic) global target, computed in
+        # _refresh_obs. The model's target_choice is a sentinel → skip the learned-head
+        # switch-penalty / yield / commitment bookkeeping (it would read garbage from slot 0).
+        if target_choice is not None and not self.cfg.analytic_target:
             obs0      = self._last_obs
             cand_idx0 = obs0["cand_idx"]                                  # [N, M, K_cand] global node
             cbfh0     = obs0["cand_bf_first_hop"]                         # [N, M, K_cand, K=8] one-hot
@@ -546,6 +566,20 @@ class Explorer:
         # Stall penalty — no net displacement this step (collision-revert hold or
         # invalid/curr-node pick). step_disp also feeds the coverage-efficiency metric.
         step_disp = (self.pos - pos_entry).norm(dim=-1)                  # [N, M]
+
+        # Progress shaping toward the committed global target (the missing "follow utility"
+        # signal — base reward only pays novel_scan on NEW cells, so explored-area moves had no
+        # gradient → loops). Euclidean closing distance to _prev_target_node (the target the
+        # agent acted on this step), in node units, capped. Telescopes to ~0 on round trips
+        # (no hacking) and aligns with coverage. analytic_target only.
+        progress_reward = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        if self.cfg.analytic_target and self.cfg.progress_reward_coef > 0.0:
+            tgt_node = self._prev_target_node                            # [N, M] committed target
+            tgt_xy = self.graph.node_xy[tgt_node.clamp(min=0)]           # [N, M, 2]
+            valid_t = (tgt_node >= 0) & (tgt_node != self.curr_idx_global)
+            d_prev = (pos_entry - tgt_xy).norm(dim=-1)                   # [N, M]
+            d_now  = (self.pos - tgt_xy).norm(dim=-1)                    # [N, M]
+            progress_reward = ((d_prev - d_now) / float(self.cfg.nr)).clamp(-2.0, 2.0) * valid_t.float()
         stall_pen = (step_disp < float(self.cfg.nr) * 0.5).float()       # [N, M]
 
         terminated_now = explored_rate >= self.cfg.done_explored_thresh
@@ -570,6 +604,7 @@ class Explorer:
                   - eps_prox * proximity_pen
                   - delta_obj * target_switch_pen
                   - delta_stall * stall_pen
+                  + self.cfg.progress_reward_coef * progress_reward
                   + terminated_now.float().unsqueeze(-1) * self.cfg.completion_bonus
                   - step_penalty)
 
@@ -587,6 +622,7 @@ class Explorer:
             "proximity":     (-eps_prox * proximity_pen).mean(),
             "target_switch": (-delta_obj * target_switch_pen).mean(),
             "stall":         (-delta_stall * stall_pen).mean(),
+            "progress":      (self.cfg.progress_reward_coef * progress_reward).mean(),
         }
 
         # ---- Exploration-quality metrics (per-step scalars; driver aggregates) ----
@@ -712,6 +748,8 @@ class Explorer:
         bugs come from stale lkp). Map fusion remains comm-gated regardless.
         """
         t_now = self.t                                   # [N]
+        # Post-fusion explored-cell count per agent — snapshot at sync drives the offer metric.
+        own_expl = (self.world.occupancy_torch != _UNKNOWN).view(self.N, self.M, -1).sum(-1).float()  # [N, M]
         if self.cfg.force_full_pos_sharing:
             # Update all (i, j) pairs unconditionally to actual positions.
             for i in range(self.M):
@@ -719,6 +757,7 @@ class Explorer:
                     self.last_known_pos[:, i, j] = self.pos[:, j, :]
                     self.last_known_target[:, i, j] = self._prev_target_node[:, j]
                     self.t_last_comm[:, i, j] = t_now
+                    self._own_expl_at_comm[:, i, j] = own_expl[:, i]
             return
         for i in range(self.M):
             for j in range(self.M):
@@ -735,6 +774,10 @@ class Explorer:
                 )
                 self.t_last_comm[:, i, j] = torch.where(
                     can, t_now, self.t_last_comm[:, i, j]
+                )
+                # Snapshot i's explored count at this sync (offer baseline toward j).
+                self._own_expl_at_comm[:, i, j] = torch.where(
+                    can, own_expl[:, i], self._own_expl_at_comm[:, i, j]
                 )
 
     # ---------------------------------------------------------------------- #
@@ -1017,18 +1060,8 @@ class Explorer:
                 visited_step=self.visited_step[:, a, :],
                 current_step=int(self.t.max().item()),
             )
-            new_target = self.graph.select_target_no_bf(info["utility"], info["node_valid"])
-            target_same = (new_target == self._target_prev[:, a]).unsqueeze(-1)   # [N, 1]
-            dist_init = torch.where(
-                target_same.expand(-1, self.N_max),
-                self._dist_prev[:, a, :],
-                torch.full_like(self._dist_prev[:, a, :], float("inf")),
-            )
-            self.graph.build_guidepost_v2(info, target=new_target, dist_init=dist_init)
-            self._target_prev[:, a] = new_target
-            self._dist_prev[:, a, :] = info["guidepost_dist"]
-            # Option A — BF FROM curr → dist[N, N_max] used to score cand by true path length.
-            # Warm-start from previous step's BF-from-curr if curr unchanged (Phase B reuse).
+            # ---- BF FROM curr (target-INDEPENDENT) → path length to every node. Moved BEFORE
+            # target selection so the analytic selector can score frontiers by true reach cost.
             curr_same = (info["curr_idx"] == self._curr_prev[:, a]).unsqueeze(-1)
             curr_dist_init = torch.where(
                 curr_same.expand(-1, self.N_max),
@@ -1080,6 +1113,50 @@ class Explorer:
                     self._dist_team_prev[:, a, j] = dist_j
                     bf_dist_team_per_j[:, j] = dist_j
                 info["bf_dist_team"] = bf_dist_team_per_j                                   # [N, M, N_max]
+            # ---- Analytic GLOBAL TARGET (deterministic) — nearest-richest frontier, with a
+            # rendezvous pull toward the teammate I owe the most fresh map. offer≈0 → pure
+            # exploration; offer high → drift the chosen frontier toward that teammate so we
+            # converge for a map exchange (self-limiting: fusion on contact resets offer→0).
+            d_team_star = None
+            w_offer = None
+            if self.M > 1:
+                # offer_j = explored cells I gained since I last synced with j (j lacks them).
+                own_expl_now = (occ_a != _UNKNOWN).view(self.N, -1).sum(-1).float()         # [N]
+                offer_j = (own_expl_now.unsqueeze(1) - self._own_expl_at_comm[:, a, :]).clamp(min=0.0)  # [N, M]
+                offer_j[:, a] = -1.0                                                        # mask self slot
+                j_star = offer_j.argmax(dim=1)                                              # [N] teammate owed most
+                offer_star = offer_j.gather(1, j_star.unsqueeze(1)).squeeze(1).clamp(min=0.0)  # [N]
+                offer_scale = max(1.0, self.cfg.rdv_offer_frac * float(self.H * self.W))
+                w_offer = (offer_star / offer_scale).clamp(0.0, 1.0)
+                d_team_star = info["bf_dist_team"].gather(
+                    1, j_star.view(self.N, 1, 1).expand(-1, 1, self.N_max)
+                ).squeeze(1)                                                               # [N, N_max]
+            new_target = self.graph.select_target_analytic(
+                info["utility"], info["node_valid"], bf_dist_from_curr,
+                d_team=d_team_star, w=w_offer,
+                beta=float(self.cfg.target_beta), lam=float(self.cfg.target_lambda),
+                prev_target=self._prev_target_node[:, a], curr_idx=info["curr_idx"],
+                keep_margin=float(self.cfg.target_keep_margin),
+            )
+            # Guidepost (BF path) to the analytic target — warm-started on unchanged target.
+            target_same = (new_target == self._target_prev[:, a]).unsqueeze(-1)            # [N, 1]
+            dist_init = torch.where(
+                target_same.expand(-1, self.N_max),
+                self._dist_prev[:, a, :],
+                torch.full_like(self._dist_prev[:, a, :], float("inf")),
+            )
+            self.graph.build_guidepost_v2(info, target=new_target, dist_init=dist_init)
+            self._target_prev[:, a] = new_target
+            self._dist_prev[:, a, :] = info["guidepost_dist"]
+            # Analytic mode: env owns the committed target → record it for last_known_target
+            # (teammates' belief of where I'm headed) and commitment-step tracking.
+            if self.cfg.analytic_target:
+                same_tgt = (new_target == self._prev_target_node[:, a])
+                self._steps_on_option[:, a] = torch.where(
+                    same_tgt, self._steps_on_option[:, a] + 1,
+                    torch.zeros_like(self._steps_on_option[:, a]),
+                )
+                self._prev_target_node[:, a] = new_target
             infos.append(info)
             cand_a = self.graph.extract_topk_candidates(
                 info["utility"], info["node_valid"], curr_xy=self.pos[:, a, :], K=K_cand,
@@ -1164,27 +1241,36 @@ class Explorer:
                 )
             cand_list.append(cand_a)
 
-        # ---- Pass 2: cross-agent feat[5] on GLOBAL node_feat ----
-        # Mark the global node nearest to each teammate's last-known position. After
-        # local-window extraction, this survives if the marked node falls inside
-        # the agent's window; otherwise the teammate position is "lost" in this view.
+        # ---- Pass 2: cross-agent feat[4] = teammate-proximity POTENTIAL on GLOBAL node_feat ----
+        # The old feat lit a SINGLE one-hot node nearest the teammate's last-known position.
+        # Once agents split (the whole point of the task) the teammate sits outside the agent's
+        # (2·n_hops+3)² ego window, so after window extraction feat[5] ≡ 0 — dead by construction,
+        # and a one-hot carries near-zero gradient even when alive. Replace with a DENSE field:
+        # exp(-d / scale) of the BF geodesic distance from the teammate's lkp to each node
+        # (info["bf_dist_team"], built in Pass 1 over the optimistic FREE∪UNKNOWN graph so it
+        # stays finite when the teammate is in unexplored space). Always informative inside the
+        # window, gradient-rich, wall-aware, and pointing toward the teammate.
         if self.M > 1:
-            nx = self.graph.node_xy[:, 0].view(1, -1)         # [1, N_max]
-            ny = self.graph.node_xy[:, 1].view(1, -1)
-            arange_n = torch.arange(self.N, device=self.dev)
+            scale_px = max(1.0, 4.0 * float(self.cfg.nr))
             for a in range(self.M):
-                occ_a_feat = torch.zeros(
-                    (self.N, self.N_max), dtype=torch.float32, device=self.dev,
-                )
-                for b in range(self.M):
-                    if a == b:
-                        continue
-                    lkp = self.last_known_pos[:, a, b, :]      # [N, 2]
-                    dx  = nx - lkp[:, 0:1]
-                    dy  = ny - lkp[:, 1:2]
-                    nearest = (dx * dx + dy * dy).argmin(dim=-1)  # [N]
-                    occ_a_feat[arange_n, nearest] = 1.0
-                infos[a]["node_feat"][..., 5] = occ_a_feat
+                # min over teammates (self slot left at +inf in Pass 1) → nearest teammate.
+                d_min = infos[a]["bf_dist_team"].min(dim=1).values            # [N, N_max]
+                pot = torch.exp(-d_min / scale_px)                            # +inf → 0
+                pot = torch.nan_to_num(pot, nan=0.0, posinf=0.0, neginf=0.0)
+                infos[a]["node_feat"][..., 4] = pot * infos[a]["node_valid"].float()
+
+        # ---- Render-global stash (eval/debug only) — full-graph utility/validity for the GIF,
+        # since obs ships only the ego window. Gated so training pays nothing. ----
+        if self.store_render_global:
+            self._render_global = {
+                "node_xy":    self.graph.node_xy,                                              # [N_max, 2] static
+                "edge_idx":   self.graph.edge_idx_static,                                      # [N_max, K] static
+                "window_idx_table": self.graph.window_idx_table,                               # [N_max, W²] global idx (-1 pad)
+                "utility":    torch.stack([infos[a]["utility"]    for a in range(self.M)], 1),  # [N, M, N_max]
+                "node_valid": torch.stack([infos[a]["node_valid"] for a in range(self.M)], 1),  # [N, M, N_max]
+                "edge_valid": torch.stack([infos[a]["edge_valid"] for a in range(self.M)], 1),  # [N, M, N_max, K]
+                "curr_idx":   torch.stack([infos[a]["curr_idx"]   for a in range(self.M)], 1),  # [N, M] GLOBAL node
+            }
 
         # ---- Pass 3: extract per-agent local window ----
         node_xy_list = []

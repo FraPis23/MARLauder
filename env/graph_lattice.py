@@ -66,6 +66,7 @@ class GraphLattice:
         guidepost_path_max: int | None = None,
         n_hops: int = 2,
         build_optim_graph: bool = False,
+        visit_age_window: int = 16,
         device: str = "cuda:0",
     ) -> None:
         self.device = device
@@ -81,6 +82,10 @@ class GraphLattice:
         self.S = int(collision_samples)
         self.flood_max_iters = int(flood_max_iters)
         self.SR = float(sensor_range_px)
+        # feat[3] age horizon (steps): recency window over which a walked node's "freshness"
+        # ramps from 0 (just left) back to 1 (cold / re-explorable). Stationary, unlike the
+        # old last_visit/current_step.
+        self.visit_age_window = max(1, int(visit_age_window))
         # Bellman-Ford iteration upper bound: Manhattan diameter ~ LH+LW; pad a bit.
         self.guidepost_iters = int(guidepost_iters) if guidepost_iters else int(self.LH + self.LW + 8)
         # Path-reconstruction length cap (number of edges on a path).
@@ -273,32 +278,50 @@ class GraphLattice:
             endpoints_valid_o = is_trav_node.unsqueeze(-1) & nbr_trav & nbr_valid_geom
             edge_valid_optim = endpoints_valid_o & collision_free                 # [N, N_max, K]
 
-        # 4) Utility — WALL-AWARE (v2). The old version summed frontier pixels in a raw
-        # (2·UR+1)² integral-image window with NO wall check: a node beside a wall counted
-        # frontier in the corridor on the other side, poisoning the GAT utility feature,
-        # the strategic candidate ranking and the guidepost argmax. Now:
-        #   (a) per-node frontier indicator from a TINY window (~NR/2 px — wall leak
-        #       negligible at one half lattice spacing), same integral-image trick;
-        #   (b) diffuse that indicator h rounds along COLLISION-CHECKED edges (edge_valid):
-        #       frontier mass can only flow through passable edges → walls block it
-        #       by construction. h ≈ UR/NR keeps the old spatial reach.
-        fr = frontier.float()                                     # [N, H, W]
-        ii = F.pad(fr, (1, 0, 1, 0)).cumsum(-1).cumsum(-2)        # [N, H+1, W+1]
-        r_ind = max(2, self.NR // 2)
-        x0 = (node_x - r_ind).clamp(0, W)
-        x1 = (node_x + r_ind + 1).clamp(0, W)
-        y0 = (node_y - r_ind).clamp(0, H)
-        y1 = (node_y + r_ind + 1).clamp(0, H)
-        def _gather_ii(ys, xs):
-            lin = ys * (W + 1) + xs
-            lin = lin.view(1, self.N_max).expand(N, -1)
-            return torch.gather(ii.view(N, -1), 1, lin)
-        f_count = (_gather_ii(y1, x1) - _gather_ii(y0, x1)
-                   - _gather_ii(y1, x0) + _gather_ii(y0, x0))     # [N, N_max]
-        # Frontier is a ~1 px ribbon → normalize by the window SIDE (max plausible ribbon
-        # length through the window), not its area, so f_ind actually spans [0, 1].
-        f_ind = (f_count / float(2 * r_ind + 1)).clamp(0, 1) * node_valid.float()
-        # Graph diffusion along valid edges only.
+        # 4) Utility — FRONTIER-GATED INFORMATION GAIN (v4).
+        #
+        # v3 tried to seed utility with raw UNKNOWN-area in a sensor-range disk. Three failures:
+        #   - disk radius (=SR=60px) ≫ node spacing (NR=16px) → adjacent boxes overlap ~87% →
+        #     utility a flat blob, NO local gradient → the actor cannot tell neighbors apart
+        #     (loops in rooms);
+        #   - the box counted unknown BEHIND walls (no occlusion) → dead-ends scored like real
+        #     frontiers;
+        #   - utility>0 almost everywhere → top-K candidates / guidepost argmax no longer
+        #     frontier-anchored → targets land in dead-ends / interior.
+        #
+        # v4 keeps the "volume behind the boundary" idea but GATES it by the frontier indicator:
+        #   seed = frontier_ribbon(small window, sharp)  ×  (FRONTIER_FLOOR + (1-FLOOR)·volume)
+        #   - frontier_ribbon: count of frontier pixels in a tiny ~NR/2 window → sharp, nonzero
+        #     ONLY on frontier nodes → restores the local gradient and frontier-anchored targets.
+        #     A frontier is a FREE cell adjacent to UNKNOWN; a wall between free and unknown makes
+        #     the cell adjacent to OBSTACLE (not a frontier) → the behind-wall occled mass is
+        #     rejected at the gate. Fixes the dead-end-scores-high bug.
+        #   - volume: fraction of a sensor-range disk that is UNKNOWN (the v3 term), now only a
+        #     MULTIPLIER on genuine frontier nodes → "big room behind a small door" still wins,
+        #     interior/dead-end nodes stay 0.
+        #   - FRONTIER_FLOOR keeps small-room frontiers as valid (utility>0) candidates.
+        # Then the same wall-aware edge diffusion spreads the gradient toward the frontier.
+        FRONTIER_FLOOR = 0.25
+        def _box_count(ii_img: torch.Tensor, r: int) -> torch.Tensor:
+            x0 = (node_x - r).clamp(0, W); x1 = (node_x + r + 1).clamp(0, W)
+            y0 = (node_y - r).clamp(0, H); y1 = (node_y + r + 1).clamp(0, H)
+            def g(ys, xs):
+                lin = (ys * (W + 1) + xs).view(1, self.N_max).expand(N, -1)
+                return torch.gather(ii_img.view(N, -1), 1, lin)
+            return g(y1, x1) - g(y0, x1) - g(y1, x0) + g(y0, x0)        # [N, N_max]
+        # Frontier ribbon — sharp, frontier-anchored (true free/unknown boundary, occlusion-safe).
+        # r_fr = NR (full node cell + one ring): a border free node's center can sit > NR/2 px
+        # from the frontier pixels (they lie in the gap toward unknown) — NR/2 missed them and
+        # zeroed genuine border nodes. NR catches the node's own cell and the adjacent boundary.
+        ii_fr = F.pad(frontier.float(), (1, 0, 1, 0)).cumsum(-1).cumsum(-2)
+        r_fr = max(2, self.NR)
+        fr_frac = (_box_count(ii_fr, r_fr) / float(2 * r_fr + 1)).clamp(0, 1)   # ribbon length proxy
+        # Revealable volume — fraction of the sensor disk that is UNKNOWN.
+        ii_unk = F.pad((occupancy == UNKNOWN).float(), (1, 0, 1, 0)).cumsum(-1).cumsum(-2)
+        r_v = max(2, int(self.SR))
+        vol = (_box_count(ii_unk, r_v) / (math.pi * float(r_v) ** 2)).clamp(0, 1)
+        f_ind = (fr_frac * (FRONTIER_FLOOR + (1.0 - FRONTIER_FLOOR) * vol)) * node_valid.float()
+        # Graph diffusion along valid edges only — spreads the frontier gradient inward.
         h_diff = max(1, round(self.UR / self.NR))
         u = f_ind
         ev_f = edge_valid.float()                                  # [N, N_max, K]
@@ -320,22 +343,27 @@ class GraphLattice:
         curr_idx = li_curr * self.LW + lj_curr                   # [N]
 
         # 6) Per-node features (7 dims).
-        node_feat = torch.zeros((N, self.N_max, 7), dtype=torch.float32, device=dev)
+        node_feat = torch.zeros((N, self.N_max, 6), dtype=torch.float32, device=dev)
         curr_xy = self.node_xy[curr_idx]                          # [N, 2]
-        win_half = 0.5 * max(self.H, self.W)
+        # EGO-SCALE normalization. The GAT only ever sees the (2·n_hops+3)² window centered on
+        # curr, so the relative coords of in-window nodes span at most ±window_radius·NR px.
+        # Normalizing by the half-MAP (old: 0.5·max(H,W)) squashed them into ~±0.15 — geometry
+        # drowned by the {0,1} binary feats at the input Linear. Normalize by the window
+        # half-extent so in-window x_rel/y_rel actually use the full [-1, +1] range.
+        win_half = float(self.window_radius * self.NR)
         node_feat[..., 0] = (self.node_xy[:, 0].view(1, -1) - curr_xy[:, 0:1]) / win_half  # x_rel
         node_feat[..., 1] = (self.node_xy[:, 1].view(1, -1) - curr_xy[:, 1:2]) / win_half  # y_rel
         node_feat[..., 2] = utility_norm
-        visited = (visited_step >= 0).float()
-        node_feat[..., 3] = visited
-        last_norm = torch.where(
-            visited.bool(),
-            visited_step.float() / max(1.0, float(current_step)),
-            torch.zeros_like(visited),
-        ).clamp(0, 1)
-        node_feat[..., 4] = last_norm
-        # feat[5] prob_occupied (M>1, written by Explorer)
-        # feat[6] guidepost (filled by build_guidepost if called)
+        # feat[3] AGE — stationary recency. 0 = just walked (avoid backtrack), ramps to 1 over
+        # visit_age_window steps; never-visited nodes start cold at 1 (re-explorable). Replaces
+        # the old visited{0,1} + last_visit/current_step pair (the latter was non-stationary —
+        # same node's value drifted every step — and redundant with the actor GRU + utility).
+        delta = (float(current_step) - visited_step.float()).clamp(min=0.0)
+        age = (delta / float(self.visit_age_window)).clamp(0.0, 1.0)
+        age = torch.where(visited_step < 0, torch.ones_like(age), age)
+        node_feat[..., 3] = age
+        # feat[4] teammate BF-proximity potential (M>1, written by Explorer)
+        # feat[5] guidepost (filled by build_guidepost if called)
         node_feat = node_feat * node_valid.unsqueeze(-1).float()
 
         # 7) curr_nbr gather.
@@ -373,7 +401,7 @@ class GraphLattice:
             guidepost_path_valid bool [N, P_max]
             guidepost_path_xy  float [N, P_max, 2]   world coords for render (NaN-padded)
 
-        Also writes the mask into `info['node_feat'][..., 6]` to populate feat[6].
+        Also writes the mask into `info['node_feat'][..., 5]` to populate feat[5].
         """
         edge_idx = info["edge_idx"]        # [N, N_max, K]
         edge_valid = info["edge_valid"]    # [N, N_max, K]
@@ -488,7 +516,7 @@ class GraphLattice:
         guidepost_nbr_bias = guidepost_nbr_bias * any_match.float()
 
         # Write feat[6] guidepost.
-        info["node_feat"][..., 6] = guidepost_mask.float()
+        info["node_feat"][..., 5] = guidepost_mask.float()
         info["guidepost_mask"] = guidepost_mask
         info["guidepost_target"] = target
         info["guidepost_path_idx"] = path_idx
@@ -678,6 +706,58 @@ class GraphLattice:
         target = masked.argmax(dim=-1)                                     # [N]
         return target
 
+    def select_target_analytic(
+        self,
+        utility: torch.Tensor,        # [N, N_max]  (frontier-gated, >0 only near frontiers)
+        node_valid: torch.Tensor,     # [N, N_max]  reachable-through-FREE mask
+        bf_dist_curr: torch.Tensor,   # [N, N_max]  BF path length curr→node (+inf unreachable)
+        d_team: torch.Tensor | None = None,   # [N, N_max] BF dist teammate→node (rendezvous anchor)
+        w: torch.Tensor | None = None,        # [N] offer weight ∈[0,1] (how much fresh map I owe)
+        beta: float = 1.0,            # distance discount (per NR node-unit)
+        lam: float = 1.0,             # rendezvous pull strength
+        prev_target: torch.Tensor | None = None,  # [N] last step's committed target (-1 none)
+        curr_idx: torch.Tensor | None = None,      # [N] curr node — safe fallback when no frontier
+        keep_margin: float = 0.2,     # commit: keep prev unless best beats it by >this fraction
+    ) -> torch.Tensor:
+        """Deterministic global target = the frontier that maximizes
+
+            explore(c) = utility(c) / (1 + β·BF_dist(curr→c)/NR)            # nearest-richest
+            score(c)   = explore(c) · (1 + λ·w·rdv(c)),  rdv(c)=1/(1+β·d_team(c)/NR)
+
+        w≈0 → pure exploration; w high → among comparable frontiers prefer the one toward the
+        teammate I owe the most fresh map → explore-while-converging for a map-exchange
+        rendezvous. Candidates restricted to reachable nodes with utility>0 (frontier-anchored).
+        """
+        nr = float(self.NR)
+        dc = bf_dist_curr / nr
+        dc = torch.where(torch.isfinite(dc), dc, torch.full_like(dc, 1.0e6))
+        explore = utility / (1.0 + beta * dc)
+        score = explore
+        if d_team is not None and w is not None:
+            dt = d_team / nr
+            dt = torch.where(torch.isfinite(dt), dt, torch.full_like(dt, 1.0e6))
+            rdv = 1.0 / (1.0 + beta * dt)
+            score = explore * (1.0 + lam * w.unsqueeze(-1) * rdv)
+        elig = node_valid & (utility > 0.0)
+        masked = torch.where(elig, score, torch.full_like(score, 0.0))     # 0 = ineligible (scores>0)
+        best_idx = masked.argmax(dim=-1)                                   # [N]
+        best_val = masked.gather(1, best_idx.unsqueeze(1)).squeeze(1)      # [N]
+        has_elig = elig.any(dim=-1)                                        # [N]
+        # Commitment / hysteresis: keep last step's target unless a candidate beats it by
+        # > keep_margin (fraction) — stops the 1-step argmax flip that ping-pongs the guidepost.
+        target = best_idx
+        if prev_target is not None:
+            pv = prev_target.clamp(min=0)
+            prev_elig = torch.gather(elig, 1, pv.unsqueeze(1)).squeeze(1) & (prev_target >= 0)
+            prev_val = masked.gather(1, pv.unsqueeze(1)).squeeze(1)
+            keep = prev_elig & (best_val <= prev_val * (1.0 + keep_margin))
+            target = torch.where(keep, pv, best_idx)
+        # Safe fallback: no eligible frontier at all → stay on curr (guidepost→self→zero bias),
+        # NEVER node 0 (which renders as an off-map top-left target).
+        if curr_idx is not None:
+            target = torch.where(has_elig, target, curr_idx)
+        return target                                                     # [N]
+
     @torch.no_grad()
     def build_guidepost_v2(
         self,
@@ -707,7 +787,7 @@ class GraphLattice:
             guidepost_dist        float [N, N_max]      for next-step warm-start
             guidepost_next_hop    long  [N]
             guidepost_nbr_bias    float [N, K]
-        Also fills `info["node_feat"][..., 6]`.
+        Also fills `info["node_feat"][..., 5]`.
         """
         edge_idx = info["edge_idx"]
         edge_valid = info["edge_valid"]
@@ -764,7 +844,7 @@ class GraphLattice:
         guidepost_nbr_bias = guidepost_nbr_bias * any_match.float()
 
         # 7) Write feat[6] + info
-        info["node_feat"][..., 6] = guidepost_mask.float()
+        info["node_feat"][..., 5] = guidepost_mask.float()
         info["guidepost_mask"] = guidepost_mask
         info["guidepost_target"] = target
         info["guidepost_path_idx"] = path_idx

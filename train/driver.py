@@ -32,6 +32,7 @@ class TrainCfg:
     switch_margin: float = 1.0     # Phase 1 — strategic target switches only when an alt beats committed by >this
     max_steps_on_option: int = 24  # Phase 1 — horizon cap forcing a re-pick (escape unreachable target)
     disable_strategic: bool = False  # Phase 3 — single-pointer ablation (bypass StrategicHead, use guidepost)
+    strategic_gate_eps: float = 0.0  # high-level gate: strategic head influences only when max ego-window utility < eps (0 = always on)
     lr_actor: float = 3e-4
     lr_critic: float = 1e-3
     device: str = "cuda:0"
@@ -110,7 +111,9 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
                             path_bias_floor=cfg.path_bias_floor,
                             switch_margin=cfg.switch_margin,
                             max_steps_on_option=cfg.max_steps_on_option,
-                            disable_strategic=cfg.disable_strategic).to(cfg.device)
+                            disable_strategic=cfg.disable_strategic,
+                            strategic_gate_eps=cfg.strategic_gate_eps,
+                            target_mode=cfg.env.analytic_target and "analytic" or "learned").to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead", dynamic=False)

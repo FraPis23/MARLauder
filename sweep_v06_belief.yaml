@@ -1,0 +1,67 @@
+# W&B sweep — v0.6 BELIEF ABLATION LADDER (acceptance criterion 5).
+#
+# Crosses the teammate-belief mode against communication degradation to test the core
+# hypothesis: a LEARNED supervised belief predictor cuts redundant sensing / contribution
+# imbalance as comm degrades, beating a no-belief point estimate and a naive Gaussian, and
+# approaching the privileged (ground-truth) upper bound.
+#
+#   belief-mode ∈ { none, naive-gaussian, learned, privileged }
+#       none           → Layer-1 spread from the point last-known position (small fixed σ)
+#       naive-gaussian → mu = last-known pos, σ grows with the comm gap Δt (no learning)
+#       learned        → supervised Gaussian belief head (trained by NLL vs GT teammate pos)
+#       privileged     → mu = TRUE teammate pos (CTDE upper bound)
+#   comm-range ∈ { 8, 60, 120 }  (8 ≈ effectively out-of-comm; 120 ≈ frequent rendezvous)
+#
+# Expectation: at small comm-range the gap none < naive < learned ≲ privileged opens up on
+# eval/sensing_overlap and eval/contrib_imbalance_norm; at large comm-range they converge
+# (positions are fresh, so the predictor barely matters).
+#
+# Metric: eval/score on the fixed 8-map suite. Also watch eval/sensing_overlap,
+# eval/contrib_imbalance_norm, and train/belief_loss (learned mode should decrease it).
+#
+# Usage (inside the marlauder container):
+#   wandb sweep sweep_v06_belief.yaml          → SWEEP_ID
+#   wandb agent <ENTITY/PROJECT/SWEEP_ID>
+
+program: scripts/run_train.py
+method: grid
+metric:
+  name: eval/score
+  goal: maximize
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --split=train/difficult
+  - --n-envs=32
+  - --n-agents=2
+  - --rollout-len=256
+  - --max-episode-steps=256
+  - --total-steps=2000000
+  - --lr=0.0003
+  - --ent-coef=0.01
+  - --clip-eps=0.2
+  - --k-epochs=4
+  - --gae-lambda=0.95
+  - --gamma=0.99
+  - --minibatches=1
+  # v0.6 two-layer controller (fixed across the ablation).
+  - --div-coef=0.1
+  - --div-spread-center=0.20
+  - --w-util-select=8.0
+  - --w-coord-select=1.0
+  - --layer1-beta=0.5
+  - --util-floor=0.05
+  - --belief-coef=1.0
+  - --compile
+  - --wandb
+  - --wandb-project=marlauder-v06
+  - ${args}
+
+# Keys MUST be exact dashed CLI flags (W&B expands ${args} as --<key>=<value>).
+parameters:
+  belief-mode:
+    values: ["none", "naive-gaussian", "learned", "privileged"]
+  comm-range:
+    values: [8, 60, 120]

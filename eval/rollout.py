@@ -31,6 +31,8 @@ class EvalRollout:
         self.env = env
         self.model = model
         self.cfg = cfg
+        # Render full-graph (not just ego window) utility — needs the global stash.
+        env.store_render_global = True
 
     @torch.no_grad()
     def run(self) -> tuple[list[np.ndarray], dict]:
@@ -120,12 +122,35 @@ class EvalRollout:
                 occ_ag = env.world.occupancy_torch[e:e+1, ag]               # [1, H, W]
                 frontier_ag = compute_frontier(occ_ag)[0].cpu().numpy()     # [H, W]
 
-                nxy_ag   = obs["node_xy"][e, ag].cpu().numpy()
-                nv_ag    = obs["node_valid"][e, ag].cpu().numpy()
-                util_ag  = obs["utility"][e, ag].cpu().numpy()
-                eidx_ag  = obs["edge_idx"][e, ag].cpu().numpy()
-                evalid_ag = obs["edge_valid"][e, ag].cpu().numpy()
-                curr_ag  = int(obs["curr_idx"][e, ag])
+                # GLOBAL graph (full map) when the stash is present; else fall back to the
+                # ego window shipped in obs.
+                rg = env._render_global
+                win_mask_ag = None
+                win_bbox_ag = None
+                if rg is not None:
+                    nxy_ag    = rg["node_xy"].cpu().numpy()                 # [N_max, 2]
+                    nv_ag     = rg["node_valid"][e, ag].cpu().numpy()       # [N_max]
+                    util_ag   = rg["utility"][e, ag].cpu().numpy()          # [N_max]
+                    eidx_ag   = rg["edge_idx"].cpu().numpy()               # [N_max, K]
+                    evalid_ag = rg["edge_valid"][e, ag].cpu().numpy()      # [N_max, K]
+                    curr_ag   = int(rg["curr_idx"][e, ag])                  # GLOBAL node idx
+                    # Ego-window highlight: global node indices of the window around curr.
+                    win_idx = rg["window_idx_table"][curr_ag].cpu().numpy() # [W²], -1 pad
+                    win_valid = win_idx[win_idx >= 0]
+                    win_mask_ag = np.zeros(nxy_ag.shape[0], dtype=bool)
+                    win_mask_ag[win_valid] = True
+                    if win_valid.size:
+                        wx, wy = nxy_ag[win_valid, 0], nxy_ag[win_valid, 1]
+                        pad = 0.5 * float(env.cfg.nr)
+                        win_bbox_ag = (float(wx.min()) - pad, float(wy.min()) - pad,
+                                       float(wx.max()) + pad, float(wy.max()) + pad)
+                else:
+                    nxy_ag   = obs["node_xy"][e, ag].cpu().numpy()
+                    nv_ag    = obs["node_valid"][e, ag].cpu().numpy()
+                    util_ag  = obs["utility"][e, ag].cpu().numpy()
+                    eidx_ag  = obs["edge_idx"][e, ag].cpu().numpy()
+                    evalid_ag = obs["edge_valid"][e, ag].cpu().numpy()
+                    curr_ag  = int(obs["curr_idx"][e, ag])
 
                 # G.3.a — render STRATEGIC head's pick (captured pre-step above), not env-argmax.
                 tgt_xy_ag = strategic_target_xy[ag]
@@ -153,6 +178,7 @@ class EvalRollout:
                     trail=trails[ag][-self.cfg.trail_len:],
                     step=step_t, explored=explored,
                     draw_edges=self.cfg.draw_edges, eidx=eidx_ag, evalid=evalid_ag,
+                    win_node_mask=win_mask_ag, win_bbox=win_bbox_ag,
                     path_xy=path_xy_ag, path_valid=path_valid_ag,
                     target_xy=tgt_xy_ag if not at_target else None,
                     extra_agents_xy=[trails[oag][-1] for oag in other_ags],

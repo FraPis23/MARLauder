@@ -66,6 +66,13 @@ def main() -> None:
     ap.add_argument("--switch-margin", type=float, default=1.0, help="Phase 1: keep committed strategic target unless an alt beats it by > this (logit units). Higher = more commitment")
     ap.add_argument("--max-steps-on-option", type=int, default=24, help="Phase 1: horizon cap forcing a strategic re-pick (escape an unreachable-but-still-candidate target)")
     ap.add_argument("--no-strategic-head", action="store_true", help="Phase 3 ablation: bypass the StrategicHead; pointer decides directly, biased by the guidepost (nearest-frontier first-hop). Tests whether the head earns its place")
+    ap.add_argument("--strategic-gate-eps", type=float, default=0.0, help="High-level gate: the StrategicHead/guidepost + BF path-bias steer the actor ONLY on steps where max utility in the ego window < this. 0 = gate off (always influences). The high-level chooser is invoked only when local exploration is exhausted")
+    ap.add_argument("--target-mode", choices=["analytic", "learned"], default="analytic", help="Global-target source. analytic: env's deterministic rendezvous-aware guidepost (StrategicHead bypassed). learned: the StrategicHead picks (legacy)")
+    ap.add_argument("--target-beta", type=float, default=1.0, help="Analytic target: distance discount β in util/(1+β·d/NR). Higher = prefer nearer frontiers")
+    ap.add_argument("--target-lambda", type=float, default=1.0, help="Analytic target: rendezvous pull strength λ. 0 = pure exploration; 1 = a full-offer teammate can double a frontier's score")
+    ap.add_argument("--rdv-offer-frac", type=float, default=0.15, help="Analytic target: offer saturates (w→1) when map gained since last sync reaches this fraction of total cells")
+    ap.add_argument("--target-keep-margin", type=float, default=0.2, help="Analytic target commitment: keep last target unless a new frontier beats it by >this fraction (hysteresis vs ping-pong)")
+    ap.add_argument("--progress-reward-coef", type=float, default=0.3, help="PBRS-style shaping: reward per node-unit of Euclidean progress toward the committed target. The missing 'follow utility' gradient. 0 = off")
     ap.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
     ap.add_argument("--score-w-imbalance", type=float, default=0.5, help="eval/score weight on NORMALIZED contrib_imbalance (equity; D2: now on [0,1] imb so equity is a first-class term, not a free rider)")
     ap.add_argument("--score-w-overlap",   type=float, default=0.25, help="eval/score weight on sensing_overlap (redundant sensing)")
@@ -113,6 +120,7 @@ def main() -> None:
         switch_margin=args.switch_margin,
         max_steps_on_option=args.max_steps_on_option,
         disable_strategic=args.no_strategic_head,
+        strategic_gate_eps=args.strategic_gate_eps,
         device=args.device,
         seed=args.seed,
         compile=args.compile,
@@ -157,6 +165,12 @@ def main() -> None:
             revisit_window=args.revisit_window,
             target_switch_penalty_coef=args.target_switch_pen,
             stall_penalty_coef=args.stall_pen,
+            analytic_target=(args.target_mode == "analytic"),
+            target_beta=args.target_beta,
+            target_lambda=args.target_lambda,
+            rdv_offer_frac=args.rdv_offer_frac,
+            target_keep_margin=args.target_keep_margin,
+            progress_reward_coef=args.progress_reward_coef,
         ),
         ppo=MAPPOCfg(
             ent_coef=args.ent_coef,

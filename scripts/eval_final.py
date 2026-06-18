@@ -56,6 +56,10 @@ def main() -> None:
     if "path_bias" in sd and "path_bias_learn" not in sd:
         sd["path_bias_learn"] = sd.pop("path_bias")
     model.load_state_dict(sd, strict=False)
+    # Restore high-level strategic gate from the training cfg (mutable attr, not a weight).
+    model.strategic_gate_eps = float(cfg_dict.get("strategic_gate_eps", 0.0))
+    _env_d = cfg_dict.get("env", {}) if isinstance(cfg_dict, dict) else {}
+    model.target_mode = "analytic" if _env_d.get("analytic_target", True) else "learned"
     model.eval()
 
     import imageio.v2 as imageio

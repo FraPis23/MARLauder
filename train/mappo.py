@@ -218,6 +218,7 @@ def ppo_update(
                             stored_choice=stored_choice_t,
                             cand_bf_first_hop=chunk_obs["cand_bf_first_hop"][tt],
                             guidepost_nbr_bias=chunk_obs["guidepost_nbr_bias"][tt],
+                            node_feat=chunk_obs["node_feat"][tt],
                         )
                         new_logp = ev["logp"]
                         new_val = ev["value"]

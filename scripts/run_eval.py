@@ -71,8 +71,12 @@ def main() -> None:
     if "path_bias" in sd and "path_bias_learn" not in sd:
         sd["path_bias_learn"] = sd.pop("path_bias")
     model.load_state_dict(sd, strict=False)
+    # Restore high-level strategic gate + target mode from the training cfg (mutable attrs).
+    if isinstance(cfg_peek, dict):
+        model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
+    model.target_mode = "analytic" if env_peek.get("analytic_target", True) else "learned"
     model.eval()
-    print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}")
+    print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}  strategic_gate_eps={model.strategic_gate_eps}")
 
     rollout = EvalRollout(env, model, EvalCfg(max_steps=args.steps, env_idx=0,
                                               deterministic=args.deterministic,

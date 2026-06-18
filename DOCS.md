@@ -121,29 +121,31 @@ obs dict [N, M, ...] → MarlActorCritic.act(obs, h_act, h_crit)
 
 ---
 
-## 3. Graph node features (NODE_INPUT_DIM = 7)
+## 3. Graph node features (NODE_INPUT_DIM = 6)
 
 | Idx | Name | Meaning | Range |
 |---|---|---|---|
-| 0 | `x_rel` | `(node.x - curr.x) / (max(H,W)/2)` | [-1, +1] |
-| 1 | `y_rel` | `(node.y - curr.y) / (max(H,W)/2)` | [-1, +1] |
-| 2 | `utility_norm` | # frontier cells inside `(2·UR+1)²` window around node, / area | [0, 1] |
-| 3 | `visited` | 1 if this node was ever `curr_idx` for this agent, else 0 | {0, 1} |
-| 4 | `last_visit_norm` | `last_visit_step / current_step` | [0, 1] |
-| 5 | `teammate_pos` | 1.0 at the lattice node nearest to **each teammate's last-known position** (M>1 only). At reset all teammates are co-located (in comm range); thereafter updates only when the pair is in range + LOS. Zero for M=1. | {0, 1} |
-| 6 | `guidepost` | 1 if node lies on Bellman-Ford shortest path from curr to nearest high-utility reachable node | {0, 1} |
+| 0 | `x_rel` | `(node.x - curr.x) / (window_radius·NR)` — **EGO-scale** (window half-extent), not half-map, so in-window coords span the full range | [-1, +1] in window |
+| 1 | `y_rel` | `(node.y - curr.y) / (window_radius·NR)` | [-1, +1] in window |
+| 2 | `utility_norm` | **info-gain** — estimated UNKNOWN area revealed on arrival (unknown cells in a `sensor_range_px` disk / disk area), diffused along valid edges. Captures big rooms behind small openings | [0, 1] |
+| 3 | `age` | **stationary recency**: `clamp((current_step − last_visit)/visit_age_window, 0,1)`; never-visited = 1 (cold/re-explorable), just-walked = 0 (avoid backtrack). Replaces old `visited{0,1}` + `last_visit_norm` (latter was non-stationary — value drifted every step — and redundant with actor GRU). `visit_age_window` default 16 | [0, 1] |
+| 4 | `teammate_pos` | **BF teammate-proximity POTENTIAL** `exp(−d/4·NR)` where d = BF geodesic from nearest teammate's lkp (optimistic FREE∪UNKNOWN graph) to this node. Dense, gradient-rich, wall-aware, points toward teammate (was a single dead one-hot). Zero for M=1 | [0, 1] |
+| 5 | `guidepost` | 1 if node lies on Bellman-Ford shortest path from curr to nearest high-utility reachable node | {0, 1} |
 
 Invalid nodes have feature row zeroed. Edges to invalid neighbors masked in GAT attention. The GAT encoder runs on the ego-centric window `(2·n_hops+3)²` centered on `curr`, not the full lattice.
 
-**Utility (v2, wall-aware)**: the old (2·UR+1)² raw integral window counted frontier pixels
-**through walls** (a node beside a wall scored frontier in the corridor on the other side,
-poisoning the GAT feature, the strategic candidate ranking and the guidepost argmax). Now:
-(a) per-node frontier indicator from a tiny ~NR/2-px window (integral image, leak negligible),
-(b) h=⌈UR/NR⌉=2 rounds of graph diffusion of that indicator along **collision-checked
-`edge_valid` edges** — frontier mass only flows through passable edges, so walls block it by
-construction. Normalized to [0,1] by 2^h; typical max ≈ 0.1.
+**Utility (v3, info-gain, wall-aware)**: prior versions measured frontier-pixel **ribbon
+length** — boundary size, not the hidden volume behind it, so a small door fronting a huge
+unexplored room scored low. v3 seeds the diffusion with **estimated information gain**: the
+count of UNKNOWN cells inside a `sensor_range_px` disk around each node (one-scan lookahead,
+integral image), normalized by disk area to a fraction ∈ [0,1]. Then h=⌈UR/NR⌉ rounds of graph
+diffusion along **collision-checked `edge_valid` edges** (mass flows only through passable
+edges → walls block by construction), normalized by 2^h. A small frontier opening onto a big
+unknown component now scores high. Within-disk occlusion is a second-order error accepted for
+an arrival estimate. (v2 used the frontier-ribbon source; the diffusion + edge-masking
+scaffold is unchanged.)
 
-### 3.1 Strategic candidate features (CAND_FEAT_DIM = 8)
+### 3.1 Strategic candidate features (CAND_FEAT_DIM = 9)
 
 Separate from the GAT node features above. For each agent, the top-K (`--top-k`, default 16) reachable frontier candidates are extracted globally (not windowed) and fed to the `StrategicHead`. Per-candidate feature vector:
 
@@ -156,6 +158,7 @@ Separate from the GAT node features above. For each agent, the top-K (`--top-k`,
 | 5 | `max_comm_gap` | steps since last comm with the most-stale teammate, / max_episode_steps |
 | 6 | `own_minus_team` | (my bf_dist − min teammate dist) × `--yield-scale`, clamped [-1,1]. Positive = teammate closer → yield. |
 | 7 | `team_alt_score` | mean over teammates of "teammate's best alternative − this cand's value" (H.2 joint distribution). High = teammate has other good options → I can take this. |
+| 8 | `prev_branch_match` | 1.0 if this candidate's BF first-hop branch == the branch committed last step → direction-commitment memory for the feedforward head (stops per-step target thrash). |
 
 The head outputs `target_logits[K]` (Gumbel-ST → one-hot pick) and a pooled `strategic_emb`. `cand_bf_first_hop[K, 8]` one-hot maps the chosen candidate to its first K=8 lattice hop (for the `path_bias` action prior).
 
@@ -294,6 +297,7 @@ Both are saved in the checkpoint cfg and propagated to eval so renders reflect t
 | `--eval-steps` | `-1` | Episode length for eval-on-ckpt GIFs. `-1` aligns with `--max-episode-steps` (G.2) |
 | `--n-hops` | `2` | Ego-centric encoder window radius. Window = (2·n_hops+3)². n_layers tied to this |
 | `--top-k` | `16` | Top-K frontier candidates per agent for strategic attention head (Phase A v2) |
+| `--strategic-gate-eps` | `0.0` | High-level gate: StrategicHead + BF path-bias steer the actor **only** on steps where max ego-window utility < this. `0.0` = gate off (head always influences). Makes the head a high-level chooser consulted when local exploration is exhausted, not a per-step driver |
 | `--force-full-comm` | off | Debug: bypass dist/LOS check; every pair communicates every step |
 | `--force-full-pos-sharing` | off | Debug: persistent teammate-position awareness (positions only, maps still comm-gated) |
 | `--force-full-occupancy-sharing` | off | Debug: maps fused every step (occupancy synced across agents) |
