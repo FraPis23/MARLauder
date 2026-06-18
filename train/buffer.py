@@ -60,6 +60,8 @@ class Rollout:
             # Phase 3 — guidepost first-hop one-hot (toward nearest frontier); used by the
             # single-pointer ablation (no strategic head) as the action-bias signal.
             "guidepost_nbr_bias": _z((T, N, M, K),             torch.float32),
+            # CTDE critic-only global state (value head only): [explored_frac, t/T, geo_dist, in_comm].
+            "critic_global":      _z((T, N, sample_obs["critic_global"].shape[-1]), torch.float32),
         }
         self.actions       = _z((T, N, M), torch.long)
         # Phase A v2 — strategic K-slot chosen at rollout (for STE replay during PPO).

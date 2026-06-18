@@ -210,46 +210,53 @@ class GraphLattice:
         is_free_node = node_occ == FREE                       # [N, N_max]
         is_free_lat = is_free_node.view(N, self.LH, self.LW)
 
-        # 2) Flood-fill from robot's lattice cell, restricted to is_free_lat.
+        # 2) Edge geometry + collision masks — computed BEFORE the flood so reachability runs
+        #    over the SAME strict FREE edge set the BF/guidepost use. (Old build flooded a 3×3
+        #    node-center dilation that ignored edge collision → node_valid a SUPERSET of
+        #    BF-reachable → targets node-reachable but edge-unreachable stranded the guidepost.)
+        edge_idx = self.edge_idx_static.unsqueeze(0).expand(N, -1, -1).contiguous()  # [N, N_max, K]
+        nbr_idx_safe = edge_idx.clamp(min=0)                  # [-1 → 0] for gather
+        nbr_valid_geom = edge_idx >= 0
+        # Collision: sample S points along each edge in world coords.
+        nx_all = self.node_xy[:, 0].view(1, self.N_max, 1, 1)    # [1, N_max, 1, 1]
+        ny_all = self.node_xy[:, 1].view(1, self.N_max, 1, 1)
+        sx = (nx_all + self.sample_dx.view(1, 1, K, self.S)).clamp(0, W - 1).long()
+        sy = (ny_all + self.sample_dy.view(1, 1, K, self.S)).clamp(0, H - 1).long()
+        sample_lin = (sy * W + sx).expand(N, -1, -1, -1)         # [N, N_max, K, S]
+        occ_samples = torch.gather(occ_flat, 1, sample_lin.reshape(N, -1)).view(N, self.N_max, K, self.S)
+        # collision_free       — no KNOWN OBSTACLE on segment (UNKNOWN allowed): OPTIMISTIC graph
+        #                        (3b), which must reach into unexplored space for teammate BF.
+        # collision_free_known — segment is ALL KNOWN-FREE (no UNKNOWN, no OBSTACLE): the FREE
+        #                        graph. The permissive mask let two free nodes connect across an
+        #                        unmapped gap → guidepost/target BF + GAT routed THROUGH walls /
+        #                        unknown. The FREE graph must only follow confirmed-open space.
+        collision_free       = (occ_samples != OBSTACLE).all(dim=-1)   # [N, N_max, K]
+        collision_free_known = (occ_samples == FREE).all(dim=-1)       # [N, N_max, K]
+
+        # 3) Reachability flood over the strict FREE edge set (both endpoints free + segment
+        #    known-free) → node_valid == BF-reachable, by construction.
+        is_free_nbr = torch.gather(is_free_node, 1, nbr_idx_safe.view(N, -1)).view(N, self.N_max, K)
+        trav = (is_free_node.unsqueeze(-1) & is_free_nbr & nbr_valid_geom & collision_free_known)  # [N,N_max,K]
+        trav_f = trav.float()
         rx = robot_xy[:, 0].clamp(0, W - 1).long()
         ry = robot_xy[:, 1].clamp(0, H - 1).long()
         rli = (ry // self.NR).clamp(0, self.LH - 1)
         rlj = (rx // self.NR).clamp(0, self.LW - 1)
-        seed = torch.zeros((N, self.LH, self.LW), dtype=torch.float32, device=dev)
-        seed[torch.arange(N, device=dev), rli, rlj] = 1.0
-        seed = seed * is_free_lat.float()                     # seed must itself be free; if not, will stay zero
-        reach = seed
+        reach = torch.zeros((N, self.N_max), dtype=torch.float32, device=dev)
+        reach[torch.arange(N, device=dev), rli * self.LW + rlj] = 1.0
+        reach = reach * is_free_node.float()                  # seed must itself be a free node
         for _ in range(self.flood_max_iters):
-            dil = F.conv2d(reach.unsqueeze(1), self._dilate_k, padding=1).squeeze(1)
-            new = (dil > 0).float() * is_free_lat.float()
+            nbr_reach = (torch.gather(reach, 1, nbr_idx_safe.view(N, -1)).view(N, self.N_max, K) * trav_f).amax(dim=-1)
+            new = torch.maximum(reach, nbr_reach)
             if torch.equal(new, reach):
                 break
             reach = new
-        node_valid = (reach.view(N, self.N_max) > 0)          # [N, N_max] bool
+        node_valid = reach > 0                                # [N, N_max] == BF-reachable
 
-        # 3) Edges: edge target idx, validity = both endpoints valid + collision-free.
-        edge_idx = self.edge_idx_static.unsqueeze(0).expand(N, -1, -1).contiguous()  # [N, N_max, K]
-        nbr_idx_safe = edge_idx.clamp(min=0)                  # [-1 → 0] for gather
-        nbr_valid_geom = edge_idx >= 0
-        # Gather neighbor validity.
-        nbr_node_valid = torch.gather(
-            node_valid, dim=1, index=nbr_idx_safe.view(N, -1)
-        ).view(N, self.N_max, K)
+        # 4) Edge validity over the strict FREE set (both endpoints now reachable).
+        nbr_node_valid = torch.gather(node_valid, 1, nbr_idx_safe.view(N, -1)).view(N, self.N_max, K)
         endpoints_valid = node_valid.unsqueeze(-1) & nbr_node_valid & nbr_valid_geom
-
-        # Collision check: sample S points along each edge in world coords.
-        nx_all = self.node_xy[:, 0].view(1, self.N_max, 1, 1)    # [1, N_max, 1, 1]
-        ny_all = self.node_xy[:, 1].view(1, self.N_max, 1, 1)
-        sx = nx_all + self.sample_dx.view(1, 1, K, self.S)       # [1, N_max, K, S]
-        sy = ny_all + self.sample_dy.view(1, 1, K, self.S)
-        sx = sx.clamp(0, W - 1).long()
-        sy = sy.clamp(0, H - 1).long()
-        sample_lin = sy * W + sx                                  # [1, N_max, K, S]
-        sample_lin = sample_lin.expand(N, -1, -1, -1)             # [N, N_max, K, S]
-        occ_samples = torch.gather(occ_flat, 1, sample_lin.reshape(N, -1)).view(N, self.N_max, K, self.S)
-        collision_free = (occ_samples != OBSTACLE).all(dim=-1)    # [N, N_max, K]
-
-        edge_valid = endpoints_valid & collision_free
+        edge_valid = endpoints_valid & collision_free_known
         edge_idx = torch.where(edge_valid, edge_idx, torch.full_like(edge_idx, -1))
 
         # 3b) OPTIMISTIC traversable graph (UNKNOWN treated passable) — for teammate-

@@ -83,8 +83,9 @@ def main() -> None:
     # --- learning (MAPPO knobs — exposed for W&B sweeps) ---
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--ent-coef", type=float, default=0.01)
-    ap.add_argument("--clip-eps", type=float, default=0.2, help="PPO clip ε")
-    ap.add_argument("--k-epochs", type=int, default=4, help="PPO epochs per rollout")
+    ap.add_argument("--clip-eps", type=float, default=0.15, help="PPO clip ε (≤0.2; 0.15 default — this task is more non-stationary than the paper's benchmarks)")
+    ap.add_argument("--k-epochs", type=int, default=4, help="PPO epochs per rollout (keep low: intra-episode obs shift + dense shaping = high non-stationarity)")
+    ap.add_argument("--max-grad-norm", type=float, default=2.0, help="gradient clip norm (paper 10.0; 2.0 here — dense shaping spikes gradients)")
     ap.add_argument("--gae-lambda", type=float, default=0.95, help="GAE λ")
     ap.add_argument("--gamma", type=float, default=0.99, help="discount factor")
     ap.add_argument("--vf-coef", type=float, default=0.5, help="value loss weight")
@@ -96,7 +97,9 @@ def main() -> None:
     ap.add_argument("--eval-on-ckpt", action="store_true",
                     help="Emit 2 eval GIFs at each milestone (25/50/75/100%%)")
     ap.add_argument("--eval-steps", type=int, default=-1,
-                    help="G.2: episode length for eval-on-ckpt GIFs. -1 = same as --max-episode-steps")
+                    help="G.2: episode length for eval-on-ckpt GIFs/traces. -1 = same as --max-episode-steps")
+    ap.add_argument("--eval-n-maps", type=int, default=2, help="GIFs + decision traces per milestone")
+    ap.add_argument("--eval-map-idx", type=int, default=-1, help="fixed eval map (-1 = random each milestone)")
     # --- Weights & Biases ---
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-project", default="marlauder")
@@ -125,6 +128,8 @@ def main() -> None:
         seed=args.seed,
         compile=args.compile,
         eval_on_ckpt=args.eval_on_ckpt,
+        eval_n_maps=args.eval_n_maps,
+        eval_map_idx=args.eval_map_idx,
         eval_split=(
             args.eval_split if args.eval_split is not None
             else ("test/complex" if args.curriculum else args.split)
@@ -177,6 +182,7 @@ def main() -> None:
             n_minibatches=args.minibatches,
             clip_eps=args.clip_eps,
             k_epochs=args.k_epochs,
+            max_grad_norm=args.max_grad_norm,
             lam=args.gae_lambda,
             gamma=args.gamma,
             vf_coef=args.vf_coef,

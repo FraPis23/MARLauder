@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>MARLauder · Episode Decision Inspector</title>
+<style>
+  :root{--bg:#0d0f14;--panel:#161a22;--line:#222936;--txt:#cdd6e4;--dim:#7e8aa0;--accent:#4cc9f0;--warn:#ff6b6b;--ok:#6bd968;--amber:#ffce54}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;display:flex;height:100vh;overflow:hidden}
+  #left{flex:1;display:flex;flex-direction:column;min-width:0}
+  #right{width:380px;background:var(--panel);border-left:1px solid var(--line);overflow-y:auto;padding:12px 14px}
+  #bar{display:flex;gap:8px;align-items:center;padding:8px 10px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  #stage{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#05070b;padding:10px}
+  canvas{image-rendering:auto;box-shadow:0 0 0 1px #2a3242;border-radius:3px}
+  button,select{background:#222a38;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:4px 9px;cursor:pointer;font:inherit}
+  button:hover{border-color:var(--accent)}
+  input[type=range]{flex:1;min-width:160px}
+  .pill{padding:2px 7px;border-radius:10px;background:#222a38;border:1px solid var(--line)}
+  .on{color:var(--ok);border-color:var(--ok)}
+  .off{color:var(--dim)}
+  h3{margin:12px 0 5px;color:var(--accent);font-size:12px;letter-spacing:.5px;text-transform:uppercase;border-bottom:1px solid var(--line);padding-bottom:3px}
+  table{width:100%;border-collapse:collapse}
+  td{padding:2px 4px;border-bottom:1px solid #1b2230}
+  td.k{color:var(--dim)}
+  td.v{text-align:right}
+  .bar8{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;width:100%;max-width:300px}
+  .cell{height:46px;border:1px solid var(--line);border-radius:5px;display:flex;align-items:center;justify-content:center;
+        font-size:14px;font-weight:600;position:relative;overflow:hidden;background:#0e1118;color:#eef3fb}
+  .cell .fill{position:absolute;left:0;bottom:0;width:100%;z-index:0}
+  .cell .val{position:relative;z-index:1;text-shadow:0 1px 3px #000,0 0 2px #000}
+  .cell .gpf{position:absolute;top:2px;right:4px;z-index:1;font-size:11px;color:#fff;text-shadow:0 0 3px #000}
+  .cell.mid{background:#11151d;color:#3a455c;font-weight:400}
+  .cell.masked{opacity:.35}
+  .cell.chosen{outline:2px solid var(--ok);outline-offset:-2px}
+  .neg{color:var(--warn)} .pos{color:var(--ok)}
+  #hint{color:var(--dim);font-size:11px}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+</style>
+</head>
+<body>
+<div id="left">
+  <div id="bar">
+    <label>episode: <select id="episode"><option>—</option></select></label>
+    <button id="reloadIdx" title="rescan traces/ folder">⟳</button>
+    <button id="loadBtn">file…</button>
+    <input type="file" id="file" accept=".json" style="display:none"/>
+    <button id="prev">◀ Prev</button>
+    <button id="play">▶ Play</button>
+    <button id="next">Next ▶</button>
+    <input type="range" id="slider" min="0" max="0" value="0"/>
+    <span class="pill" id="tlabel">t=0</span>
+    <select id="agent"></select>
+    <label>color: <select id="field">
+      <option value="util">utility</option>
+      <option value="age">age</option>
+      <option value="team">teammate_pot</option>
+      <option value="gp">guidepost</option>
+      <option value="bf">bf_dist→target</option>
+    </select></label>
+    <label><input type="checkbox" id="edges" checked/> edges</label>
+    <span id="hint">load a trace, then click a node</span>
+  </div>
+  <div id="stage"><canvas id="cv"></canvas></div>
+</div>
+<div id="right">
+  <h3>step / agent</h3>
+  <table id="meta"></table>
+  <h3>action logits (8 neighbors)</h3>
+  <div class="bar8" id="bar8"></div>
+  <div id="hint2" style="margin-top:6px;color:var(--dim)"></div>
+  <h3>reward breakdown (this step)</h3>
+  <table id="reward"></table>
+  <h3>selected node</h3>
+  <table id="node"><tr><td class="k">—</td></tr></table>
+</div>
+<script>
+const A = { trace:null, dir:".", t:0, agent:0, field:"util", edges:true, sel:null, playing:false, img:new Image() };
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const $ = id => document.getElementById(id);
+
+// K=8 neighbour offsets (dr,dc): NW N NE | W . E | SW S SE
+const KOFF = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+const KGRID = [0,1,2,3,4,5,6,7];   // already 3x3 minus center order matches bar8 layout below
+
+function ramp(t){ // 0..1 -> dim blue -> amber
+  t=Math.max(0,Math.min(1,t)); const lo=[46,64,120], hi=[255,210,60];
+  return `rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*t)).join(",")})`;
+}
+function fieldVal(n,f){ let v=n[f]; if(v===null||v===undefined) return null; return v; }
+
+function curStep(){ return A.trace.steps[A.t]; }
+function curAgent(){ return curStep().agents[A.agent]; }
+
+async function loadTrace(url){
+  const r = await fetch(url); A.trace = await r.json();
+  A.dir = url.substring(0, url.lastIndexOf("/")+1) || "./";
+  $("slider").max = A.trace.steps.length-1;
+  $("agent").innerHTML = "";
+  for(let a=0;a<A.trace.meta.n_agents;a++){ const o=document.createElement("option"); o.value=a;o.text="agent "+a; $("agent").add(o);}
+  A.t=0; A.agent=0; render();
+  $("hint").textContent = `map ${A.trace.meta.map_idx} · ${A.trace.steps.length} steps · gate_eps=${A.trace.meta.gate_eps} · ${A.trace.meta.target_mode}`;
+}
+
+function fitCanvas(){
+  const m=A.trace.meta;
+  if(cv.width!==m.W||cv.height!==m.H){ cv.width=m.W; cv.height=m.H; }   // internal res = map px
+  fitToStage();
+}
+function fitToStage(){
+  if(!A.trace) return;
+  const m=A.trace.meta, st=document.getElementById("stage");
+  const pad=20, aw=st.clientWidth-pad, ah=st.clientHeight-pad;
+  const s=Math.max(0.1, Math.min(aw/m.W, ah/m.H));   // contain, preserve aspect, scale UP
+  cv.style.width=Math.round(m.W*s)+"px";
+  cv.style.height=Math.round(m.H*s)+"px";
+}
+window.addEventListener("resize", ()=>{ fitToStage(); });
+
+function drawNodes(){
+  const st=curStep(), ag=curAgent(), m=A.trace.meta;
+  // field range for normalization
+  let lo=1e9,hi=-1e9;
+  for(const n of ag.nodes){ const v=fieldVal(n,A.field); if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);} }
+  if(hi<=lo) hi=lo+1;
+  // edges
+  if(A.edges){
+    ctx.strokeStyle="rgba(120,140,170,0.28)"; ctx.lineWidth=0.6;
+    const pos={}; for(const n of ag.nodes) pos[n.i]=n;
+    ctx.beginPath();
+    for(const [s,d] of ag.edges){ const a=pos[s],b=pos[d]; if(a&&b){ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);} }
+    ctx.stroke();
+  }
+  // nodes
+  for(const n of ag.nodes){
+    const v=fieldVal(n,A.field);
+    ctx.fillStyle = v===null? "#33405a" : ramp((v-lo)/(hi-lo));
+    ctx.beginPath(); ctx.arc(n.x,n.y, A.sel&&A.sel===n.i?5:3, 0, 6.283); ctx.fill();
+    ctx.lineWidth=0.6; ctx.strokeStyle="#000"; ctx.stroke();
+  }
+  // target ring
+  const tgt = ag.nodes.find(n=>n.i===ag.target);
+  if(tgt){ ctx.strokeStyle=getCSS("--amber"); ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(tgt.x,tgt.y,9,0,6.283); ctx.stroke(); }
+  // curr ring + chosen-action arrow
+  const cur = ag.nodes.find(n=>n.i===ag.curr) || {x:ag.pos[0],y:ag.pos[1]};
+  ctx.strokeStyle=getCSS("--accent"); ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(cur.x,cur.y,7,0,6.283); ctx.stroke();
+  const act=ag.action; if(act>=0&&act<8){ const o=KOFF[act]; const ex=cur.x+o[1]*m.nr*0.9, ey=cur.y+o[0]*m.nr*0.9;
+    ctx.strokeStyle=getCSS("--ok"); ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(cur.x,cur.y); ctx.lineTo(ex,ey); ctx.stroke();
+    ctx.fillStyle=getCSS("--ok"); ctx.beginPath();ctx.arc(ex,ey,3,0,6.283);ctx.fill(); }
+  // sel ring
+  if(A.sel!=null){ const s=ag.nodes.find(n=>n.i===A.sel); if(s){ctx.strokeStyle="#fff";ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(s.x,s.y,6,0,6.283);ctx.stroke();} }
+}
+function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v); }
+
+function render(){
+  if(!A.trace) return;
+  fitCanvas();
+  const ag=curAgent();
+  A.img.onload=()=>{ ctx.clearRect(0,0,cv.width,cv.height); ctx.drawImage(A.img,0,0); drawNodes(); };
+  A.img.src = A.dir + ag.frame + "?"+A.t;   // cache-bust per step
+  $("slider").value=A.t; $("tlabel").textContent="t="+A.t; $("agent").value=A.agent;
+  panels();
+}
+
+function panels(){
+  const ag=curAgent();
+  $("meta").innerHTML = row("step",A.t)+row("agent",A.agent)+row("value",ag.value)
+    +`<tr><td class=k>gate</td><td class=v><span class="pill ${ag.gate?'on':'off'}">${ag.gate?'STRATEGIC (local exhausted)':'LOCAL (climb)'}</span></td></tr>`
+    +row("curr node",ag.curr)+row("target node",ag.target)+row("chosen action",ag.action);
+  // logits 3x3 (center blank). Dark cell + proportional fill bar + white value text =
+  // readable on any value (the old full-yellow background washed the text out).
+  const cells=[0,1,2,3,null,4,5,6,7];
+  const fin=ag.logits.filter(x=>x!==null && Math.abs(x)<9000);
+  let lo=Math.min(...fin), hi=Math.max(...fin); if(hi<=lo) hi=lo+1;
+  $("bar8").innerHTML = cells.map(k=>{
+    if(k===null) return `<div class="cell mid">·</div>`;
+    const v=ag.logits[k], masked=!ag.action_mask[k];
+    const t=(v!==null&&Math.abs(v)<9000)?(v-lo)/(hi-lo):0;
+    const chosen=(k===ag.action), gp=ag.guidepost_dir[k]>0.01;
+    const fillc = chosen? getCSS('--ok') : '#3f6ea8';
+    const cls = `cell${masked?' masked':''}${chosen?' chosen':''}`;
+    return `<div class="${cls}" title="dir ${k} logit=${v}${masked?' [masked]':''}${gp?' [guidepost]':''}">
+      <div class="fill" style="height:${Math.round(t*100)}%;background:${fillc};opacity:.5"></div>
+      <span class="val">${v===null||Math.abs(v)>9000?'—':v.toFixed(2)}</span>${gp?'<span class="gpf">→</span>':''}</div>`;
+  }).join("");
+  $("hint2").innerHTML = `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked &nbsp;·&nbsp; bar = logit height`;
+  // reward
+  const rw=ag.reward||{}; let html="";
+  for(const k of Object.keys(rw)){ const v=rw[k]; html+=`<tr><td class=k>${k}</td><td class="v ${v<0?'neg':v>0?'pos':''}">${v===null?'·':v.toFixed(4)}</td></tr>`; }
+  $("reward").innerHTML = html||"<tr><td class=k>—</td></tr>";
+  showNode();
+}
+function row(k,v){ return `<tr><td class=k>${k}</td><td class=v>${v}</td></tr>`; }
+
+function showNode(){
+  const ag=curAgent();
+  if(A.sel==null){ $("node").innerHTML="<tr><td class=k>click a node</td></tr>"; return; }
+  const n=ag.nodes.find(x=>x.i===A.sel);
+  if(!n){ $("node").innerHTML="<tr><td class=k>node not valid this step</td></tr>"; return; }
+  $("node").innerHTML = row("index",n.i)+row("xy",`${n.x}, ${n.y}`)+row("utility",n.util)
+    +row("age",n.age)+row("teammate_pot",n.team)+row("guidepost",n.gp)+row("bf→target (nodes)",n.bf)
+    + (n.i===ag.curr?row("•","CURR"):"") + (n.i===ag.target?row("•","TARGET"):"");
+}
+
+// node picking
+cv.addEventListener("click",e=>{
+  if(!A.trace) return;
+  const r=cv.getBoundingClientRect(), sx=cv.width/r.width, sy=cv.height/r.height;
+  const x=(e.clientX-r.left)*sx, y=(e.clientY-r.top)*sy;
+  const ag=curAgent(); let best=null,bd=1e9;
+  for(const n of ag.nodes){ const d=(n.x-x)**2+(n.y-y)**2; if(d<bd){bd=d;best=n.i;} }
+  if(bd<400) { A.sel=best; render(); }
+});
+
+$("loadBtn").onclick=()=>$("file").click();
+$("file").onchange=e=>{ const f=e.target.files[0]; if(!f)return; const u=URL.createObjectURL(f);
+  // file:// won't resolve relative frames; recommend http.server. Still load JSON for non-image inspection.
+  fetch(u).then(r=>r.json()).then(j=>{A.trace=j;A.dir="./";$("slider").max=j.steps.length-1;
+    $("agent").innerHTML="";for(let a=0;a<j.meta.n_agents;a++){const o=document.createElement("option");o.value=a;o.text="agent "+a;$("agent").add(o);} A.t=0;render();}); };
+$("prev").onclick=()=>{A.t=Math.max(0,A.t-1);render();};
+$("next").onclick=()=>{A.t=Math.min(A.trace.steps.length-1,A.t+1);render();};
+$("slider").oninput=e=>{A.t=+e.target.value;render();};
+$("agent").onchange=e=>{A.agent=+e.target.value;render();};
+$("field").onchange=e=>{A.field=e.target.value;render();};
+$("edges").onchange=e=>{A.edges=e.target.checked;render();};
+$("play").onclick=()=>{ A.playing=!A.playing; $("play").textContent=A.playing?"⏸ Pause":"▶ Play";
+  const tick=()=>{ if(!A.playing)return; if(A.t<A.trace.steps.length-1){A.t++;render();setTimeout(tick,180);} else A.playing=false,$("play").textContent="▶ Play"; }; tick(); };
+document.addEventListener("keydown",e=>{ if(e.key==="ArrowLeft")$("prev").click(); if(e.key==="ArrowRight")$("next").click(); });
+
+// ---- episode picker: read traces/index.json (written by training / trace_episode.py) ----
+async function loadIndex(){
+  try{
+    const r=await fetch("traces/index.json?"+Date.now()); const idx=await r.json();
+    const sel=$("episode"); sel.innerHTML="";
+    // sort by checkpoint % then map
+    idx.sort((a,b)=> (a.tag<b.tag?-1:1));
+    for(const e of idx){ const o=document.createElement("option"); o.value=e.tag;
+      o.text=`${e.tag}  (expl ${e.final_explored!=null?Math.round(e.final_explored*100)+'%':'?'}, ${e.n_steps} steps)`; sel.add(o); }
+    if(idx.length){ sel.value=idx[idx.length-1].tag; await loadTrace(`traces/${sel.value}/trace.json`); }
+    $("hint").textContent=`${idx.length} episodes in traces/`;
+    return true;
+  }catch(e){ return false; }
+}
+$("episode").onchange=e=> loadTrace(`traces/${e.target.value}/trace.json`);
+$("reloadIdx").onclick=loadIndex;
+
+// boot: prefer the folder index; fall back to a sibling trace.json
+loadIndex().then(ok=>{ if(!ok) loadTrace("trace.json").catch(()=>{
+  $("hint").textContent="serve a run folder (python -m http.server) so traces/index.json is reachable, or use 'file…'";
+}); });
+</script>
+</body>
+</html>

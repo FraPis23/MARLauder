@@ -23,13 +23,18 @@ from train.buffer import Rollout
 class MAPPOCfg:
     gamma: float = 0.99
     lam: float = 0.95
-    clip_eps: float = 0.2
+    # clip ε 0.15 (paper says ≤0.2; we run tighter because this task is MORE non-stationary
+    # than the paper's benchmarks — intra-episode obs shift + dense evolving shaping → smaller
+    # policy drift per update is safer). k_epochs stays low (4) for the same reason.
+    clip_eps: float = 0.15
     ent_coef: float = 0.01
     vf_coef: float = 0.5
     k_epochs: int = 4
     tbptt_steps: int = 16
     n_minibatches: int = 1
-    max_grad_norm: float = 0.5
+    # Paper Tab.7 uses 10.0; we keep a tighter leash (2.0) because the dense shaping reward
+    # spikes gradients — but 0.5 was throttling learning, so 2.0 is the middle ground.
+    max_grad_norm: float = 2.0
     use_amp: bool = True
     # MAPPO paper §3.3 / Alg.1 — clipped value loss (max of unclipped and
     # V_old-clipped squared error). Clip range reuses clip_eps, in the
@@ -219,6 +224,7 @@ def ppo_update(
                             cand_bf_first_hop=chunk_obs["cand_bf_first_hop"][tt],
                             guidepost_nbr_bias=chunk_obs["guidepost_nbr_bias"][tt],
                             node_feat=chunk_obs["node_feat"][tt],
+                            critic_global=chunk_obs["critic_global"][tt] if "critic_global" in chunk_obs else None,
                         )
                         new_logp = ev["logp"]
                         new_val = ev["value"]

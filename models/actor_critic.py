@@ -29,6 +29,11 @@ from models.init_utils import apply_orthogonal, orthogonal_
 
 F_IN = 6
 K = 8
+# CTDE critic-only global state (value head, never seen by actors → no execution leak):
+#   [explored_frac_union, t/max_steps, geodesic_pair_dist/diam, in_comm]. First two fix the
+#   non-stationary coverage VALUE (predict remaining return); last two add coordination context.
+#   Geodesic distance reuses the env's already-computed bf_dist_team (no extra BF).
+CRITIC_GLOBAL_DIM = 4
 CAND_FEAT_DIM = 9     # rel_x, rel_y, utility, euclid, min_team_dist, max_comm_gap, own_minus_team,
 #                       team_alt_score, prev_branch_match (does cand continue last step's committed
 #                       BF-tree first-hop branch → gives the feedforward strategic head memory of its
@@ -202,7 +207,7 @@ class MarlActorCritic(nn.Module):
         self.register_buffer("path_bias_floor", torch.tensor(float(path_bias_floor)), persistent=False)
         self.path_bias_learn = nn.Parameter(torch.tensor(0.5))
         # Critic head (CTDE)
-        self.critic_pre = nn.Sequential(nn.Linear(n_agents * d, d), nn.GELU())
+        self.critic_pre = nn.Sequential(nn.Linear(n_agents * d + CRITIC_GLOBAL_DIM, d), nn.GELU())
         self.gru_critic = nn.GRUCell(d, d)
         self.critic_head = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 1))
         # Precomputed K_INDEX_TABLE for analytic next-hop slot from (sign(dy), sign(dx)).
@@ -258,6 +263,15 @@ class MarlActorCritic(nn.Module):
         curr_emb = h[b_arange, curr_idx]                            # [B, d]
         nbr_embs = h[b_arange.unsqueeze(-1).expand(B, K), curr_nbr]  # [B, K, d]
         return h, curr_emb, nbr_embs
+
+    def _critic_in(self, curr_emb_per_agent: torch.Tensor, critic_global: torch.Tensor | None) -> torch.Tensor:
+        """Concat joint agent embeddings [N, M·d] with the CTDE global vector [N, CRITIC_GLOBAL_DIM]
+        (zeros if absent — back-compat / M=1)."""
+        N = curr_emb_per_agent.shape[0]
+        joint = curr_emb_per_agent.reshape(N, self.M * self.d)
+        if critic_global is None:
+            critic_global = joint.new_zeros(N, CRITIC_GLOBAL_DIM)
+        return torch.cat([joint, critic_global], dim=-1)
 
     def _strategic_gate(self, obs: dict, B: int) -> torch.Tensor | None:
         """High-level gate: 1 where the ego window has NO local utility (→ consult strategic
@@ -426,8 +440,7 @@ class MarlActorCritic(nn.Module):
         entropy = dist.entropy()
 
         curr_emb_per_agent = curr_emb.view(N, M, self.d)
-        joint = curr_emb_per_agent.reshape(N, M * self.d)
-        joint = self.critic_pre(joint)
+        joint = self.critic_pre(self._critic_in(curr_emb_per_agent, obs.get("critic_global")))
         h_crit_out = self.gru_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
 
@@ -503,8 +516,7 @@ class MarlActorCritic(nn.Module):
         entropy = dist.entropy()
 
         curr_emb_per_agent = curr_emb.view(N, M, self.d)
-        joint = curr_emb_per_agent.reshape(N, M * self.d)
-        joint = self.critic_pre(joint)
+        joint = self.critic_pre(self._critic_in(curr_emb_per_agent, obs.get("critic_global")))
         h_crit_out = self.gru_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
 
@@ -570,6 +582,7 @@ class MarlActorCritic(nn.Module):
         cand_bf_first_hop: torch.Tensor | None = None,   # G.3.c [N, M, K_cand, K]
         guidepost_nbr_bias: torch.Tensor | None = None,  # Phase 3 ablation [N, M, K]
         node_feat: torch.Tensor | None = None,           # [N, M, N_max_window, F] for strategic gate
+        critic_global: torch.Tensor | None = None,       # [N, CRITIC_GLOBAL_DIM] CTDE value-only state
         nr: float = 16.0,
     ) -> dict:
         """One PPO-evaluate step given pre-encoded curr/nbr embeddings.
@@ -622,8 +635,7 @@ class MarlActorCritic(nn.Module):
         logp = dist.log_prob(action.reshape(B))
         entropy = dist.entropy()
 
-        joint = curr_emb.reshape(N, M * self.d)
-        joint = self.critic_pre(joint)
+        joint = self.critic_pre(self._critic_in(curr_emb, critic_global))
         h_crit_out = self.gru_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
         # J.3 — expose strategic target logits for the cross-agent diversity loss (mappo).

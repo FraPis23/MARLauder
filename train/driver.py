@@ -34,7 +34,7 @@ class TrainCfg:
     disable_strategic: bool = False  # Phase 3 — single-pointer ablation (bypass StrategicHead, use guidepost)
     strategic_gate_eps: float = 0.0  # high-level gate: strategic head influences only when max ego-window utility < eps (0 = always on)
     lr_actor: float = 3e-4
-    lr_critic: float = 1e-3
+    lr_critic: float = 5e-4   # faster than actor (non-stationary value) but below paper's 1e-3 (oscillation risk)
     device: str = "cuda:0"
     seed: int = 0
     compile: bool = False
@@ -364,7 +364,7 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
     return out
 
 
-def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50, 75, 100)) -> None:
+def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40, 60, 80, 100)) -> None:
     import time
     import numpy as np
     cfg.out_dir = Path(cfg.out_dir)
@@ -378,7 +378,18 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
         torch.backends.cudnn.benchmark = True
     env, model = make_env_model(cfg)
     vnorm = ValueNormalizer().to(cfg.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr_actor)
+    # Separate critic param group at a faster lr: the value target (coverage-left + time-left)
+    # is highly non-stationary in this task, so the critic needs to track faster than the actor.
+    # Paper Tab.7 uses Adam eps 1e-5 (vs torch default 1e-8). CTDE value-only modules.
+    _critic_mods = (model.critic_pre, model.gru_critic, model.critic_head)
+    _critic_params = [p for m in _critic_mods for p in m.parameters()]
+    _critic_ids = {id(p) for p in _critic_params}
+    _actor_params = [p for p in model.parameters() if id(p) not in _critic_ids]
+    optimizer = torch.optim.Adam(
+        [{"params": _actor_params, "lr": cfg.lr_actor},
+         {"params": _critic_params, "lr": cfg.lr_critic}],
+        eps=1e-5,
+    )
     h_act, h_crit = model.init_hidden(cfg.n_envs, cfg.device)
 
     # Weights & Biases (optional). Guarded import → absent package / --wandb off = no-op.
@@ -506,9 +517,17 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (25, 50
                     map_indices = [cfg.eval_map_idx] * cfg.eval_n_maps
                 else:
                     map_indices = eval_rng.integers(0, n_maps, size=cfg.eval_n_maps).tolist()
+                from eval.trace import capture_trace
                 for gi, midx in enumerate(map_indices):
                     gif_path = cfg.out_dir / f"eval_ckpt_{pct:03d}_m{gi}.gif"
                     _emit_eval_gif(model, cfg, gif_path, int(midx))
+                    # Step-through decision trace for the web inspector (same episode/map).
+                    try:
+                        capture_trace(model, _eval_split, cfg.env.__dict__, cfg.n_agents,
+                                      int(midx), cfg.eval_steps, cfg.out_dir,
+                                      f"ckpt_{pct:03d}_m{gi}", cfg.device)
+                    except Exception as e:
+                        print(f"[trace] skipped ({e})")
                     # Surface behavior in the W&B dashboard (not just on-disk files).
                     if wb is not None:
                         wb.log({f"behavior/rollout_m{gi}": wb.Video(str(gif_path), fps=12,

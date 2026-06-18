@@ -19,6 +19,9 @@ class ValueNormalizer(nn.Module):
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
         x = x.detach().reshape(-1).float()
+        # Defensive: drop non-finite samples. A single inf/NaN return would otherwise corrupt
+        # mean/var permanently (Welford), poisoning every later normalize() → pg/v NaN forever.
+        x = x[torch.isfinite(x)]
         bn = float(x.numel())
         if bn == 0:
             return
