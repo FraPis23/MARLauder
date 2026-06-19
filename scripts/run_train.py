@@ -59,7 +59,6 @@ def main() -> None:
     ap.add_argument("--yield-scale",     type=float, default=3.0,  help="G.4.a: scale on cand_own_minus_team yield feature")
     ap.add_argument("--target-yield-weight", type=float, default=0.0, help="J.1: α_yield — reward for CHOOSING a frontier you're closer to than the (live) teammate. One-sided pull (≥0, no repulsion); reactive position-driven division without ping-pong/idle. 0 = off")
     ap.add_argument("--proximity-pen",   type=float, default=0.0,  help="G.4.b: per-step raw-distance penalty (ELIMINATED by default — it caused the ping-pong/deadlock; novel_scan handles anti-chase). >0 only for ablation")
-    ap.add_argument("--path-bias-floor", type=float, default=1.5,  help="I.3: fixed floor on target-following bias (actor logits)")
     ap.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
     ap.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
     ap.add_argument("--target-switch-pen", type=float, default=0.05, help="δ_obj: graph-tree branch-flip commitment penalty = the deliberation cost; now fires only on genuine (margin-gated) switches")
@@ -119,7 +118,6 @@ def main() -> None:
         rollout_len=args.rollout_len,
         n_hops=args.n_hops,
         lr_actor=args.lr,
-        path_bias_floor=args.path_bias_floor,
         switch_margin=args.switch_margin,
         max_steps_on_option=args.max_steps_on_option,
         disable_strategic=args.no_strategic_head,

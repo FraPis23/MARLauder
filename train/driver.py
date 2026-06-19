@@ -3,6 +3,9 @@ milestones (25/50/75/100%), logs metrics to stdout.
 """
 from __future__ import annotations
 
+import json
+import os
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +17,21 @@ from models.actor_critic import MarlActorCritic
 from models.value_normalizer import ValueNormalizer
 from train.buffer import Rollout
 from train.mappo import MAPPOCfg, ppo_update
+
+
+def _dump_status(out_dir: Path, status: dict) -> None:
+    """Atomically write status.json (event-driven heartbeat for the web inspector).
+
+    Called only on training start, milestone checkpoints, and exit — never per-iter,
+    so it costs nothing in the hot loop. Liveness between events is inferred by the web
+    server from the recorded PID (see viz/web_server.py), which catches hard kills that
+    never reach the exit handler. Temp-file + replace = the server never reads a partial.
+    """
+    import time
+    status["timestamp"] = time.time()
+    tmp = out_dir / "status.json.tmp"
+    tmp.write_text(json.dumps(status))
+    tmp.replace(out_dir / "status.json")
 
 
 @dataclass
@@ -28,7 +46,6 @@ class TrainCfg:
     n_heads: int = 4
     n_hops: int = 2          # ego-centric encoder window radius; n_layers tied to this
     n_layers: int = 2        # GAT layers; default tied to n_hops in make_env_model
-    path_bias_floor: float = 1.5   # I.3 — fixed floor on target-following bias (actor logits)
     switch_margin: float = 1.0     # Phase 1 — strategic target switches only when an alt beats committed by >this
     max_steps_on_option: int = 24  # Phase 1 — horizon cap forcing a re-pick (escape unreachable target)
     disable_strategic: bool = False  # Phase 3 — single-pointer ablation (bypass StrategicHead, use guidepost)
@@ -108,7 +125,6 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
     cfg.ppo.node_eps = float(cfg.env.nr) * 0.5
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
                             n_heads=cfg.n_heads, n_layers=cfg.n_layers,
-                            path_bias_floor=cfg.path_bias_floor,
                             switch_margin=cfg.switch_margin,
                             max_steps_on_option=cfg.max_steps_on_option,
                             disable_strategic=cfg.disable_strategic,
@@ -424,6 +440,37 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     print(f"[train] iters={n_iters}  steps/iter={steps_per_iter}  total≈{n_iters * steps_per_iter:,}")
     total_train_time = 0.0      # cumulative collect+update time (eval-free)
     total_env_steps = 0
+
+    # Event-driven status for the web inspector. Written ONCE here, then only at milestone
+    # ckpts and on exit — zero cost in the hot loop. pid/host let the server detect a hard
+    # kill (which never reaches the exit handler) by checking the process is still alive.
+    status = {
+        "state": "training", "pid": os.getpid(), "host": socket.gethostname(),
+        "start_time": time.time(), "total_iters": n_iters,
+        "split": cfg.split, "n_agents": cfg.n_agents, "n_envs": cfg.n_envs,
+        "iter": 0, "progress_pct": 0.0, "last_ckpt": None, "ep_end_pct": None,
+    }
+    _dump_status(cfg.out_dir, status)
+
+    # Exit events: normal finish sets state="done" below; any abnormal exit
+    # (exception, Ctrl-C, docker stop/SIGTERM) lands here and records "stopped".
+    # kill -9 leaves no event → server falls back to the PID liveness check.
+    import atexit
+    import signal
+
+    def _finalize() -> None:
+        if status["state"] == "training":   # not already marked done
+            status["state"] = "stopped"
+            _dump_status(cfg.out_dir, status)
+    atexit.register(_finalize)
+
+    def _on_sigterm(*_):
+        raise KeyboardInterrupt   # unwind the loop → atexit fires → "stopped"
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)   # docker stop / kill
+    except ValueError:
+        pass   # not main thread (e.g. some sweep agents) — atexit still covers normal exit
+
     for it in range(1, n_iters + 1):
         # H.5 — update curriculum weights each iter.
         if cfg.curriculum and hasattr(env.split, "set_weights"):
@@ -509,6 +556,12 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                                        "n_agents": cfg.n_agents},
             }, ckpt_path)
             print(f"[ckpt] {ckpt_path}")
+            # Milestone status update (rare event — piggybacks the ckpt's own disk write).
+            status.update(iter=it, progress_pct=round(100.0 * it / n_iters, 1),
+                          last_ckpt=f"ckpt_{pct:03d}", env_steps=total_env_steps,
+                          ep_end_pct=round(ep_end_mean * 100, 1) if ep_end_n > 0
+                          else status["ep_end_pct"])
+            _dump_status(cfg.out_dir, status)
             if cfg.eval_on_ckpt:
                 from env.maps import load_split as _ls
                 _eval_split = _ls(cfg.eval_split, device=cfg.device)
@@ -543,5 +596,9 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                                "n_agents": cfg.n_agents},
     }, cfg.out_dir / "final.pt")
     print(f"[done] {cfg.out_dir/'final.pt'}")
+    # Clean-completion event: marks DONE so the atexit handler won't downgrade to "stopped".
+    status.update(state="done", iter=n_iters, progress_pct=100.0,
+                  env_steps=total_env_steps)
+    _dump_status(cfg.out_dir, status)
     if wb is not None:
         wb.finish()

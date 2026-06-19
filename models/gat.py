@@ -37,6 +37,10 @@ class MaskedGATLayer(nn.Module):
         self.v_proj = nn.Linear(in_dim, out_dim, bias=False)
         self.o_proj = nn.Linear(out_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
+        # Inspector hook: when store_attn, keep the per-node neighbor-attention softmax of the
+        # last forward (detached) so the viewer can show which neighbors a node aggregates from.
+        self.store_attn = False
+        self._last_attn: torch.Tensor | None = None
 
     def forward(
         self,
@@ -79,6 +83,8 @@ class MaskedGATLayer(nn.Module):
         attn = self.dropout(attn)
         attn = torch.where(any_valid.expand_as(attn), attn, torch.zeros_like(attn))
 
+        if self.store_attn:
+            self._last_attn = attn.detach()                                     # [B, N, K, H]
         out = (attn.unsqueeze(-1) * v_nbr).sum(dim=2)                            # [B, N, H, D]
         out = out.reshape(B, N, H * D)
         out = self.o_proj(out)                                                   # [B, N, out_dim]
@@ -97,6 +103,7 @@ class GATEncoder(nn.Module):
         self.layers = nn.ModuleList([MaskedGATLayer(d, d, n_heads=n_heads) for _ in range(n_layers)])
         self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
         self.act = nn.GELU()
+        self.last_attn: list | None = None   # inspector: per-layer [B,N,K,H] from last forward
         # MAPPO paper Tab.7 — orthogonal init across all GAT projections.
         apply_orthogonal(self)
 
@@ -109,9 +116,23 @@ class GATEncoder(nn.Module):
     ) -> torch.Tensor:
         h = self.input_proj(node_feat)
         h = h * node_valid.unsqueeze(-1).float()
+        attns = []
         for layer, norm in zip(self.layers, self.norms):
             res = h
             h = layer(h, edge_idx, edge_valid, node_valid)
+            if self.store_attn:
+                attns.append(layer._last_attn)
             h = norm(res + self.act(h))
             h = h * node_valid.unsqueeze(-1).float()
+        self.last_attn = attns if self.store_attn else None
         return h
+
+    @property
+    def store_attn(self) -> bool:
+        return getattr(self, "_store_attn", False)
+
+    @store_attn.setter
+    def store_attn(self, v: bool) -> None:
+        self._store_attn = bool(v)
+        for layer in self.layers:
+            layer.store_attn = bool(v)

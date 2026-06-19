@@ -3,8 +3,10 @@
     python scripts/trace_episode.py --ckpt runs/run/ckpt_020.pt --split test/hybrid \\
         --map-idx 167 --steps 120 --out runs/run
 
-Writes runs/run/traces/<tag>/ + traces/index.json + inspector.html. Then:
-    cd runs/run && python -m http.server 8000  → http://localhost:8000/inspector.html
+Writes runs/run/traces/<tag>/ + traces/index.json + inspector.html.
+In Docker the web server is already running on :8080; just open:
+    http://localhost:8080/run/inspector.html
+Outside Docker: cd runs/run && python -m http.server 8080
 """
 from __future__ import annotations
 
@@ -60,7 +62,7 @@ def main() -> None:
     tag = args.tag or f"{args.ckpt.stem}_m{args.map_idx}"
     capture_trace(model, split, env_peek, args.n_agents, args.map_idx,
                   args.steps, args.out, tag, args.device)
-    print(f"[view] cd {args.out} && python -m http.server 8000  → http://localhost:8000/inspector.html")
+    print(f"[view] http://localhost:8080/{args.out.name}/inspector.html  (Docker already serves runs/ on :8080)")
 
 
 if __name__ == "__main__":

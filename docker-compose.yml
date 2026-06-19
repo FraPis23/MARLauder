@@ -22,9 +22,15 @@ services:
     # shared memory ampia per torch dataloader / multiprocessing
     ipc: host
     shm_size: "8gb"
+    ports:
+      - "8080:8080"
     stdin_open: true
     tty: true
-    command: sleep infinity
+    # Web UI: index at http://localhost:8080/ lists all runs; each run's inspector at
+    # http://localhost:8080/<run_name>/inspector.html  (traces/index.json resolves relatively).
+    command: >
+      bash -c "python viz/web_server.py &
+               sleep infinity"
 
 volumes:
   warp-cache:

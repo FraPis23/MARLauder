@@ -12,8 +12,9 @@
   #bar{display:flex;gap:8px;align-items:center;padding:8px 10px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
   #stage{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#05070b;padding:10px}
   canvas{image-rendering:auto;box-shadow:0 0 0 1px #2a3242;border-radius:3px}
-  button,select{background:#222a38;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:4px 9px;cursor:pointer;font:inherit}
-  button:hover{border-color:var(--accent)}
+  button,select,a#home{background:#222a38;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:4px 9px;cursor:pointer;font:inherit}
+  button:hover,a#home:hover{border-color:var(--accent);color:var(--accent)}
+  a#home{text-decoration:none}
   input[type=range]{flex:1;min-width:160px}
   .pill{padding:2px 7px;border-radius:10px;background:#222a38;border:1px solid var(--line)}
   .on{color:var(--ok);border-color:var(--ok)}
@@ -26,20 +27,40 @@
   .bar8{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;width:100%;max-width:300px}
   .cell{height:46px;border:1px solid var(--line);border-radius:5px;display:flex;align-items:center;justify-content:center;
         font-size:14px;font-weight:600;position:relative;overflow:hidden;background:#0e1118;color:#eef3fb}
-  .cell .fill{position:absolute;left:0;bottom:0;width:100%;z-index:0}
+  .cell .fill{position:absolute;left:0;width:100%;z-index:0}
+  .cell .zero{position:absolute;left:0;top:50%;width:100%;height:1px;background:#5b677e;opacity:.7;z-index:0}
   .cell .val{position:relative;z-index:1;text-shadow:0 1px 3px #000,0 0 2px #000}
   .cell .gpf{position:absolute;top:2px;right:4px;z-index:1;font-size:11px;color:#fff;text-shadow:0 0 3px #000}
   .cell.mid{background:#11151d;color:#3a455c;font-weight:400}
   .cell.masked{opacity:.35}
   .cell.chosen{outline:2px solid var(--ok);outline-offset:-2px}
+  .cell.sel{outline:2px solid #fff;outline-offset:-2px}
+  .cell:not(.masked):not(.mid){cursor:pointer}
   .neg{color:var(--warn)} .pos{color:var(--ok)}
   #hint{color:var(--dim);font-size:11px}
   .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+  /* multi-agent (small-multiples) view */
+  #multi{flex:1;display:none;grid-auto-rows:1fr;gap:10px;padding:10px;overflow:auto}
+  .mcell{position:relative;background:#05070b;border:1px solid #2a3242;border-radius:4px;display:flex;flex-direction:column;min-height:0}
+  .mcell canvas{flex:1;min-height:0;width:100%;object-fit:contain}
+  .mcap{position:absolute;top:4px;left:6px;font-size:11px;font-weight:600;padding:1px 7px;border-radius:9px;background:rgba(5,7,11,.7);z-index:2}
+  .mcap .clink{font-weight:400;color:var(--ok)} .mcap .cno{font-weight:400;color:var(--dim)}
+  /* communication panel rows */
+  #comm td{padding:3px 4px}
+  .cdot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:middle}
+  /* per-feature logit attribution bars (diverging from a center line) */
+  .fbar{position:relative;height:11px;background:#11151d;border-radius:2px;overflow:hidden}
+  .fbar .z{position:absolute;left:50%;top:0;width:1px;height:100%;background:#5b677e;opacity:.6}
+  .fbar .f{position:absolute;top:0;height:100%}
+  .cstat{font-size:11px;padding:1px 7px;border-radius:9px}
+  .cstat.live{color:var(--ok);border:1px solid var(--ok);background:rgba(107,217,104,.1)}
+  .cstat.est{color:var(--amber);border:1px solid var(--amber);background:rgba(255,206,84,.1)}
 </style>
 </head>
 <body>
 <div id="left">
   <div id="bar">
+    <a href="/" id="home" title="back to runs index">← runs</a>
     <label>episode: <select id="episode"><option>—</option></select></label>
     <button id="reloadIdx" title="rescan traces/ folder">⟳</button>
     <button id="loadBtn">file…</button>
@@ -52,35 +73,118 @@
     <select id="agent"></select>
     <label>color: <select id="field">
       <option value="util">utility</option>
+      <option value="ub">util · boundary px</option>
+      <option value="uv">util · detectable vol</option>
       <option value="age">age</option>
       <option value="team">teammate_pot</option>
       <option value="gp">guidepost</option>
       <option value="bf">bf_dist→target</option>
     </select></label>
     <label><input type="checkbox" id="edges" checked/> edges</label>
+    <label><input type="checkbox" id="grid" checked/> ego grid</label>
+    <label>view: <select id="view">
+      <option value="single">single agent</option>
+      <option value="agents">all agents · local maps</option>
+    </select></label>
+    <label><input type="checkbox" id="teammates" checked/> teammates</label>
     <span id="hint">load a trace, then click a node</span>
   </div>
   <div id="stage"><canvas id="cv"></canvas></div>
+  <div id="multi"></div>
 </div>
 <div id="right">
   <h3>step / agent</h3>
   <table id="meta"></table>
+  <h3>communication</h3>
+  <table id="comm"></table>
+  <div id="commLegend" style="margin-top:6px;color:var(--dim);font-size:11px">
+    ● solid + green link = communicating (true pos) &nbsp;·&nbsp; ◌ dashed + “?” = estimate (last known)
+  </div>
   <h3>action logits (8 neighbors)</h3>
   <div class="bar8" id="bar8"></div>
   <div id="hint2" style="margin-top:6px;color:var(--dim)"></div>
+  <h3 id="attribTitle">logit · by feature</h3>
+  <table id="attrib"></table>
+  <div id="attribHint" style="margin-top:6px;color:var(--dim);font-size:11px"></div>
   <h3>reward breakdown (this step)</h3>
   <table id="reward"></table>
-  <h3>selected node</h3>
+  <h3 id="nodeTitle">selected node</h3>
   <table id="node"><tr><td class="k">—</td></tr></table>
 </div>
 <script>
-const A = { trace:null, dir:".", t:0, agent:0, field:"util", edges:true, sel:null, playing:false, img:new Image() };
+const A = { trace:null, dir:".", t:0, agent:0, field:"util", edges:true, grid:true, view:"single", teammates:true, sel:null, actSel:null, playing:false, img:new Image(), _rid:0 };
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
 const $ = id => document.getElementById(id);
+
+// Per-agent colors (used everywhere an agent is drawn/labelled).
+const ACOL = ["#4cc9f0","#ff6b6b","#6bd968","#ffce54","#b980f0","#ff9f40","#56d6c4","#f06ec0"];
+const acol = a => ACOL[a % ACOL.length];
 
 // K=8 neighbour offsets (dr,dc): NW N NE | W . E | SW S SE
 const KOFF = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
 const KGRID = [0,1,2,3,4,5,6,7];   // already 3x3 minus center order matches bar8 layout below
+
+// Draw agent `va`'s teammates onto ctx (map-pixel coords). The viewer's OWN position is
+// shown as a curr-ring + chosen-action arrow (drawSelf), not a filled dot — so we never
+// paint the agent somewhere it isn't. comm → teammate at TRUE pos, solid + live link;
+// no-comm → at the believed (estimate) pos, hollow/dashed + "?" (guessed vs known).
+function drawAgents(ctx, va, drawSelf){
+  const ag = curStep().agents[va];
+  if(A.teammates && ag.teammates) for(const tm of ag.teammates){
+    const c = acol(tm.j);
+    if(tm.comm){
+      const [tx,ty]=tm.true;
+      ctx.setLineDash([4,3]); ctx.strokeStyle="rgba(107,217,104,.85)"; ctx.lineWidth=1.4;
+      ctx.beginPath(); ctx.moveTo(ag.pos[0],ag.pos[1]); ctx.lineTo(tx,ty); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle=c; ctx.beginPath(); ctx.arc(tx,ty,5,0,6.283); ctx.fill();
+      ctx.lineWidth=1.6; ctx.strokeStyle="#fff"; ctx.stroke();
+      agentLabel(ctx,tx,ty,"A"+tm.j,c,false);
+    } else {
+      const [ex,ey]=tm.est;
+      ctx.setLineDash([3,3]); ctx.lineWidth=1.6; ctx.strokeStyle=c; ctx.globalAlpha=.65;
+      ctx.beginPath(); ctx.arc(ex,ey,6,0,6.283); ctx.stroke();          // hollow = estimate
+      ctx.globalAlpha=1; ctx.setLineDash([]);
+      ctx.fillStyle=c; ctx.globalAlpha=.7; ctx.font="bold 9px monospace";
+      ctx.fillText("?",ex-2,ey+3); ctx.globalAlpha=1;
+      agentLabel(ctx,ex,ey,"A"+tm.j+"≈",c,true);
+    }
+  }
+  // Own agent: curr-ring at its actual position + arrow to the chosen next cell (multi-view
+  // only; in single view drawNodes already draws the curr ring + action arrow).
+  if(drawSelf) drawSelfMarker(ctx, ag, va);
+}
+function drawSelfMarker(ctx, ag, va){
+  const m=A.trace.meta, [px,py]=ag.pos;
+  // filled disc at the agent's ACTUAL current position + arrow to chosen next cell.
+  // Disc uses the agent's OWN palette color (acol) so identity is consistent across views.
+  ctx.fillStyle=acol(va); ctx.beginPath(); ctx.arc(px,py,6,0,6.283); ctx.fill();
+  ctx.lineWidth=1.4; ctx.strokeStyle="#fff"; ctx.stroke();
+  const act=ag.action;
+  if(act>=0&&act<8){ const o=KOFF[act], ex=px+o[1]*m.nr*0.9, ey=py+o[0]*m.nr*0.9;
+    ctx.strokeStyle=getCSS("--ok"); ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(ex,ey); ctx.stroke();
+    ctx.fillStyle=getCSS("--ok"); ctx.beginPath(); ctx.arc(ex,ey,3,0,6.283); ctx.fill(); }
+}
+// Egocentric observation window: the (2·n_hops+3)² lattice the GAT actually sees, centered
+// on the agent's current node (spacing = nr). Drawn faint — context, not focus. This is the
+// fixed receptive field, so it's shown whole even where cells fall off the map / get masked.
+function drawEgoGrid(ctx, ag){
+  if(!A.grid) return;
+  const m=A.trace.meta, nr=m.nr, win=m.win||(2*(m.n_hops||2)+3);
+  // centre on the agent's CURRENT node (grid-aligned) — never the chosen next cell.
+  const cn=(ag.nodes||[]).find(n=>n.i===ag.curr);
+  const cx=cn?cn.x:ag.pos[0], cy=cn?cn.y:ag.pos[1], half=win/2*nr;  // win odd → agent in centre cell
+  ctx.save(); ctx.strokeStyle="rgba(150,170,205,0.20)"; ctx.lineWidth=0.6; ctx.beginPath();
+  for(let i=0;i<=win;i++){ const off=(-win/2+i)*nr;
+    ctx.moveTo(cx-half, cy+off); ctx.lineTo(cx+half, cy+off);   // horizontal
+    ctx.moveTo(cx+off, cy-half); ctx.lineTo(cx+off, cy+half); } // vertical
+  ctx.stroke(); ctx.restore();
+}
+function agentLabel(ctx,x,y,txt,c,faded){
+  ctx.font="bold 9px ui-monospace,monospace"; ctx.globalAlpha=faded?.7:1;
+  ctx.fillStyle="rgba(5,7,11,.75)"; ctx.fillRect(x+6,y-13,txt.length*6+4,12);
+  ctx.fillStyle=c; ctx.fillText(txt,x+8,y-4); ctx.globalAlpha=1;
+}
 
 function ramp(t){ // 0..1 -> dim blue -> amber
   t=Math.max(0,Math.min(1,t)); const lo=[46,64,120], hi=[255,210,60];
@@ -92,12 +196,13 @@ function curStep(){ return A.trace.steps[A.t]; }
 function curAgent(){ return curStep().agents[A.agent]; }
 
 async function loadTrace(url){
+  resetGifCache();                                 // free decoded frames from the previous episode
   const r = await fetch(url); A.trace = await r.json();
   A.dir = url.substring(0, url.lastIndexOf("/")+1) || "./";
   $("slider").max = A.trace.steps.length-1;
   $("agent").innerHTML = "";
   for(let a=0;a<A.trace.meta.n_agents;a++){ const o=document.createElement("option"); o.value=a;o.text="agent "+a; $("agent").add(o);}
-  A.t=0; A.agent=0; render();
+  A.t=0; A.agent=0; A.actSel=null; A.sel=null; render();
   $("hint").textContent = `map ${A.trace.meta.map_idx} · ${A.trace.steps.length} steps · gate_eps=${A.trace.meta.gate_eps} · ${A.trace.meta.target_mode}`;
 }
 
@@ -122,9 +227,11 @@ function drawNodes(){
   let lo=1e9,hi=-1e9;
   for(const n of ag.nodes){ const v=fieldVal(n,A.field); if(v!==null){lo=Math.min(lo,v);hi=Math.max(hi,v);} }
   if(hi<=lo) hi=lo+1;
-  // edges
+  drawEgoGrid(ctx, ag);   // faint observation lattice under everything else
+  // edges = graph-lattice connectivity (each node ↔ its ≤8 neighbors); this is the graph
+  // the GAT passes messages over. Faint on purpose, but visible enough to toggle.
   if(A.edges){
-    ctx.strokeStyle="rgba(120,140,170,0.28)"; ctx.lineWidth=0.6;
+    ctx.strokeStyle="rgba(140,165,200,0.5)"; ctx.lineWidth=1;
     const pos={}; for(const n of ag.nodes) pos[n.i]=n;
     ctx.beginPath();
     for(const [s,d] of ag.edges){ const a=pos[s],b=pos[d]; if(a&&b){ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);} }
@@ -140,9 +247,10 @@ function drawNodes(){
   // target ring
   const tgt = ag.nodes.find(n=>n.i===ag.target);
   if(tgt){ ctx.strokeStyle=getCSS("--amber"); ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(tgt.x,tgt.y,9,0,6.283); ctx.stroke(); }
-  // curr ring + chosen-action arrow
+  // curr disc (filled, at actual current position) + chosen-action arrow
   const cur = ag.nodes.find(n=>n.i===ag.curr) || {x:ag.pos[0],y:ag.pos[1]};
-  ctx.strokeStyle=getCSS("--accent"); ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(cur.x,cur.y,7,0,6.283); ctx.stroke();
+  ctx.fillStyle=acol(A.agent); ctx.beginPath(); ctx.arc(cur.x,cur.y,6,0,6.283); ctx.fill();   // own palette color
+  ctx.lineWidth=1.4; ctx.strokeStyle="#fff"; ctx.stroke();
   const act=ag.action; if(act>=0&&act<8){ const o=KOFF[act]; const ex=cur.x+o[1]*m.nr*0.9, ey=cur.y+o[0]*m.nr*0.9;
     ctx.strokeStyle=getCSS("--ok"); ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(cur.x,cur.y); ctx.lineTo(ex,ey); ctx.stroke();
     ctx.fillStyle=getCSS("--ok"); ctx.beginPath();ctx.arc(ex,ey,3,0,6.283);ctx.fill(); }
@@ -151,54 +259,285 @@ function drawNodes(){
 }
 function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v); }
 
+// Per-agent episode = one animated GIF; seek to frame `fi`. WebCodecs ImageDecoder isn't in
+// every browser (e.g. Firefox), so we decode GIFs with a small built-in parser instead. Frames
+// are composited (disposal-aware) and cached. Legacy traces store ".png" paths → <img> fallback.
+const GIF = {};   // url -> { ready, parsed, octx, off, lastDrawn, prev, snap, frames:{fi:canvas} }
+function resetGifCache(){ for(const u in GIF) delete GIF[u]; }
+
+// --- minimal GIF87a/89a decoder: returns {width,height,frames:[{x,y,w,h,disposal,tIndex,palette,pixels,interlace}]}
+function parseGIF(buf){
+  const d=new Uint8Array(buf); let p=0;
+  const u16=()=>{ const v=d[p]|(d[p+1]<<8); p+=2; return v; };
+  if(String.fromCharCode(d[0],d[1],d[2])!=="GIF") throw new Error("not a GIF");
+  p=6; const width=u16(), height=u16(), packed=d[p++]; p+=2;  // skip bgIndex, aspect
+  let gct=null; const gctSize=2<<(packed&7);
+  if(packed&0x80){ gct=d.subarray(p,p+gctSize*3); p+=gctSize*3; }
+  const frames=[]; let disposal=0,tFlag=0,tIndex=0;
+  while(p<d.length){
+    const b=d[p++];
+    if(b===0x3B) break;                                   // trailer
+    if(b===0x21){                                         // extension
+      const label=d[p++];
+      if(label===0xF9){ const sz=d[p++]; const pk=d[p]; disposal=(pk>>2)&7; tFlag=pk&1; tIndex=d[p+3]; p+=sz; p++; }
+      else { while(d[p]!==0){ p+=d[p]+1; } p++; }         // skip sub-blocks
+    } else if(b===0x2C){                                  // image descriptor
+      const x=u16(),y=u16(),w=u16(),h=u16(),ip=d[p++];
+      let lct=gct, lsz=gctSize;
+      if(ip&0x80){ lsz=2<<(ip&7); lct=d.subarray(p,p+lsz*3); p+=lsz*3; }
+      const interlace=!!(ip&0x40);
+      const minCode=d[p++];
+      // gather LZW sub-blocks
+      let len=0,q=p; while(d[q]!==0){ len+=d[q]; q+=d[q]+1; }
+      const data=new Uint8Array(len); let o=0; while(d[p]!==0){ const n=d[p++]; data.set(d.subarray(p,p+n),o); o+=n; p+=n; } p++;
+      const pixels=lzw(minCode,data,w*h);
+      frames.push({x,y,w,h,disposal,tIndex:tFlag?tIndex:-1,palette:lct,pixels,interlace});
+      disposal=0;tFlag=0;tIndex=0;
+    } else break;
+  }
+  return {width,height,frames};
+}
+function lzw(minCode,data,npix){
+  const clear=1<<minCode, eoi=clear+1; let size=minCode+1, mask=(1<<size)-1;
+  let dict=[], out=new Uint8Array(npix), oi=0;
+  const reset=()=>{ dict=[]; for(let i=0;i<clear;i++)dict[i]=[i]; dict[clear]=[]; dict[eoi]=[]; size=minCode+1; mask=(1<<size)-1; };
+  reset();
+  let bit=0,prev=null;
+  const read=()=>{ let v=0; for(let i=0;i<size;i++){ const by=bit>>3, bo=bit&7; v|=((data[by]>>bo)&1)<<i; bit++; } return v; };
+  const total=data.length*8;
+  while(bit+size<=total){
+    let code=read();
+    if(code===clear){ reset(); prev=null; continue; }
+    if(code===eoi) break;
+    let entry;
+    if(code<dict.length) entry=dict[code];
+    else if(prev) entry=prev.concat(prev[0]);
+    else break;
+    for(let i=0;i<entry.length;i++){ if(oi<npix) out[oi++]=entry[i]; }
+    if(prev){ dict.push(prev.concat(entry[0])); if(dict.length-1===mask && size<12){ size++; mask=(1<<size)-1; } }
+    prev=entry;
+  }
+  return out;
+}
+function drawGifFrame(g, fi){               // composite frames 0..fi onto g.octx (incremental)
+  const fr=g.parsed.frames, W=g.parsed.width, H=g.parsed.height;
+  if(fi<g.lastDrawn){ g.octx.clearRect(0,0,W,H); g.lastDrawn=-1; g.prev=null; }
+  for(let i=g.lastDrawn+1;i<=fi;i++){
+    if(g.prev){ if(g.prev.disposal===2) g.octx.clearRect(g.prev.x,g.prev.y,g.prev.w,g.prev.h);
+                else if(g.prev.disposal===3 && g.snap) g.octx.putImageData(g.snap,0,0); }
+    const f=fr[i];
+    if(f.disposal===3) g.snap=g.octx.getImageData(0,0,W,H);
+    const img=new ImageData(f.w,f.h), pal=f.palette;
+    for(let q=0;q<f.pixels.length;q++){ const ci=f.pixels[q], o=q*4;
+      if(ci===f.tIndex){ img.data[o+3]=0; } else { img.data[o]=pal[ci*3]; img.data[o+1]=pal[ci*3+1]; img.data[o+2]=pal[ci*3+2]; img.data[o+3]=255; } }
+    if(f.interlace) deinterlace(img,f.w,f.h);
+    const tmp=document.createElement("canvas"); tmp.width=f.w; tmp.height=f.h;
+    tmp.getContext("2d").putImageData(img,0,0);
+    g.octx.drawImage(tmp,f.x,f.y);          // source-over → transparent pixels keep underlying
+    g.prev=f;
+  }
+  g.lastDrawn=fi;
+}
+function deinterlace(img,w,h){ const src=img.data.slice(); const rows=[];
+  for(let y=0;y<h;y+=8)rows.push(y); for(let y=4;y<h;y+=8)rows.push(y); for(let y=2;y<h;y+=4)rows.push(y); for(let y=1;y<h;y+=2)rows.push(y);
+  for(let i=0;i<rows.length;i++){ const dy=rows[i]; img.data.set(src.subarray(i*w*4,(i+1)*w*4), dy*w*4); } }
+
+async function frameImage(url, fi){
+  if(!url.endsWith(".gif")){ const im=new Image(); im.src=A.dir+url; await im.decode(); return im; }
+  let g=GIF[url];
+  if(!g){ g=GIF[url]={frames:{}, lastDrawn:-1, prev:null};
+    g.ready=fetch(A.dir+url).then(r=>r.arrayBuffer()).then(b=>{
+      g.parsed=parseGIF(b);
+      g.off=document.createElement("canvas"); g.off.width=g.parsed.width; g.off.height=g.parsed.height;
+      g.octx=g.off.getContext("2d",{willReadFrequently:true});
+    });
+  }
+  await g.ready;
+  const n=g.parsed.frames.length, idx=Math.max(0,Math.min(n-1,fi));
+  if(!(idx in g.frames)){ drawGifFrame(g, idx);
+    const c=document.createElement("canvas"); c.width=g.parsed.width; c.height=g.parsed.height;
+    c.getContext("2d").drawImage(g.off,0,0); g.frames[idx]=c;   // snapshot composited frame
+  }
+  return g.frames[idx];
+}
 function render(){
   if(!A.trace) return;
-  fitCanvas();
-  const ag=curAgent();
-  A.img.onload=()=>{ ctx.clearRect(0,0,cv.width,cv.height); ctx.drawImage(A.img,0,0); drawNodes(); };
-  A.img.src = A.dir + ag.frame + "?"+A.t;   // cache-bust per step
   $("slider").value=A.t; $("tlabel").textContent="t="+A.t; $("agent").value=A.agent;
+  const multi = A.view==="agents";
+  $("stage").style.display = multi?"none":"flex";
+  $("multi").style.display = multi?"grid":"none";
+  if(multi){ renderMulti(); panels(); return; }
+  fitCanvas();
+  const ag=curAgent(), tok=++A._rid;
+  frameImage(ag.frame, ag.fi||0).then(img=>{
+    if(tok!==A._rid) return;                                // a newer step superseded this draw
+    ctx.clearRect(0,0,cv.width,cv.height); ctx.drawImage(img,0,0,cv.width,cv.height);
+    drawNodes(); drawAgents(ctx,A.agent,false);
+  }).catch(e=>{
+    if(tok!==A._rid) return;
+    ctx.clearRect(0,0,cv.width,cv.height); ctx.fillStyle="#c66"; ctx.font="13px monospace";
+    ctx.fillText("frame decode failed: "+e.message, 12, 24); drawNodes(); drawAgents(ctx,A.agent,false);
+  });
   panels();
 }
 
+// All-agents view: one mini-canvas per agent showing ITS OWN local occupancy map +
+// its own position + its teammate beliefs (live or estimated). Rebuilds when the agent
+// count changes; redraws frames every step.
+function renderMulti(){
+  const m=A.trace.meta, st=curStep(), M=m.n_agents, host=$("multi");
+  host.style.gridTemplateColumns = `repeat(${M<=1?1:M<=4?2:3}, 1fr)`;
+  if(host.childElementCount!==M){
+    host.innerHTML="";
+    for(let a=0;a<M;a++){
+      const cell=document.createElement("div"); cell.className="mcell";
+      const cap=document.createElement("div"); cap.className="mcap"; cap.id="mcap"+a;
+      const c=document.createElement("canvas"); c.id="mcv"+a; c.width=m.W; c.height=m.H;
+      cell.append(cap,c); host.append(cell);
+      c.onclick=()=>{ A.agent=a; A.view="single"; $("view").value="single"; render(); };  // click a cell → focus it
+    }
+  }
+  const tok=++A._rid;
+  for(let a=0;a<M;a++){
+    const c=$("mcv"+a), cx=c.getContext("2d"), ag=st.agents[a];
+    frameImage(ag.frame, ag.fi||0).then(img=>{
+      if(tok!==A._rid) return;
+      cx.clearRect(0,0,c.width,c.height); cx.drawImage(img,0,0,c.width,c.height); drawAgentsInto(cx,a);
+    }).catch(()=>{});
+    // caption: agent id + comm status to each teammate
+    const links=(ag.teammates||[]).map(tm=>tm.comm
+      ?`<span class="clink">●A${tm.j}</span>`:`<span class="cno">≈A${tm.j}</span>`).join(" ");
+    $("mcap"+a).innerHTML=`<span style="color:${acol(a)}">A${a}</span> ${links}`;
+  }
+}
+// Mini-canvas overlay: teammates are the whole point of this view, so force them on
+// regardless of the toolbar checkbox (which only governs the single-agent canvas).
+function drawAgentsInto(cx,a){ const save=A.teammates; A.teammates=true; drawAgents(cx,a,true); A.teammates=save; }
+
 function panels(){
   const ag=curAgent();
-  $("meta").innerHTML = row("step",A.t)+row("agent",A.agent)+row("value",ag.value)
+  const term = !!curStep().terminal;
+  const banner = term
+    ? `<tr><td colspan=2 style="text-align:center;color:var(--ok);font-weight:600;padding:5px 0;border-bottom:1px solid var(--ok)">✓ EPISODE COMPLETE · full map (both agents)</td></tr>`
+    : "";
+  $("meta").innerHTML = banner + row("step",A.t)+row("agent",A.agent)+row("value",ag.value)
     +`<tr><td class=k>gate</td><td class=v><span class="pill ${ag.gate?'on':'off'}">${ag.gate?'STRATEGIC (local exhausted)':'LOCAL (climb)'}</span></td></tr>`
     +row("curr node",ag.curr)+row("target node",ag.target)+row("chosen action",ag.action);
-  // logits 3x3 (center blank). Dark cell + proportional fill bar + white value text =
-  // readable on any value (the old full-yellow background washed the text out).
+  // communication: per teammate, live (knows true pos) vs estimate (stale belief).
+  const tms=ag.teammates||[];
+  $("comm").innerHTML = tms.length ? tms.map(tm=>{
+    const live=!!tm.comm, p=live?tm.true:tm.est;
+    return `<tr><td><span class="cdot" style="background:${acol(tm.j)}"></span>agent ${tm.j}</td>
+      <td class=v><span class="cstat ${live?'live':'est'}">${live?'● communicating':'≈ estimate'}</span></td></tr>
+      <tr><td class=k style="padding-top:0">${live?'true pos':'believed pos'}</td>
+      <td class="v" style="padding-top:0;color:var(--dim)">${p[0]}, ${p[1]}</td></tr>`;
+  }).join("") : "<tr><td class=k>(single agent)</td></tr>";
+  // logits 3x3 (center blank). DIVERGING bar from the mid-line (= logit 0): positive grows
+  // UP (blue/green), negative grows DOWN (red). Sign = fill direction, magnitude = length.
+  // Symmetric scale by the max |logit| in the set so the bars are comparable.
   const cells=[0,1,2,3,null,4,5,6,7];
   const fin=ag.logits.filter(x=>x!==null && Math.abs(x)<9000);
-  let lo=Math.min(...fin), hi=Math.max(...fin); if(hi<=lo) hi=lo+1;
+  const scale=Math.max(1e-6, ...fin.map(Math.abs));
   $("bar8").innerHTML = cells.map(k=>{
     if(k===null) return `<div class="cell mid">·</div>`;
     const v=ag.logits[k], masked=!ag.action_mask[k];
-    const t=(v!==null&&Math.abs(v)<9000)?(v-lo)/(hi-lo):0;
-    const chosen=(k===ag.action), gp=ag.guidepost_dir[k]>0.01;
-    const fillc = chosen? getCSS('--ok') : '#3f6ea8';
-    const cls = `cell${masked?' masked':''}${chosen?' chosen':''}`;
-    return `<div class="${cls}" title="dir ${k} logit=${v}${masked?' [masked]':''}${gp?' [guidepost]':''}">
-      <div class="fill" style="height:${Math.round(t*100)}%;background:${fillc};opacity:.5"></div>
-      <span class="val">${v===null||Math.abs(v)>9000?'—':v.toFixed(2)}</span>${gp?'<span class="gpf">→</span>':''}</div>`;
+    const fin_v=(v!==null&&Math.abs(v)<9000);
+    const frac=fin_v?Math.max(-1,Math.min(1,v/scale)):0;     // [-1,1]; sign = direction
+    const h=Math.round(Math.abs(frac)*50);                    // % of half-cell height
+    const chosen=(k===ag.action), gp=ag.guidepost_dir[k]>0.01, sel=(k===A.actSel);
+    const posc = chosen? getCSS('--ok') : '#365275';          // positive: muted blue (green if chosen)
+    const negc = '#9c4a58';                                   // negative: muted red
+    const fillStyle = frac>=0
+      ? `bottom:50%;height:${h}%;background:${posc}`
+      : `top:50%;height:${h}%;background:${negc}`;
+    const cls = `cell${masked?' masked':''}${chosen?' chosen':''}${sel?' sel':''}`;
+    return `<div class="${cls}" data-k="${k}" title="dir ${k} logit=${v}${masked?' [masked]':''}${gp?' [guidepost]':''}">
+      <div class="zero"></div>
+      <div class="fill" style="${fillStyle};opacity:.55"></div>
+      <span class="val">${fin_v?v.toFixed(2):'—'}</span>${gp?'<span class="gpf">→</span>':''}</div>`;
   }).join("");
-  $("hint2").innerHTML = `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked &nbsp;·&nbsp; bar = logit height`;
-  // reward
-  const rw=ag.reward||{}; let html="";
-  for(const k of Object.keys(rw)){ const v=rw[k]; html+=`<tr><td class=k>${k}</td><td class="v ${v<0?'neg':v>0?'pos':''}">${v===null?'·':v.toFixed(4)}</td></tr>`; }
+  $("hint2").innerHTML = `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked &nbsp;·&nbsp; <b>click a cell</b> → breakdown below`
+    + `<br>bar diverges from mid-line: <span style="color:#365275">▲ positive (up)</span> &nbsp; <span style="color:#9c4a58">▼ negative (down)</span>`;
+  // reward — component terms first, then a separator, then `total` as the sum result.
+  const rw=ag.reward||{};
+  const cell=(k,v)=>`<tr><td class=k>${k}</td><td class="v ${v<0?'neg':v>0?'pos':''}">${v===null?'·':v.toFixed(4)}</td></tr>`;
+  let html="";
+  for(const k of Object.keys(rw)){ if(k==="total") continue; html+=cell(k,rw[k]); }
+  if("total" in rw){
+    html+=`<tr><td colspan=2 style="border-bottom:1px solid var(--line);padding:0"></td></tr>`;
+    html+=`<tr><td class=k style="font-weight:600;color:var(--txt)">total</td>`
+        + `<td class="v ${rw.total<0?'neg':rw.total>0?'pos':''}" style="font-weight:600">${rw.total===null?'·':rw.total.toFixed(4)}</td></tr>`;
+  }
   $("reward").innerHTML = html||"<tr><td class=k>—</td></tr>";
+  showAttrib();
   showNode();
 }
 function row(k,v){ return `<tr><td class=k>${k}</td><td class=v>${v}</td></tr>`; }
 
 function showNode(){
   const ag=curAgent();
-  if(A.sel==null){ $("node").innerHTML="<tr><td class=k>click a node</td></tr>"; return; }
+  const title=$("nodeTitle");
+  if(A.sel==null){ title.innerHTML="selected node"; $("node").innerHTML="<tr><td class=k>click a node</td></tr>"; return; }
   const n=ag.nodes.find(x=>x.i===A.sel);
-  if(!n){ $("node").innerHTML="<tr><td class=k>node not valid this step</td></tr>"; return; }
-  $("node").innerHTML = row("index",n.i)+row("xy",`${n.x}, ${n.y}`)+row("utility",n.util)
+  if(!n){ title.innerHTML="selected node"; $("node").innerHTML="<tr><td class=k>node not valid this step</td></tr>"; return; }
+  // index + global xy live in the title (these are render-graph coords, NOT in the obs the
+  // agent sees — it gets x_rel/y_rel within its ego window, not the absolute index/xy).
+  title.innerHTML = `selected node <span style="color:var(--txt);font-weight:400;text-transform:none;letter-spacing:0">`
+    + `· #${n.i} · (${n.x}, ${n.y})</span>`;
+  // utility seed = boundary-pixel ribbon × (FLOOR + (1−FLOOR)·detectable-volume), then diffused.
+  const ubv = n.ub!=null?row("&nbsp;&nbsp;↳ boundary px",n.ub):"";
+  const uvv = n.uv!=null?row("&nbsp;&nbsp;↳ detectable vol",n.uv):"";
+  $("node").innerHTML = row("utility (diffused)",n.util)+ubv+uvv
     +row("age",n.age)+row("teammate_pot",n.team)+row("guidepost",n.gp)+row("bf→target (nodes)",n.bf)
     + (n.i===ag.curr?row("•","CURR"):"") + (n.i===ag.target?row("•","TARGET"):"");
+}
+
+// Attribution for ONE clicked action-logit cell. For the clicked neighbor's OWN node features,
+// Integrated Gradients gives  weight_f = ∫∂logit/∂feat dα  (multiplier, independent of value)
+// and  product_f = weight_f · value_f  (this feature's contribution). The logit reconstructs as
+//   baseline (blank obs) + Σ product_f + other (rest of the ego window) = logit.
+function showAttrib(){
+  const ag=curAgent(), tEl=$("attribTitle"), aEl=$("attrib"), hEl=$("attribHint");
+  const names=A.trace.meta.feat_names||["x_rel","y_rel","utility","age","teammate_pot","guidepost"];
+  const k = (A.actSel!=null) ? A.actSel : ag.action;          // default = chosen action
+  if(k==null || k<0){ tEl.innerHTML="logit · by feature"; aEl.innerHTML="<tr><td class=k>click a logit cell above</td></tr>"; hEl.textContent=""; return; }
+  const node=(ag.curr_nbrs||[])[k];
+  const at=(ag.nbr_attrib||[]).find(x=>x.node===node);
+  tEl.innerHTML=`logit · by feature <span style="color:var(--txt);font-weight:400;text-transform:none;letter-spacing:0">· dir ${k}${at?` · logit = ${at.logit}`:''}</span>`;
+  if(!at || !at.wts){      // masked direction, or a stale trace without weight/product fields
+    aEl.innerHTML=`<tr><td class=k>${ag.action_mask&&!ag.action_mask[k]?'masked direction — no action logit':'no attribution for this cell'}</td></tr>`;
+    hEl.innerHTML=(at&&!at.wts)?`<span style="color:var(--warn)">⚠ STALE trace (no weight/product) — regenerate it.</span>`:"";
+    return;
+  }
+  const base=at.base||0, other=at.other||0;
+  const prodSum=at.prod.reduce((s,c)=>s+(c||0),0), recon=base+prodSum+other;
+  const wmax=Math.max(1e-6,...at.wts.map(x=>Math.abs(x||0)));
+  const wAbsTot=Math.max(1e-9, at.wts.reduce((s,c)=>s+Math.abs(c||0),0));   // for weight %
+  const wbar=(w)=>{ const t=Math.abs(w)/wmax*46, col=w>=0?'#365275':'#9c4a58';
+    const side=w>=0?`left:50%;width:${t}%`:`right:50%;width:${t}%`;
+    return `<td><div class="fbar"><div class="z"></div><div class="f" style="${side};background:${col}"></div></div></td>`; };
+  const num=(c,b)=>`<td class="v ${c<0?'neg':c>0?'pos':''}"${b?' style="font-weight:600"':''}>${c>=0?'+':''}${c.toFixed(3)}</td>`;
+  let rows=`<tr><td class=k>feature</td><td class=v>value</td><td class=v>weight</td><td style="width:30%">weight (bar)</td><td class=v>wt%</td><td class=v>product</td></tr>`;
+  for(let f=0;f<at.wts.length;f++){
+    const w=at.wts[f]||0, val=at.vals[f], p=at.prod[f]||0, pct=Math.abs(w)/wAbsTot*100;
+    rows+=`<tr><td class=k>${names[f]||('f'+f)}</td><td class=v>${val==null?'·':val.toFixed(2)}</td>`
+      +`<td class="v" style="opacity:.85">${w>=0?'+':''}${w.toFixed(3)}</td>${wbar(w)}`
+      +`<td class="v" style="opacity:.7">${pct.toFixed(0)}%</td>${num(p)}</tr>`;
+  }
+  // separator, then the terms that add up to the logit (product column = the additive value).
+  rows+=`<tr><td colspan=6 style="border-bottom:1px solid var(--line);padding:0"></td></tr>`;
+  const term=(label,v)=>`<tr><td class=k style="opacity:.75">${label}</td><td class=v>·</td><td class=v>·</td><td></td><td class=v>·</td>${num(v)}</tr>`;
+  rows+=term("baseline (blank obs)",base);
+  rows+=term("Σ products (this cell)",prodSum);
+  rows+=term("other window nodes",other);
+  const bad=Math.abs(recon-at.logit)>0.5;
+  rows+=`<tr><td class=k style="font-weight:600;color:var(--txt)">Σ = logit</td><td class=v>·</td><td class=v>·</td>`
+    +`<td style="text-align:right;opacity:.6;font-size:11px">${bad?'<span style="color:var(--warn)">recon '+recon.toFixed(2)+'≠</span>':'recon '+recon.toFixed(2)}</td>`
+    +`<td class=v>·</td><td class="v" style="font-weight:600">${at.logit.toFixed(3)}</td></tr>`;
+  aEl.innerHTML=rows;
+  hEl.innerHTML = bad
+    ? `<span style="color:var(--warn)">⚠ reconstruction ≠ logit — STALE trace. Regenerate it.</span>`
+    : `weight = ∫ ∂logit/∂feature (sensitivity, independent of the value) · product = weight × value (this feature's push on the logit) · wt% = share of total |weight|. baseline + Σ products + other = logit.`;
 }
 
 // node picking
@@ -209,6 +548,12 @@ cv.addEventListener("click",e=>{
   const ag=curAgent(); let best=null,bd=1e9;
   for(const n of ag.nodes){ const d=(n.x-x)**2+(n.y-y)**2; if(d<bd){bd=d;best=n.i;} }
   if(bd<400) { A.sel=best; render(); }
+});
+
+// Click an action-logit cell → show its by-feature breakdown (no map-node click needed).
+$("bar8").addEventListener("click",e=>{
+  const cell=e.target.closest(".cell"); if(!cell || cell.dataset.k==null) return;
+  A.actSel=parseInt(cell.dataset.k); blurActive(); panels();
 });
 
 $("loadBtn").onclick=()=>$("file").click();
@@ -222,9 +567,27 @@ $("slider").oninput=e=>{A.t=+e.target.value;render();};
 $("agent").onchange=e=>{A.agent=+e.target.value;render();};
 $("field").onchange=e=>{A.field=e.target.value;render();};
 $("edges").onchange=e=>{A.edges=e.target.checked;render();};
+$("grid").onchange=e=>{A.grid=e.target.checked;blurActive();render();};
+$("view").onchange=e=>{A.view=e.target.value;render();};
+$("teammates").onchange=e=>{A.teammates=e.target.checked;render();};
 $("play").onclick=()=>{ A.playing=!A.playing; $("play").textContent=A.playing?"⏸ Pause":"▶ Play";
   const tick=()=>{ if(!A.playing)return; if(A.t<A.trace.steps.length-1){A.t++;render();setTimeout(tick,180);} else A.playing=false,$("play").textContent="▶ Play"; }; tick(); };
-document.addEventListener("keydown",e=>{ if(e.key==="ArrowLeft")$("prev").click(); if(e.key==="ArrowRight")$("next").click(); });
+// A button/select keeps focus after a click, so Space/Enter would re-fire it instead of
+// our shortcuts. Blur it first, then handle the key. Enter is swallowed entirely.
+function blurActive(){ const a=document.activeElement; if(a&&a!==document.body&&a.blur) a.blur(); }
+document.addEventListener("keydown",e=>{
+  const tag=e.target.tagName;
+  if(e.key==="Enter"){ e.preventDefault(); blurActive(); return; }     // never re-trigger a focused control
+  if(tag==="SELECT"||tag==="INPUT") return;                            // let dropdowns/range work normally
+  if(e.key==="ArrowLeft"){ e.preventDefault(); blurActive(); $("prev").click(); }
+  else if(e.key==="ArrowRight"){ e.preventDefault(); blurActive(); $("next").click(); }
+  else if(e.key===" "){ e.preventDefault(); blurActive(); $("play").click(); }   // spacebar = play/pause
+});
+// Drop focus right after a button/select interaction so the keys work immediately after.
+document.addEventListener("mouseup",e=>{ const t=e.target; if(t&&(t.tagName==="BUTTON")) setTimeout(()=>t.blur(),0); });
+$("agent").addEventListener("change",()=>$("agent").blur());
+$("field").addEventListener("change",()=>$("field").blur());
+$("view").addEventListener("change",()=>$("view").blur());
 
 // ---- episode picker: read traces/index.json (written by training / trace_episode.py) ----
 async function loadIndex(){
@@ -234,7 +597,7 @@ async function loadIndex(){
     // sort by checkpoint % then map
     idx.sort((a,b)=> (a.tag<b.tag?-1:1));
     for(const e of idx){ const o=document.createElement("option"); o.value=e.tag;
-      o.text=`${e.tag}  (expl ${e.final_explored!=null?Math.round(e.final_explored*100)+'%':'?'}, ${e.n_steps} steps)`; sel.add(o); }
+      o.text=`${e.completed?'✓ ':''}${e.tag}  (expl ${e.final_explored!=null?Math.round(e.final_explored*100)+'%':'?'}, ${e.n_steps} steps)`; sel.add(o); }
     if(idx.length){ sel.value=idx[idx.length-1].tag; await loadTrace(`traces/${sel.value}/trace.json`); }
     $("hint").textContent=`${idx.length} episodes in traces/`;
     return true;

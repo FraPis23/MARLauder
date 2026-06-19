@@ -159,7 +159,7 @@ class StrategicHead(nn.Module):
 
 class MarlActorCritic(nn.Module):
     def __init__(self, n_agents: int = 1, d: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 gumbel_tau: float = 1.0, path_bias_floor: float = 1.5,
+                 gumbel_tau: float = 1.0,
                  switch_margin: float = 1.0, max_steps_on_option: int = 24,
                  disable_strategic: bool = False,
                  strategic_gate_eps: float = 0.0,
@@ -168,6 +168,12 @@ class MarlActorCritic(nn.Module):
         self.M = n_agents
         self.d = d
         self.gumbel_tau = gumbel_tau           # mutable; trainer anneals via attribute assignment
+        # Inspector hook: when True, act() stashes the pointer-attention logits + the (now
+        # purely visual) guidepost first-hop direction into self._dbg_logits. The guidepost is
+        # NO LONGER added to the logits — path_bias removed; the model must learn to follow it
+        # via node_feat[5] / the actor-input direction. Off in training → zero cost.
+        self.store_logit_components = False
+        self._dbg_logits: dict | None = None
         # Phase 3 — single-pointer ablation. When True the StrategicHead is bypassed: the actor
         # uses a zero strategic embedding + the env guidepost (BF first-hop toward nearest
         # frontier) as both the actor-input direction and the action-logit bias (ARIADNE/IR2
@@ -182,8 +188,8 @@ class MarlActorCritic(nn.Module):
         self.max_steps_on_option = max_steps_on_option
         # Strategic-head GATE. The StrategicHead + BF path-bias are meant to be HIGH-LEVEL: a
         # distant frontier target consulted only when the local ego window is exhausted. When
-        # strategic_gate_eps > 0, the head's influence (strategic_emb + next-hop dir + path_bias)
-        # is zeroed per-agent on any step where the max utility inside the ego window ≥ eps —
+        # strategic_gate_eps > 0, the head's influence (strategic_emb + next-hop dir in the
+        # actor input) is zeroed per-agent on any step where max utility inside the ego window ≥ eps —
         # i.e. while the local GAT still sees nearby gain the actor climbs it greedily, and the
         # strategic pick only steers the actor once no local utility remains. eps == 0 disables
         # the gate (legacy behavior — head always influences), so old checkpoints are unchanged.
@@ -200,12 +206,10 @@ class MarlActorCritic(nn.Module):
         self.actor_pre = nn.Linear(2 * d + 2 * K, d)
         self.gru_actor = nn.GRUCell(d, d)
         self.pointer = PointerHead(d)
-        # I.3 — bias on action logits toward BF first-hop of strategic target.
-        # effective = path_bias_floor (fixed) + softplus(path_bias_learn). The floor keeps a
-        # persistent prior toward the model's own chosen target so the grid-utility pointer
-        # signal cannot fully suppress target-following; learnable part adds headroom.
-        self.register_buffer("path_bias_floor", torch.tensor(float(path_bias_floor)), persistent=False)
-        self.path_bias_learn = nn.Parameter(torch.tensor(0.5))
+        # I.3 path_bias REMOVED: the hard BF-first-hop bias on action logits is gone. The
+        # guidepost is left as a learnable signal only (node_feat[5] in the GAT encoder + the
+        # strategic next-hop direction in the actor input); the actor must learn to choose
+        # nodes from it rather than being pushed by an additive logit term.
         # Critic head (CTDE)
         self.critic_pre = nn.Sequential(nn.Linear(n_agents * d + CRITIC_GLOBAL_DIM, d), nn.GELU())
         self.gru_critic = nn.GRUCell(d, d)
@@ -227,11 +231,6 @@ class MarlActorCritic(nn.Module):
         apply_orthogonal(self)
         orthogonal_(self.strategic_head.score, gain=0.01)   # strategic target logits
         orthogonal_(self.critic_head[-1], gain=1.0)         # V(s) output
-
-    @property
-    def path_bias(self) -> torch.Tensor:
-        """I.3 — effective path-following bias: fixed floor + non-negative learnable extra."""
-        return self.path_bias_floor + torch.nn.functional.softplus(self.path_bias_learn)
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -410,25 +409,39 @@ class MarlActorCritic(nn.Module):
         )
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)              # [B, d]
-        logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
-        if self.disable_strategic or self.target_mode == "analytic":
-            # Bias toward the (analytic / nearest-frontier) guidepost first-hop, gated by local
-            # utility so it only steers once the ego window is exhausted.
-            gp = obs["guidepost_nbr_bias"].reshape(B, K)
-            if gate is not None:
-                gp = gp * gate
-            logits = logits + self.path_bias * gp
-        else:
-            # G.3.c — soft bias toward BF first-hop of strategic pick.
-            cand_bf_first_hop = obs.get("cand_bf_first_hop")
-            if cand_bf_first_hop is not None:
-                cbfh = cand_bf_first_hop.reshape(B, -1, K)                                 # [B, K_cand, K=8]
-                chosen_hop = torch.gather(
-                    cbfh, dim=1, index=target_idx.view(B, 1, 1).expand(-1, 1, K)
-                ).squeeze(1)                                                                # [B, K=8]
-                if gate is not None:
-                    chosen_hop = chosen_hop * gate
-                logits = logits + self.path_bias * chosen_hop
+        pointer_logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
+        logits = pointer_logits
+        # path_bias REMOVED — guidepost first-hop is no longer added to the logits. The block
+        # below runs ONLY for the inspector (store_logit_components) to visualize the guidepost
+        # direction; it does NOT influence the action distribution and is skipped in training.
+        if self.store_logit_components:
+            path_hop = logits.new_zeros(B, K)
+            if self.disable_strategic or self.target_mode == "analytic":
+                gp = obs["guidepost_nbr_bias"].reshape(B, K)
+                path_hop = gp * gate if gate is not None else gp
+            else:
+                cand_bf_first_hop = obs.get("cand_bf_first_hop")
+                if cand_bf_first_hop is not None:
+                    cbfh = cand_bf_first_hop.reshape(B, -1, K)                              # [B, K_cand, K=8]
+                    chosen_hop = torch.gather(
+                        cbfh, dim=1, index=target_idx.view(B, 1, 1).expand(-1, 1, K)
+                    ).squeeze(1)                                                            # [B, K=8]
+                    path_hop = chosen_hop * gate if gate is not None else chosen_hop
+        # Inspector: stash the pointer logits + guidepost direction (no longer an additive term).
+        if self.store_logit_components:
+            # Encoder neighbor-attention from this forward: per layer [N, M, N_max, K, H].
+            enc_attn = None
+            if getattr(self.encoder, "last_attn", None) is not None:
+                enc_attn = [a.view(N, M, a.shape[-3], a.shape[-2], a.shape[-1])
+                            for a in self.encoder.last_attn]
+            self._dbg_logits = {
+                "pointer":   pointer_logits.detach().view(N, M, K),   # GAT pointer attention score
+                "path_hop":  path_hop.detach().view(N, M, K),         # guidepost first-hop one-hot (gated) — NOT added to logits
+                "path_term": torch.zeros(N, M, K, device=logits.device),  # path_bias removed → no logit contribution
+                "path_bias": 0.0,                                     # path_bias removed
+                "gate":      (gate.detach().view(N, M) if gate is not None else None),
+                "enc_attn":  enc_attn,                                 # GAT per-layer neighbor attention
+            }
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
@@ -494,21 +507,7 @@ class MarlActorCritic(nn.Module):
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self.gru_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
-        if self.disable_strategic or self.target_mode == "analytic":
-            if "guidepost_nbr_bias" in obs:
-                gp = obs["guidepost_nbr_bias"].reshape(B, K)
-                if gate is not None:
-                    gp = gp * gate
-                logits = logits + self.path_bias * gp
-        else:
-            # G.3.c — soft path bias on action logits, indexed by stored strategic pick.
-            cand_bf_first_hop = obs.get("cand_bf_first_hop")
-            if cand_bf_first_hop is not None and sc is not None:
-                cbfh = cand_bf_first_hop.reshape(B, -1, K)
-                chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
-                if gate is not None:
-                    chosen_hop = chosen_hop * gate
-                logits = logits + self.path_bias * chosen_hop
+        # path_bias REMOVED — no additive guidepost/BF-first-hop term on the action logits.
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
@@ -617,18 +616,7 @@ class MarlActorCritic(nn.Module):
         h_act_out = self.gru_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs.reshape(B, K, self.d),
                               action_mask.reshape(B, K))
-        if self.disable_strategic or self.target_mode == "analytic":
-            if gp_flat is not None:
-                gp_b = gp_flat * gate if gate is not None else gp_flat
-                logits = logits + self.path_bias * gp_b
-        elif cand_bf_first_hop is not None:
-            # G.3.c — soft path bias using stored strategic pick.
-            cbfh = cand_bf_first_hop.reshape(B, -1, K)
-            sc = stored_choice.reshape(B)
-            chosen_hop = torch.gather(cbfh, dim=1, index=sc.view(B, 1, 1).expand(-1, 1, K)).squeeze(1)
-            if gate is not None:
-                chosen_hop = chosen_hop * gate
-            logits = logits + self.path_bias * chosen_hop
+        # path_bias REMOVED — no additive guidepost/BF-first-hop term on the action logits.
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)

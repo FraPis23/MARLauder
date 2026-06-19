@@ -391,6 +391,14 @@ class GraphLattice:
             "curr_nbr": curr_nbr,
             "curr_nbr_valid": curr_nbr_valid,
             "utility": utility_norm,
+            # Inspector decomposition of the utility seed (pre-diffusion, per node) — these are
+            # references to tensors already computed above, so they add ZERO training compute
+            # (only read when store_render_global, and the trace iterates valid nodes only):
+            #   util_boundary = fr_frac  → frontier-ribbon length (BOUNDARY pixels)
+            #   util_volume   = vol      → fraction of sensor disk that is UNKNOWN (DETECTABLE cells)
+            # f_ind = fr_frac · (FRONTIER_FLOOR + (1−FLOOR)·vol); utility_norm diffuses f_ind.
+            "util_boundary": fr_frac,
+            "util_volume":   vol,
             "edge_valid_optim": edge_valid_optim,   # [N,N_max,K] or None (M==1 / flag off)
         }
 

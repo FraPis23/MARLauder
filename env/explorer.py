@@ -1376,11 +1376,18 @@ class Explorer:
         # ---- Render-global stash (eval/debug only) — full-graph utility/validity for the GIF,
         # since obs ships only the ego window. Gated so training pays nothing. ----
         if self.store_render_global:
+            # comm_mask is None on the reset-time refresh (the None→eye default runs later);
+            # fall back to self-only so the stash never dereferences None.
+            cm_stash = comm_mask if comm_mask is not None else torch.eye(
+                self.M, dtype=torch.bool, device=self.dev).unsqueeze(0).expand(self.N, self.M, self.M)
             self._render_global = {
                 "node_xy":    self.graph.node_xy,                                              # [N_max, 2] static
                 "edge_idx":   self.graph.edge_idx_static,                                      # [N_max, K] static
                 "window_idx_table": self.graph.window_idx_table,                               # [N_max, W²] global idx (-1 pad)
                 "utility":    torch.stack([infos[a]["utility"]    for a in range(self.M)], 1),  # [N, M, N_max]
+                # Utility decomposition (boundary-pixel ribbon vs revealable-volume) per node.
+                "util_boundary": torch.stack([infos[a]["util_boundary"] for a in range(self.M)], 1),  # [N, M, N_max]
+                "util_volume":   torch.stack([infos[a]["util_volume"]   for a in range(self.M)], 1),  # [N, M, N_max]
                 "node_valid": torch.stack([infos[a]["node_valid"] for a in range(self.M)], 1),  # [N, M, N_max]
                 "edge_valid": torch.stack([infos[a]["edge_valid"] for a in range(self.M)], 1),  # [N, M, N_max, K]
                 "curr_idx":   torch.stack([infos[a]["curr_idx"]   for a in range(self.M)], 1),  # [N, M] GLOBAL node
@@ -1389,6 +1396,12 @@ class Explorer:
                 "node_feat":  torch.stack([infos[a]["node_feat"]  for a in range(self.M)], 1),  # [N, M, N_max, F]
                 "target":     self._prev_target_node.clone(),                                   # [N, M] GLOBAL target node
                 "guidepost_dist": torch.stack([infos[a]["guidepost_dist"] for a in range(self.M)], 1),  # [N, M, N_max]
+                # Inspector: teammate visibility. pos = ground-truth xy; last_known_pos[i,j] =
+                # i's belief of j (fresh when comm, else stale estimate); comm_mask[i,j] = i&j
+                # exchanging this step (→ belief == truth). Lets the viewer draw known vs guessed.
+                "pos":            self.pos.clone(),                                              # [N, M, 2]
+                "last_known_pos": self.last_known_pos.clone(),                                   # [N, M, M, 2]
+                "comm_mask":      cm_stash.clone(),                                              # [N, M, M] bool
             }
 
         # ---- Pass 3: extract per-agent local window ----
