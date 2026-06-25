@@ -391,6 +391,9 @@ class GraphLattice:
             "curr_nbr": curr_nbr,
             "curr_nbr_valid": curr_nbr_valid,
             "utility": utility_norm,
+            # util_raw = f_ind: PRE-diffusion frontier seed (nonzero ONLY on true frontier nodes).
+            # Experimental: feed to select_target_analytic instead of the diffused utility_norm.
+            "util_raw": f_ind,
             # Inspector decomposition of the utility seed (pre-diffusion, per node) — these are
             # references to tensors already computed above, so they add ZERO training compute
             # (only read when store_render_global, and the trace iterates valid nodes only):
@@ -733,6 +736,11 @@ class GraphLattice:
         prev_target: torch.Tensor | None = None,  # [N] last step's committed target (-1 none)
         curr_idx: torch.Tensor | None = None,      # [N] curr node — safe fallback when no frontier
         keep_margin: float = 0.2,     # commit: keep prev unless best beats it by >this fraction
+        exclude: torch.Tensor | None = None,  # [N, N_max] bool: nodes a teammate out-ranked → drop
+        d_team_min: torch.Tensor | None = None,  # [N, N_max] BF dist NEAREST teammate→node (ownership)
+        sep_w: float = 0.0,           # separation strength ∈[0,1] (0 = off)
+        sep_k: float = 2.0,           # ownership-gate sigmoid sharpness (per hop)
+        sep_m: float = 0.0,           # margin: hops a teammate must be closer before I yield
     ) -> torch.Tensor:
         """Deterministic global target = the frontier that maximizes
 
@@ -753,7 +761,25 @@ class GraphLattice:
             dt = torch.where(torch.isfinite(dt), dt, torch.full_like(dt, 1.0e6))
             rdv = 1.0 / (1.0 + beta * dt)
             score = explore * (1.0 + lam * w.unsqueeze(-1) * rdv)
+        # Separation / ownership: down-weight frontiers a teammate is closer to (division of labor).
+        # adv > 0 → I'm closer (mine) → gate≈1; adv < 0 → teammate closer → gate≈0 → score scaled
+        # down by (1 − sep_w). One-sided (never negative → no repulsion); single-frontier still wins
+        # the argmax (only down-weighted, not zeroed → no idle).
+        if d_team_min is not None and sep_w > 0.0:
+            dtm = d_team_min / nr
+            dtm = torch.where(torch.isfinite(dtm), dtm, torch.full_like(dtm, 1.0e6))
+            adv = dtm - dc                                                 # hops; >0 = mine
+            own_gate = torch.sigmoid(sep_k * (adv - sep_m))               # ∈(0,1)
+            score = score * (1.0 - sep_w * (1.0 - own_gate))
         elig = node_valid & (utility > 0.0)
+        if curr_idx is not None:
+            # Exclude the node the agent is ON: even if it's still a frontier (unknown within NR
+            # due to range/occlusion), staying re-scans nothing — the agent must MOVE toward the
+            # unknown. Zero distance (dc=0) would otherwise let curr win the argmax → self-target.
+            node_idx = torch.arange(self.N_max, device=utility.device).view(1, -1)
+            elig = elig & (node_idx != curr_idx.unsqueeze(1))
+        if exclude is not None:
+            elig = elig & ~exclude                                         # drop teammate-claimed nodes
         masked = torch.where(elig, score, torch.full_like(score, 0.0))     # 0 = ineligible (scores>0)
         best_idx = masked.argmax(dim=-1)                                   # [N]
         best_val = masked.gather(1, best_idx.unsqueeze(1)).squeeze(1)      # [N]

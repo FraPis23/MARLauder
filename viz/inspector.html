@@ -106,7 +106,7 @@
   <h3 id="attribTitle">logit · by feature</h3>
   <table id="attrib"></table>
   <div id="attribHint" style="margin-top:6px;color:var(--dim);font-size:11px"></div>
-  <h3>reward breakdown (this step)</h3>
+  <h3>reward breakdown (received entering this step)</h3>
   <table id="reward"></table>
   <h3 id="nodeTitle">selected node</h3>
   <table id="node"><tr><td class="k">—</td></tr></table>
@@ -459,7 +459,11 @@ function panels(){
   $("hint2").innerHTML = `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked &nbsp;·&nbsp; <b>click a cell</b> → breakdown below`
     + `<br>bar diverges from mid-line: <span style="color:#365275">▲ positive (up)</span> &nbsp; <span style="color:#9c4a58">▼ negative (down)</span>`;
   // reward — component terms first, then a separator, then `total` as the sum result.
-  const rw=ag.reward||{};
+  // Show the reward RECEIVED entering the current state = the reward of the PREVIOUS
+  // transition (step t-1's action). The trace records reward together with the state+action
+  // that produced it (s_t, a_t → r_t), so reading step t-1 aligns the number with the frame
+  // the user is looking at. t=0 has no prior transition → empty.
+  const rw=(A.t>0 ? ((A.trace.steps[A.t-1].agents[A.agent]||{}).reward||{}) : {});
   const cell=(k,v)=>`<tr><td class=k>${k}</td><td class="v ${v<0?'neg':v>0?'pos':''}">${v===null?'·':v.toFixed(4)}</td></tr>`;
   let html="";
   for(const k of Object.keys(rw)){ if(k==="total") continue; html+=cell(k,rw[k]); }

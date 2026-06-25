@@ -58,6 +58,12 @@ class EnvCfg:
     target_lambda: float = 1.0               # λ: rendezvous pull strength (0 = pure exploration)
     rdv_offer_frac: float = 0.15             # offer saturates (w→1) at this fraction of map cells gained since sync
     target_keep_margin: float = 0.2          # commit: keep last target unless a new one beats it by >this fraction
+    # Separation / ownership term (analytic target): down-weight frontiers a teammate is closer to,
+    # so agents spread to different regions (division of labor). own_gate = σ(k·(adv−m)), adv =
+    # (d_team_min − d_curr)/NR in hops; sep_mult = 1 − w·(1−own_gate). w=0 → off (today's behavior).
+    target_sep_weight: float = 0.5           # strength ∈[0,1]; 0 disables
+    target_sep_k: float = 2.0                # sigmoid sharpness (per hop)
+    target_sep_margin: float = 0.0           # hops a teammate must be closer before I yield
     progress_reward_coef: float = 0.3        # PBRS-style: reward per node-unit closer to the committed target
     analytic_target: bool = True             # env owns the deterministic global target (vs learned StrategicHead)
     num_sim_steps: int = 5
@@ -1271,6 +1277,10 @@ class Explorer:
         K_cand = int(self.cfg.top_k_candidates)
         infos: list[dict] = []
         cand_list: list[dict] = []
+        pref_targets: list[torch.Tensor] = []     # per-agent PRE-deconfliction analytic target
+        dteam_list: list = []                      # per-agent rendezvous anchor (re-select arg)
+        w_list: list = []                          # per-agent offer weight (re-select arg)
+        dteam_min_list: list = []                  # per-agent NEAREST-teammate BF dist (separation arg)
         for a in range(self.M):
             occ_a      = self.world.occupancy_torch[:, a, :, :]
             frontier_a = compute_frontier(occ_a)
@@ -1306,6 +1316,7 @@ class Explorer:
             # converge for a map exchange (self-limiting: fusion on contact resets offer→0).
             d_team_star = None
             w_offer = None
+            d_team_min = None
             if self.M > 1:
                 # offer_j = explored cells I gained since I last synced with j (j lacks them).
                 own_expl_now = (occ_a != _UNKNOWN).view(self.N, -1).sum(-1).float()         # [N]
@@ -1318,14 +1329,85 @@ class Explorer:
                 d_team_star = info["bf_dist_team"].gather(
                     1, j_star.view(self.N, 1, 1).expand(-1, 1, self.N_max)
                 ).squeeze(1)                                                               # [N, N_max]
-            new_target = self.graph.select_target_analytic(
-                info["utility"], info["node_valid"], bf_dist_from_curr,
+                # NEAREST teammate BF reach per node (self slot = +inf in Pass 1) — ownership signal.
+                d_team_min = info["bf_dist_team"].min(dim=1).values                        # [N, N_max]
+            # Preferred analytic target (PRE-deconfliction). Guidepost + commitment bookkeeping
+            # are DEFERRED until after the intra-step target deconfliction below, so they reflect
+            # the FINAL target (a teammate may out-rank this one and force a re-pick).
+            pref_target = self.graph.select_target_analytic(
+                info["util_raw"], info["node_valid"], bf_dist_from_curr,
                 d_team=d_team_star, w=w_offer,
                 beta=float(self.cfg.target_beta), lam=float(self.cfg.target_lambda),
                 prev_target=self._prev_target_node[:, a], curr_idx=info["curr_idx"],
                 keep_margin=float(self.cfg.target_keep_margin),
+                d_team_min=d_team_min, sep_w=float(self.cfg.target_sep_weight),
+                sep_k=float(self.cfg.target_sep_k), sep_m=float(self.cfg.target_sep_margin),
             )
-            # Guidepost (BF path) to the analytic target — warm-started on unchanged target.
+            pref_targets.append(pref_target)
+            dteam_list.append(d_team_star)
+            w_list.append(w_offer)
+            dteam_min_list.append(d_team_min)
+            infos.append(info)
+            cand_a = self.graph.extract_topk_candidates(
+                info["utility"], info["node_valid"], curr_xy=self.pos[:, a, :], K=K_cand,
+                bf_dist=bf_dist_from_curr,
+            )
+            # G.3.c — per-candidate BF first-hop slot (one-hot) on the BF-from-curr tree.
+            self._candidate_first_hop_onehot(info, cand_a, bf_parent_from_curr)
+            # H.3 / H.2 — per-candidate teammate-aware features (min BF dist + alt score).
+            self._candidate_team_features(info, cand_a, a, K_cand)
+            cand_list.append(cand_a)
+
+        # ---- Intra-step target deconfliction (arrival-time priority, lower-index tiebreak) ----
+        # Two agents that picked the SAME global target deadlock (both route to one node, collide,
+        # mutual-revert, never re-scan → frontier persists → re-pick same target forever). Resolve
+        # HERE, intra-step (so no 1-step-stale claim): the agent with the smaller BF reach cost to
+        # the contested node keeps it (arrives first); ties broken by lower index. The loser drops
+        # that node and re-selects a different frontier — UNLESS it has no other frontier (then both
+        # commit, never back down). Analytic mode only (env owns the target).
+        final_targets = [t.clone() for t in pref_targets]
+        if self.M > 1 and self.cfg.analytic_target:
+            exclude = [torch.zeros((self.N, self.N_max), dtype=torch.bool, device=self.dev)
+                       for _ in range(self.M)]
+
+            def _arrival(a: int, g: torch.Tensor) -> torch.Tensor:
+                # BF reach cost agent a → node g (+inf if unreachable). [N]
+                return infos[a]["bf_dist_from_curr"].gather(
+                    1, g.clamp(min=0).unsqueeze(1)).squeeze(1)
+
+            for _pass in range(self.M):           # bounded; cascades settle within M passes
+                for a in range(self.M):
+                    for b in range(self.M):
+                        if a == b:
+                            continue
+                        ta, tb = final_targets[a], final_targets[b]
+                        same = (ta == tb) & (ta >= 0)
+                        ca, cb = _arrival(a, ta), _arrival(b, tb)
+                        # a yields to b: b strictly closer, or equal cost and b lower index.
+                        a_yields = same & ((cb < ca) | ((cb == ca) & (b < a)))
+                        add = torch.zeros_like(exclude[a])
+                        add.scatter_(1, ta.clamp(min=0).unsqueeze(1), True)
+                        trial = exclude[a] | (add & a_yields.unsqueeze(1))
+                        re_t = self.graph.select_target_analytic(
+                            infos[a]["util_raw"], infos[a]["node_valid"],
+                            infos[a]["bf_dist_from_curr"],
+                            d_team=dteam_list[a], w=w_list[a],
+                            beta=float(self.cfg.target_beta), lam=float(self.cfg.target_lambda),
+                            prev_target=self._prev_target_node[:, a], curr_idx=infos[a]["curr_idx"],
+                            keep_margin=float(self.cfg.target_keep_margin), exclude=trial,
+                            d_team_min=dteam_min_list[a], sep_w=float(self.cfg.target_sep_weight),
+                            sep_k=float(self.cfg.target_sep_k), sep_m=float(self.cfg.target_sep_margin),
+                        )
+                        # Single-frontier guard: only yield if the re-pick is a REAL other frontier
+                        # (not the curr-node fallback) — else both commit, never back down.
+                        do_yield = a_yields & (re_t != infos[a]["curr_idx"])
+                        exclude[a] = exclude[a] | (add & do_yield.unsqueeze(1))
+                        final_targets[a] = torch.where(do_yield, re_t, final_targets[a])
+
+        # ---- Guidepost + commitment bookkeeping on the FINAL (deconflicted) target ----
+        for a in range(self.M):
+            info = infos[a]
+            new_target = final_targets[a]
             target_same = (new_target == self._target_prev[:, a]).unsqueeze(-1)            # [N, 1]
             dist_init = torch.where(
                 target_same.expand(-1, self.N_max),
@@ -1344,16 +1426,6 @@ class Explorer:
                     torch.zeros_like(self._steps_on_option[:, a]),
                 )
                 self._prev_target_node[:, a] = new_target
-            infos.append(info)
-            cand_a = self.graph.extract_topk_candidates(
-                info["utility"], info["node_valid"], curr_xy=self.pos[:, a, :], K=K_cand,
-                bf_dist=bf_dist_from_curr,
-            )
-            # G.3.c — per-candidate BF first-hop slot (one-hot) on the BF-from-curr tree.
-            self._candidate_first_hop_onehot(info, cand_a, bf_parent_from_curr)
-            # H.3 / H.2 — per-candidate teammate-aware features (min BF dist + alt score).
-            self._candidate_team_features(info, cand_a, a, K_cand)
-            cand_list.append(cand_a)
 
         # ---- Pass 2: cross-agent feat[4] = teammate-proximity POTENTIAL on GLOBAL node_feat ----
         # The old feat lit a SINGLE one-hot node nearest the teammate's last-known position.
