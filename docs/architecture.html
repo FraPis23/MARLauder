@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MARLauder — Architettura</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --mut:#8b949e;
+    --env:#1f6feb; --net:#2ea043; --train:#bc8cff; --bus:#d29922;
+    --line:#30363d; --edge:#6e7681;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{padding:18px 24px;border-bottom:1px solid var(--line)}
+  h1{margin:0;font-size:18px}
+  .sub{color:var(--mut);font-size:12px;margin-top:4px}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;padding:12px 24px;border-bottom:1px solid var(--line)}
+  .lg{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)}
+  .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
+  .wrap{padding:24px;display:flex;flex-direction:column;gap:0;align-items:center}
+  .lane{width:100%;max-width:1120px}
+  .laneTitle{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin:18px 0 8px}
+  .row{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;justify-content:center}
+  .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:10px 12px;min-width:150px;max-width:230px}
+  .box b{display:block;font-size:13px;margin-bottom:3px}
+  .box .io{color:var(--mut);font-size:11px;white-space:pre-line}
+  .box.env{border-left:3px solid var(--env)}
+  .box.net{border-left:3px solid var(--net)}
+  .box.train{border-left:3px solid var(--train)}
+  .bus{background:linear-gradient(90deg,#3a2d05,#241c04);border:1px dashed var(--bus);
+    border-radius:8px;padding:10px 14px;width:100%;max-width:1120px;text-align:center}
+  .bus b{color:var(--bus)}
+  .bus .io{color:#d8c79a;font-size:11px;white-space:pre-line;margin-top:4px}
+  .arrow{align-self:center;color:var(--edge);font-size:20px;padding:0 2px}
+  .down{color:var(--edge);font-size:22px;text-align:center;margin:6px 0}
+  .split{display:flex;gap:24px;width:100%;max-width:1120px;justify-content:center;flex-wrap:wrap}
+  .col{flex:1;min-width:300px;background:#11161d;border:1px solid var(--line);border-radius:10px;padding:14px}
+  .col h3{margin:0 0 10px;font-size:13px}
+  .col.actor h3{color:#2ea043}.col.critic h3{color:#58a6ff}
+  .note{color:var(--mut);font-size:11px;margin-top:6px}
+  .stack{display:flex;flex-direction:column;gap:6px}
+  .pill{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:12px}
+  .pill .t{color:var(--mut);font-size:11px}
+  .gone{opacity:.4;text-decoration:line-through;border-style:dashed!important}
+  .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px;vertical-align:middle}
+  .tag.cut{background:#3d1d1d;color:#ff7b72;border:1px solid #ff7b72}
+  .tag.keep{background:#13311c;color:#3fb950;border:1px solid #238636}
+  footer{color:var(--mut);font-size:11px;padding:16px 24px;border-top:1px solid var(--line)}
+  code{color:#79c0ff}
+</style>
+</head>
+<body>
+<header>
+  <h1>MARLauder — Architettura (v0.6, target analitico)</h1>
+  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO · GAT ego-centrico · planner BF analitico</div>
+</header>
+
+<div class="legend">
+  <span class="lg"><span class="dot" style="background:var(--env)"></span>Env / simulazione (GPU)</span>
+  <span class="lg"><span class="dot" style="background:var(--net)"></span>Rete (MarlActorCritic)</span>
+  <span class="lg"><span class="dot" style="background:var(--train)"></span>Training (MAPPO)</span>
+  <span class="lg"><span class="dot" style="background:var(--bus)"></span>Bus dati (interfaccia)</span>
+  <span class="lg"><span class="tag cut">CUT</span> rimosso con StrategicHead</span>
+  <span class="lg"><span class="tag keep">KEEP</span> resta</span>
+</div>
+
+<div class="wrap">
+
+  <!-- ENV PIPELINE -->
+  <div class="lane">
+    <div class="laneTitle">① Env — pipeline percezione → planning (per step, tutta su GPU)</div>
+    <div class="row">
+      <div class="box env"><b>WarpWorld</b><span class="io">in: pos [N,M,2]
+out: occupancy [N,M,H,W]
+LiDAR 720 raggi · log-odds · fuse_maps()</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>Frontier</b><span class="io">in: occupancy
+out: frontier [N,H,W]
+conv2d (FREE adiac. UNKNOWN)</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>GraphLattice.build</b><span class="io">out: node_feat[6], edge_idx[8],
+node_valid, utility
+lattice 8-vicini · reachability</span></div>
+    </div>
+    <div class="down">↓</div>
+    <div class="row">
+      <div class="box env"><b>Bellman-Ford</b><span class="io">bf_from_curr → dist/parent
+bf_from_teammate (optim graph)
+wall-aware, warm-started</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>select_target_analytic</b><span class="io">out: target_node [N]
+util/(1+β·d)·rdv·separation
+guidepost + next-hop dir</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>extract_local_window</b><span class="io">ritaglio ego (2·n_hops+3)²
+= ciò che la rete vede</span></div>
+      <span class="arrow">→</span>
+      <div class="box env gone"><b>extract_topk_candidates <span class="tag cut">CUT</span></b><span class="io">K=16 frontiere + cand_feat[9]
++ cand_bf_first_hop
+solo per StrategicHead</span></div>
+    </div>
+  </div>
+
+  <div class="down">↓ &nbsp; Explorer assembla obs</div>
+
+  <!-- OBS BUS -->
+  <div class="bus">
+    <b>BUS #1 — obs dict [N, M, …]</b> (env → modello)
+    <div class="io">node_feat[6] · edge_idx · node_valid · curr_idx · curr_nbr · action_mask · guidepost_nbr_bias(next-hop) · prev_action · pos · critic_global[4]
+<span style="color:#ff7b72">CUT: cand_feat · cand_valid · cand_xy · cand_bf_first_hop · cand_idx · committed_node · committed_steps</span></div>
+  </div>
+
+  <div class="down">↓</div>
+
+  <!-- ENCODER -->
+  <div class="lane">
+    <div class="laneTitle">② Rete — encoder condiviso</div>
+    <div class="row">
+      <div class="box net"><b>GATEncoder <span class="tag keep">KEEP</span></b><span class="io">in: node_feat,edge_idx,edge_valid,node_valid
+MaskedGAT × n_layers
+Residual+LayerNorm+GELU
+out: h [B,N_max,d] → gather:
+curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
+    </div>
+  </div>
+
+  <div class="down">↓ &nbsp; curr_emb &amp; nbr_embs (un solo forward, condiviso)</div>
+
+  <!-- ACTOR / CRITIC SPLIT -->
+  <div class="split">
+    <div class="col actor">
+      <h3>③a ACTOR — decentralizzato (vede solo il proprio grafo)</h3>
+      <div class="stack">
+        <div class="pill gone">StrategicHead <span class="tag cut">CUT</span><div class="t">MHA su K candidati · Gumbel-ST · commitment (switch_margin, max_steps_on_option) · strategic_emb</div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill">strategic_gate <span class="tag keep">KEEP</span><div class="t">se utility locale &gt; eps → azzera next-hop dir (climb locale)</div></div>
+        <div class="pill">actor_pre (Linear) <span class="tag keep">KEEP</span><div class="t">in: curr_emb ‖ next_hop_dir[8] ‖ prev_action[8] → d
+<span style="color:#ff7b72">(era: + strategic_emb)</span></div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill"><b>GRUCell (actor)</b> <span class="tag keep">KEEP</span><div class="t">memoria per-agente · stato [N,M,d]</div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill">PointerHead <span class="tag keep">KEEP</span><div class="t">query=h · keys=nbr_embs[8] · mask=action_mask → logits[8]</div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill"><b>Categorical → action [N,M]</b><div class="t">1 di 8 vicini</div></div>
+      </div>
+      <div class="note">Output: action, logp, entropy, hidden_actor. <span style="color:#ff7b72">CUT: target_choice, target_logits, target_argmax</span></div>
+    </div>
+
+    <div class="col critic">
+      <h3>③b CRITIC — CTDE (vede tutti gli agenti, solo in training)</h3>
+      <div class="stack">
+        <div class="pill">critic_pre (Linear+GELU) <span class="tag keep">KEEP</span><div class="t">in: concat_M(curr_emb) ‖ critic_global[4] → d</div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill"><b>GRUCell (critic)</b> <span class="tag keep">KEEP</span><div class="t">memoria valore congiunto · stato [N,d]</div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill">critic_head (MLP) <span class="tag keep">KEEP</span><div class="t">→ V(s) [N] scalare condiviso</div></div>
+      </div>
+      <div class="note">critic_global[4] = [explored_frac, t/T, geo_pair_dist, in_comm]. Buttato al deploy → nessun leak.</div>
+    </div>
+  </div>
+
+  <div class="down">↓ &nbsp; BUS #2 — act() output → buffer</div>
+
+  <!-- TRAINING -->
+  <div class="lane">
+    <div class="laneTitle">④ Training — MAPPO</div>
+    <div class="row">
+      <div class="box train"><b>Rollout buffer</b><span class="io">store T step [T,N,M,…]
++ h_actor/critic_init</span></div>
+      <span class="arrow">→</span>
+      <div class="box train"><b>compute_gae</b><span class="io">adv per-agente [T,N,M]
+ret_team [T,N] (V condiviso)</span></div>
+      <span class="arrow">→</span>
+      <div class="box train"><b>ValueNormalizer</b><span class="io">Welford mean/var
+spazio normalizzato</span></div>
+      <span class="arrow">→</span>
+      <div class="box train"><b>ppo_update</b><span class="io">encode_chunk (encoder 1×/chunk)
+evaluate_step_from_enc (TBPTT)
+clip + Huber V + entropy · AMP
+<span style="color:#ff7b72">CUT: _diversity_loss, div_coef</span></span></div>
+    </div>
+    <div class="note" style="text-align:center">∇ → aggiorna pesi del modello (loop: collect_rollout → ppo_update × n_iters)</div>
+  </div>
+
+  <!-- REWARD -->
+  <div class="lane">
+    <div class="laneTitle">Reward (per-agente, in env.step)</div>
+    <div class="row">
+      <div class="box env"><b>KEEP</b><span class="io">novel_scan (privilegiato) · team_delta
+give/recv (rendezvous) · progress (PBRS BF)
+overlap · revisit · stall · completion · step_pen</span></div>
+      <div class="box env gone"><b>CUT (learned-head-only)</b><span class="io">target_switch_pen (B+D branch-flip)
+yield_bonus (J.2)
+_objective_switch_and_yield()</span></div>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  Tre disaccoppiamenti: (1) il planner BF analitico decide il target, la rete fa solo controllo locale (interfaccia = next-hop dir + utility in node_feat);
+  (2) encoder condiviso, due teste (actor decentralizzato / critic centralizzato);
+  (3) <code>act()</code> (rollout, sampling) ≟ <code>evaluate_step_from_enc()</code> (update, replay) — stesso calcolo, due regimi.
+  &nbsp;·&nbsp; <span style="color:#ff7b72">CUT</span> = elementi vivi solo per la StrategicHead.
+</footer>
+</body>
+</html>

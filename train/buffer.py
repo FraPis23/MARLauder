@@ -32,10 +32,7 @@ class Rollout:
         N_max = sample_obs["node_feat"].shape[2]
         F = sample_obs["node_feat"].shape[3]
         K = sample_obs["edge_idx"].shape[3]
-        K_cand = sample_obs["cand_feat"].shape[2]
-        F_cand = sample_obs["cand_feat"].shape[3]
         self.N_max, self.F, self.K = N_max, F, K
-        self.K_cand, self.F_cand = K_cand, F_cand
 
         def _z(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -49,23 +46,14 @@ class Rollout:
             "curr_nbr":           _z((T, N, M, K),            torch.long),
             "curr_nbr_valid":     _z((T, N, M, K),            torch.bool),
             "action_mask":        _z((T, N, M, K),            torch.bool),
-            # Phase A v2 — strategic head inputs.
-            "cand_feat":          _z((T, N, M, K_cand, F_cand), torch.float32),
-            "cand_valid":         _z((T, N, M, K_cand),        torch.bool),
-            "cand_xy":            _z((T, N, M, K_cand, 2),     torch.float32),
-            "cand_bf_first_hop":  _z((T, N, M, K_cand, K),     torch.float32),
             "pos":                _z((T, N, M, 2),             torch.float32),
-            # Fix B — previous-action one-hot per agent.
+            # Previous-action one-hot per agent.
             "prev_action":        _z((T, N, M, K),             torch.float32),
-            # Phase 3 — guidepost first-hop one-hot (toward nearest frontier); used by the
-            # single-pointer ablation (no strategic head) as the action-bias signal.
-            "guidepost_nbr_bias": _z((T, N, M, K),             torch.float32),
-            # CTDE critic-only global state (value head only): [explored_frac, t/T, geo_dist, in_comm].
+            # CTDE critic-only global state (value head only): 8-dim, shape from sample_obs.
+            # [explored_frac, t/T, geo_pair, coverage_rate, redundancy, tgt_dist, idle_frac, imbalance].
             "critic_global":      _z((T, N, sample_obs["critic_global"].shape[-1]), torch.float32),
         }
         self.actions       = _z((T, N, M), torch.long)
-        # Phase A v2 — strategic K-slot chosen at rollout (for STE replay during PPO).
-        self.target_choice = _z((T, N, M), torch.long)
         self.logp          = _z((T, N, M), torch.float32)
         self.values    = _z((T, N),    torch.float32)        # denormalized
         self.rewards   = _z((T, N, M), torch.float32)
@@ -77,12 +65,10 @@ class Rollout:
         self.last_value    = _z((N,), torch.float32)         # V(s_T) for bootstrap
 
     def store(self, t: int, obs: dict, action: torch.Tensor, logp: torch.Tensor,
-              value: torch.Tensor, reward: torch.Tensor, done: torch.Tensor,
-              target_choice: torch.Tensor) -> None:
+              value: torch.Tensor, reward: torch.Tensor, done: torch.Tensor) -> None:
         for k in self.obs:
             self.obs[k][t].copy_(obs[k])
         self.actions[t].copy_(action)
-        self.target_choice[t].copy_(target_choice)
         self.logp[t].copy_(logp)
         self.values[t].copy_(value)
         self.rewards[t].copy_(reward)

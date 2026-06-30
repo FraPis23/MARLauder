@@ -86,10 +86,23 @@ class GraphLattice:
         # ramps from 0 (just left) back to 1 (cold / re-explorable). Stationary, unlike the
         # old last_visit/current_step.
         self.visit_age_window = max(1, int(visit_age_window))
-        # Bellman-Ford iteration upper bound: Manhattan diameter ~ LH+LW; pad a bit.
-        self.guidepost_iters = int(guidepost_iters) if guidepost_iters else int(self.LH + self.LW + 8)
-        # Path-reconstruction length cap (number of edges on a path).
-        self.guidepost_path_max = int(guidepost_path_max) if guidepost_path_max else int(self.LH + self.LW + 4)
+        # Bellman-Ford iteration upper bound. The OLD bound (Manhattan diameter ~LH+LW) is only
+        # valid in open maps: in a corridor/maze the geodesic hop count from agent→target winds
+        # far past LH+LW, so BF-from-target never propagated back to curr → parent[curr]<0 →
+        # next_hop=curr → the guidepost (and bf_dist used for scoring/progress) silently broke and
+        # the global target "disappeared". The true upper bound on a simple path is N_max hops, so
+        # use that. bf_from_target early-exits the instant dist stops changing (every-8-iter check),
+        # so on open maps the cost is unchanged (~diameter iters); the higher cap only spends extra
+        # iters on the long maze geodesics that actually need them. Reachable targets always converge.
+        self.guidepost_iters = int(guidepost_iters) if guidepost_iters else int(self.N_max)
+        # Path-reconstruction length cap (number of edges on a path). Drives a Python loop +
+        # the rendered guidepost line / feat[5] mask (NOT next_hop, which reads parent[curr]
+        # directly), so it can stay bounded well below N_max. Doubled vs the old LH+LW+4 so long
+        # corridor paths render without truncation, capped so the loop never blows up on big maps.
+        self.guidepost_path_max = (
+            int(guidepost_path_max) if guidepost_path_max
+            else int(min(self.N_max, 2 * (self.LH + self.LW) + 8))
+        )
 
         dev = device
         # Lattice indices (li, lj) per flat node.
@@ -656,62 +669,6 @@ class GraphLattice:
         return k_analytic, edge_clear
 
     @torch.no_grad()
-    def extract_topk_candidates(
-        self,
-        utility: torch.Tensor,        # [N, N_max]
-        node_valid: torch.Tensor,     # [N, N_max]
-        curr_xy: torch.Tensor,        # [N, 2] world coords of agent
-        K: int = 16,
-        bf_dist: torch.Tensor | None = None,   # [N, N_max] BF dist from curr; replaces euclid
-    ) -> dict[str, torch.Tensor]:
-        """Phase A v2 / A1: top-K frontier candidates per env, ranked by valid utility.
-
-        Returns dict with:
-            cand_idx       long  [N, K]      flat global node idx; -1 where slot has no valid candidate
-            cand_xy        f32   [N, K, 2]   world coords (zeros where invalid)
-            cand_utility   f32   [N, K]      raw utility values (0 where invalid)
-            cand_valid     bool  [N, K]      True where cand_idx[k] >= 0
-            cand_rel_xy    f32   [N, K, 2]   (cand_xy − curr_xy) (zeros where invalid)
-            cand_euclid    f32   [N, K]      ‖cand_xy − curr_xy‖ (0 where invalid)
-
-        Reachability is already encoded in node_valid (flood-fill from curr through
-        known-FREE space). Selected targets are guaranteed reachable; wall-bumping
-        at the strategic level is impossible by construction.
-        """
-        N, N_max = utility.shape
-        # Mask unreachable nodes with sentinel below 0 so they never enter top-K.
-        SENTINEL = float("-inf")
-        masked = torch.where(node_valid, utility, torch.full_like(utility, SENTINEL))
-        topk_vals, topk_idx = masked.topk(K, dim=-1)                              # [N, K]
-        valid = torch.isfinite(topk_vals) & (topk_vals > 0.0)                     # frontier must have utility>0
-        # Use 0-fill (not -1) for the gather; rely on valid mask downstream.
-        safe_idx = torch.where(valid, topk_idx, torch.zeros_like(topk_idx))       # [N, K]
-        xy = self.node_xy[safe_idx]                                               # [N, K, 2]
-        xy = xy * valid.unsqueeze(-1).float()                                     # zero out invalid slots
-        cand_idx_out = torch.where(valid, topk_idx, torch.full_like(topk_idx, -1))
-        cand_util = torch.where(valid, topk_vals, torch.zeros_like(topk_vals))
-        rel = xy - curr_xy.unsqueeze(1)                                           # [N, K, 2]
-        rel = rel * valid.unsqueeze(-1).float()
-        if bf_dist is not None:
-            # Option A: replace straight-line euclid with BF shortest-path distance
-            # through known-FREE space. Wall-aware. Same magnitude as euclid in open
-            # space, much larger in maze around obstacles.
-            d_per_cand = torch.gather(bf_dist, dim=1, index=safe_idx)              # [N, K]
-            # Unreachable nodes have +inf; clamp to a large finite value for stability.
-            d_per_cand = torch.where(torch.isfinite(d_per_cand), d_per_cand,
-                                      torch.full_like(d_per_cand, 1.0e6))
-            euclid = d_per_cand * valid.float()                                    # [N, K]
-        else:
-            euclid = rel.norm(dim=-1) * valid.float()                              # [N, K]
-        return {
-            "cand_idx":     cand_idx_out,
-            "cand_xy":      xy,
-            "cand_utility": cand_util,
-            "cand_valid":   valid,
-            "cand_rel_xy":  rel,
-            "cand_euclid":  euclid,
-        }
-
     def select_target_no_bf(
         self,
         utility: torch.Tensor,        # [N, N_max]
@@ -738,7 +695,8 @@ class GraphLattice:
         keep_margin: float = 0.2,     # commit: keep prev unless best beats it by >this fraction
         exclude: torch.Tensor | None = None,  # [N, N_max] bool: nodes a teammate out-ranked → drop
         d_team_min: torch.Tensor | None = None,  # [N, N_max] BF dist NEAREST teammate→node (ownership)
-        sep_w: float = 0.0,           # separation strength ∈[0,1] (0 = off)
+        sep_w: float | torch.Tensor = 0.0,   # separation strength ∈[0,1] (0 = off). [N] tensor → per-env
+                                             # (e.g. 1−w: separate when nothing fresh to offer)
         sep_k: float = 2.0,           # ownership-gate sigmoid sharpness (per hop)
         sep_m: float = 0.0,           # margin: hops a teammate must be closer before I yield
     ) -> torch.Tensor:
@@ -765,12 +723,15 @@ class GraphLattice:
         # adv > 0 → I'm closer (mine) → gate≈1; adv < 0 → teammate closer → gate≈0 → score scaled
         # down by (1 − sep_w). One-sided (never negative → no repulsion); single-frontier still wins
         # the argmax (only down-weighted, not zeroed → no idle).
-        if d_team_min is not None and sep_w > 0.0:
+        sep_is_tensor = isinstance(sep_w, torch.Tensor)
+        sep_active = sep_is_tensor or sep_w > 0.0
+        if d_team_min is not None and sep_active:
             dtm = d_team_min / nr
             dtm = torch.where(torch.isfinite(dtm), dtm, torch.full_like(dtm, 1.0e6))
             adv = dtm - dc                                                 # hops; >0 = mine
             own_gate = torch.sigmoid(sep_k * (adv - sep_m))               # ∈(0,1)
-            score = score * (1.0 - sep_w * (1.0 - own_gate))
+            sw = sep_w.unsqueeze(-1) if sep_is_tensor else sep_w           # [N,1] broadcast over nodes
+            score = score * (1.0 - sw * (1.0 - own_gate))
         elig = node_valid & (utility > 0.0)
         if curr_idx is not None:
             # Exclude the node the agent is ON: even if it's still a frontier (unknown within NR
@@ -795,6 +756,50 @@ class GraphLattice:
             target = torch.where(keep, pv, best_idx)
         # Safe fallback: no eligible frontier at all → stay on curr (guidepost→self→zero bias),
         # NEVER node 0 (which renders as an off-map top-left target).
+        if curr_idx is not None:
+            target = torch.where(has_elig, target, curr_idx)
+        return target                                                     # [N]
+
+    def select_target_nearest_bf(
+        self,
+        utility: torch.Tensor,        # [N, N_max]  (frontier-gated, >0 only near frontiers)
+        node_valid: torch.Tensor,     # [N, N_max]  reachable-through-FREE mask
+        bf_dist_curr: torch.Tensor,   # [N, N_max]  BF path length curr→node (+inf unreachable)
+        prev_target: torch.Tensor | None = None,   # [N] last step's committed target (-1 none)
+        curr_idx: torch.Tensor | None = None,      # [N] curr node — safe fallback when no frontier
+        keep_margin: float = 0.2,     # commit: keep prev unless a new frontier is >this fraction CLOSER
+        exclude: torch.Tensor | None = None,       # [N, N_max] bool: nodes a teammate claimed → drop
+    ) -> torch.Tensor:
+        """Global target = the reachable frontier with the SMALLEST BF path distance from curr.
+
+        Pure greedy-nearest on the wall-aware BF field — ignores utility magnitude, rendezvous
+        and separation (those are the analytic selector's job). The guidepost then just points the
+        agent at the closest unexplored boundary it can actually reach. Same eligibility set as the
+        analytic path (reachable, utility>0, not the curr node, not teammate-claimed) and the same
+        fallback (stay on curr when no frontier) so downstream code is unchanged.
+        """
+        INF = float("inf")
+        elig = node_valid & (utility > 0.0)
+        if curr_idx is not None:
+            node_idx = torch.arange(self.N_max, device=utility.device).view(1, -1)
+            elig = elig & (node_idx != curr_idx.unsqueeze(1))          # must MOVE off curr
+        if exclude is not None:
+            elig = elig & ~exclude
+        dist = torch.where(elig, bf_dist_curr, torch.full_like(bf_dist_curr, INF))
+        best_idx = dist.argmin(dim=-1)                                  # [N] nearest reachable frontier
+        best_val = dist.gather(1, best_idx.unsqueeze(1)).squeeze(1)     # [N]
+        has_elig = elig.any(dim=-1)                                     # [N]
+        # Commitment / hysteresis: keep last step's target unless a candidate is closer by
+        # > keep_margin (fraction) — stops the 1-step argmin flip when two frontiers tie in reach.
+        target = best_idx
+        if prev_target is not None:
+            pv = prev_target.clamp(min=0)
+            prev_elig = torch.gather(elig, 1, pv.unsqueeze(1)).squeeze(1) & (prev_target >= 0)
+            prev_val = dist.gather(1, pv.unsqueeze(1)).squeeze(1)
+            # smaller dist is better → keep prev unless the new nearest beats it by the margin.
+            keep = prev_elig & (best_val >= prev_val * (1.0 - keep_margin))
+            target = torch.where(keep, pv, best_idx)
+        # Safe fallback: no eligible frontier → stay on curr (never node 0 / off-map top-left).
         if curr_idx is not None:
             target = torch.where(has_elig, target, curr_idx)
         return target                                                     # [N]

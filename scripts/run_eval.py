@@ -61,8 +61,12 @@ def main() -> None:
     # G.1 — full reset for specific map. Avoids stale BF cache / strategic features.
     env.reload_map(env_idx=0, map_idx=int(args.map_idx))
 
+    # GAT depth must match the trained weights (n_layers is tied to n_hops at train time). Recover
+    # it from the ckpt cfg — else a default mismatch silently DROPS layer weights (strict=False).
+    n_layers = (cfg_peek.get("n_layers") if isinstance(cfg_peek, dict) else None) \
+               or env_peek.get("n_hops") or args.n_layers
     model = MarlActorCritic(n_agents=args.n_agents, d=args.d_hidden,
-                            n_heads=args.n_heads, n_layers=args.n_layers).to(args.device)
+                            n_heads=args.n_heads, n_layers=int(n_layers)).to(args.device)
     ckpt = ckpt_peek  # already loaded above
     sd = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in ckpt["model"].items()}
     # Strip torch.compile prefix if present.
@@ -74,7 +78,6 @@ def main() -> None:
     # Restore high-level strategic gate + target mode from the training cfg (mutable attrs).
     if isinstance(cfg_peek, dict):
         model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
-    model.target_mode = "analytic" if env_peek.get("analytic_target", True) else "learned"
     model.eval()
     print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}  strategic_gate_eps={model.strategic_gate_eps}")
 

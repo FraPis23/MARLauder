@@ -59,7 +59,6 @@ def main() -> None:
     # Restore high-level strategic gate from the training cfg (mutable attr, not a weight).
     model.strategic_gate_eps = float(cfg_dict.get("strategic_gate_eps", 0.0))
     _env_d = cfg_dict.get("env", {}) if isinstance(cfg_dict, dict) else {}
-    model.target_mode = "analytic" if _env_d.get("analytic_target", True) else "learned"
     model.eval()
 
     import imageio.v2 as imageio

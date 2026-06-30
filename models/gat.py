@@ -57,35 +57,34 @@ class MaskedGATLayer(nn.Module):
         k = self.k_proj(x).view(B, N, H, D)
         v = self.v_proj(x).view(B, N, H, D)
 
-        # Gather neighbor k and v.
+        # Gather neighbor k and v: reshape to [B, N, H*D], gather over the N axis by neighbor
+        # index, reshape back.
         safe_idx = edge_idx.clamp(min=0)                # [B, N, K]
-        # k: [B, N, H, D]; gather along dim=1 with [B, N*K, H, D] expand
-        gather_idx = safe_idx.unsqueeze(-1).unsqueeze(-1).expand(B, N, K, H, D)  # [B, N, K, H, D]
-        # We need to gather from k along dim=1 (the N axis), with index [B, N*K, ...]
-        k_exp = k.unsqueeze(2).expand(B, N, K, H, D)    # placeholder, will overwrite via gather
-        # easier route: reshape k to [B, N, H*D], gather over dim=1, reshape back.
         k_flat = k.reshape(B, N, H * D)
         v_flat = v.reshape(B, N, H * D)
         idx_flat = safe_idx.reshape(B, N * K).unsqueeze(-1).expand(B, N * K, H * D)
         k_nbr = torch.gather(k_flat, 1, idx_flat).view(B, N, K, H, D)            # [B, N, K, H, D]
         v_nbr = torch.gather(v_flat, 1, idx_flat).view(B, N, K, H, D)
 
-        # Attention scores: (q · k_nbr) / sqrt(D)
-        scores = (q.unsqueeze(2) * k_nbr).sum(dim=-1) / math.sqrt(D)             # [B, N, K, H]
-        # Mask invalid edges → -inf.
-        mask = edge_valid.unsqueeze(-1)                                          # [B, N, K, 1]
-        scores = scores.masked_fill(~mask, float("-inf"))
+        # Self-loop: a node also attends to ITSELF. Standard GAT (Veličković 2018) includes i in
+        # its neighborhood N_i. We append a self slot (always valid) so the softmax is over the K
+        # neighbors + self → the node learns how much to weight its own features vs neighbors',
+        # AND a node with no valid neighbor still has a well-defined self-only output (no NaN, so
+        # the old all-invalid fallback is gone).
+        self_valid = torch.ones(B, N, 1, dtype=torch.bool, device=x.device)
+        k_all = torch.cat([k_nbr, k.unsqueeze(2)], dim=2)                        # [B, N, K+1, H, D]
+        v_all = torch.cat([v_nbr, v.unsqueeze(2)], dim=2)                        # [B, N, K+1, H, D]
+        valid_all = torch.cat([edge_valid, self_valid], dim=2)                   # [B, N, K+1]
 
-        # If a row has all -inf (no valid neighbor), softmax → NaN. Detect & fall back to a self-attention-zero output (no aggregation).
-        any_valid = edge_valid.any(dim=-1, keepdim=True).unsqueeze(-1)           # [B, N, 1, 1]
-        scores = torch.where(any_valid.expand_as(scores), scores, torch.zeros_like(scores))
-        attn = F.softmax(scores, dim=2)                                          # [B, N, K, H]
+        # Attention scores: (q · k_all) / sqrt(D), invalid edges → -inf (self never masked).
+        scores = (q.unsqueeze(2) * k_all).sum(dim=-1) / math.sqrt(D)             # [B, N, K+1, H]
+        scores = scores.masked_fill(~valid_all.unsqueeze(-1), float("-inf"))
+        attn = F.softmax(scores, dim=2)                                          # [B, N, K+1, H]
         attn = self.dropout(attn)
-        attn = torch.where(any_valid.expand_as(attn), attn, torch.zeros_like(attn))
 
         if self.store_attn:
-            self._last_attn = attn.detach()                                     # [B, N, K, H]
-        out = (attn.unsqueeze(-1) * v_nbr).sum(dim=2)                            # [B, N, H, D]
+            self._last_attn = attn.detach()                                     # [B, N, K+1, H]
+        out = (attn.unsqueeze(-1) * v_all).sum(dim=2)                            # [B, N, H, D]
         out = out.reshape(B, N, H * D)
         out = self.o_proj(out)                                                   # [B, N, out_dim]
 

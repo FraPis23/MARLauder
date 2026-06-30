@@ -38,6 +38,9 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, default=Path("/workspace/MARLauder/runs/trace_run"))
     ap.add_argument("--tag", default=None, help="trace name (default ckpt+map)")
+    ap.add_argument("--comm-gated-pos", action="store_true",
+                    help="Override force_full_pos_sharing=False so teammate last-known pos freezes "
+                         "between comm contacts (real behavior, not the debug real-time pos)")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -56,7 +59,9 @@ def main() -> None:
     model.load_state_dict(sd, strict=False)
     if isinstance(cfg_peek, dict):
         model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
-    model.target_mode = "analytic" if env_peek.get("analytic_target", True) else "learned"
+
+    if args.comm_gated_pos and isinstance(env_peek, dict):
+        env_peek = {**env_peek, "force_full_pos_sharing": False}
 
     split = load_split(args.split, device=args.device)
     tag = args.tag or f"{args.ckpt.stem}_m{args.map_idx}"

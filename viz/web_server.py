@@ -10,15 +10,198 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import socket
+import sys
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
 _REPO    = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))   # so `import scripts.train_args` resolves (torch-free)
 RUNS_DIR = _REPO / "runs"
 VIZ_DIR  = _REPO / "viz"
+DATA_DIR = _REPO / "data"
 _HOST    = socket.gethostname()
+
+
+def _scan_splits() -> list[str]:
+    """Available map splits = data/<group>/<name>/ dirs holding a maps.npy. Feeds the
+    dashboard's on-demand-eval map-type dropdown."""
+    out: list[str] = []
+    if not DATA_DIR.exists():
+        return out
+    for grp in sorted(DATA_DIR.iterdir()):
+        if not grp.is_dir():
+            continue
+        for sp in sorted(grp.iterdir()):
+            if sp.is_dir() and (sp / "maps.npy").exists():
+                out.append(f"{grp.name}/{sp.name}")
+    return out
+
+
+# ---- Training launcher: web form → spawned run_train.py process -------------------------
+# The form is auto-built from scripts.train_args.schema() — EVERY flag, with its default,
+# choices, and help (tooltip). Last-used values persist server-side (survive browser close AND
+# power-off) in runs/.launch_params.json; the defaults themselves come from the schema.
+LAUNCH_PARAMS_FILE = RUNS_DIR / ".launch_params.json"
+
+
+def _arg_schema() -> list[dict]:
+    from scripts.train_args import schema
+    return schema()
+
+
+def _schema_defaults() -> dict:
+    """{dest: default} for every flag + the free-form extra_args field."""
+    d = {f["dest"]: f["default"] for f in _arg_schema() if f["dest"] != "out"}
+    d["extra_args"] = ""
+    return d
+
+
+def _load_launch_params() -> dict:
+    try:
+        saved = json.loads(LAUNCH_PARAMS_FILE.read_text())
+    except Exception:
+        saved = {}
+    return {**_schema_defaults(), **(saved if isinstance(saved, dict) else {})}
+
+
+def _save_launch_params(params: dict) -> None:
+    tmp = LAUNCH_PARAMS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(params, indent=2))
+    tmp.replace(LAUNCH_PARAMS_FILE)
+
+
+def _build_cmd(p: dict) -> list[str]:
+    """Map the web form's params to a run_train.py argv, generically from the schema. `-u` =
+    unbuffered stdout so the live log streams to the browser without block-buffering. `--out`
+    is appended by the launcher; only NON-default values are emitted to keep the command short."""
+    import shlex
+    cmd = ["python", "-u", "scripts/run_train.py"]
+    for f in _arg_schema():
+        dest, flag, kind = f["dest"], f["flag"], f["kind"]
+        if dest == "out" or dest not in p:
+            continue
+        v = p[dest]
+        if kind == "bool":
+            if v:
+                cmd.append(flag)
+        else:
+            sv = "" if v is None else str(v).strip()
+            if sv == "":
+                continue
+            d = f["default"]
+            if kind in ("int", "float"):
+                try:
+                    if float(v) == float(d):
+                        continue        # numeric default (1 == 1.0) → skip
+                except (TypeError, ValueError):
+                    pass
+            elif sv == str(d):
+                continue                # string default → skip
+            cmd += [flag, sv]
+    extra = str(p.get("extra_args", "") or "").strip()
+    if extra:
+        cmd += shlex.split(extra)
+    return cmd
+
+
+def _launch_training(params: dict) -> dict:
+    """Spawn a detached run_train.py. Fresh dir runs/<run-name>_<timestamp>; stdout+stderr →
+    that dir's train.log. start_new_session detaches it so it outlives the web server."""
+    import subprocess
+    import time
+    base = (str(params.get("wandb_run_name", "") or "run").strip().replace("/", "_")) or "run"
+    run = f"{base}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = RUNS_DIR / run
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cmd = _build_cmd(params) + ["--out", str(run_dir)]
+    # Persist this run's exact params alongside its outputs (audit / reproduce).
+    (run_dir / "params.json").write_text(json.dumps(
+        {"params": params, "cmd": " ".join(cmd)}, indent=2))
+    logf = open(run_dir / "train.log", "wb")
+    logf.write(("$ " + " ".join(cmd) + "\n\n").encode())
+    logf.flush()
+    env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+    proc = subprocess.Popen(cmd, cwd=str(_REPO), stdout=logf, stderr=subprocess.STDOUT,
+                            start_new_session=True, env=env)
+    _save_launch_params(params)
+    return {"ok": True, "run": run, "pid": proc.pid, "cmd": " ".join(cmd)}
+
+
+def _read_log(run: str, offset: int) -> dict:
+    """Incremental tail of a run's train.log from `offset` bytes → for the live console."""
+    p = (RUNS_DIR / run / "train.log").resolve()
+    if RUNS_DIR.resolve() not in p.parents or not p.exists():
+        return {"data": "", "offset": offset, "exists": False}
+    size = p.stat().st_size
+    if offset > size:        # file shrank/rotated → restart from the top
+        offset = 0
+    with open(p, "rb") as f:
+        f.seek(offset)
+        chunk = f.read()
+    return {"data": chunk.decode("utf-8", "replace"), "offset": offset + len(chunk), "exists": True}
+
+
+def _list_ckpts(run: str) -> list[str]:
+    """Saved policy checkpoints in a run dir (newest first) → the eval-checkpoint picker."""
+    d = (RUNS_DIR / run).resolve()
+    if RUNS_DIR.resolve() not in d.parents or not d.is_dir():
+        return []
+    pts = sorted(d.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p.name for p in pts]
+
+
+def _eval_ckpt(run: str, ckpt: str, split: str, n_maps: int, steps: int) -> dict:
+    """Spawn a standalone eval of one saved checkpoint → GIFs + traces (unlocks inspector).
+    Independent of training, so it works on stopped/done runs too."""
+    import subprocess
+    d = (RUNS_DIR / run).resolve()
+    if RUNS_DIR.resolve() not in d.parents or not d.is_dir():
+        return {"ok": False, "error": "invalid run"}
+    ck = (d / ckpt).resolve()
+    if ck.parent != d or not ck.exists() or ck.suffix != ".pt":
+        return {"ok": False, "error": "invalid checkpoint"}
+    # n_agents from the run's params.json when available (else 2).
+    n_agents = 2
+    try:
+        n_agents = int(json.loads((d / "params.json").read_text())["params"].get("n_agents", 2))
+    except Exception:
+        pass
+    cmd = ["python", "-u", "scripts/eval_ckpt.py",
+           "--ckpt", str(ck), "--split", str(split),
+           "--n-maps", str(int(n_maps)), "--steps", str(int(steps)),
+           "--n-agents", str(n_agents), "--out", str(d)]
+    logf = open(d / "eval.log", "ab")
+    logf.write(("\n$ " + " ".join(cmd) + "\n").encode())
+    logf.flush()
+    env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+    proc = subprocess.Popen(cmd, cwd=str(_REPO), stdout=logf, stderr=subprocess.STDOUT,
+                            start_new_session=True, env=env)
+    return {"ok": True, "pid": proc.pid, "cmd": " ".join(cmd)}
+
+
+def _stop_run(run: str) -> dict:
+    """Graceful stop+save: SIGTERM the run's training PID. The driver's signal handler saves
+    the policy (ckpt_stop.pt) before exiting. PID is read from the run's status.json."""
+    p = (RUNS_DIR / run / "status.json").resolve()
+    if RUNS_DIR.resolve() not in p.parents or not p.exists():
+        return {"ok": False, "error": "no status.json"}
+    try:
+        pid = int(json.loads(p.read_text()).get("pid", 0))
+    except Exception as exc:
+        return {"ok": False, "error": f"bad status.json ({exc})"}
+    if pid <= 0:
+        return {"ok": False, "error": "no pid"}
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"ok": False, "error": "process already gone"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "pid": pid, "msg": "SIGTERM sent; policy saved as ckpt_stop on exit"}
 
 
 def _pid_alive(pid: int) -> bool:
@@ -93,6 +276,9 @@ def _scan_runs() -> list[dict]:
             "state":         state,
             "has_inspector": has_inspector,
             "has_traces":    has_traces,
+            "has_log":       (d / "train.log").exists(),
+            "has_params":    (d / "params.json").exists(),
+            "has_ckpts":     bool(pt_files),
             "last_ckpt":     last_ckpt,
             "last_mtime":    last_mtime,
             "n_traces":      n_traces,
@@ -112,13 +298,97 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/runs":
             self._api_runs()
+        elif path == "/api/splits":
+            self._send_json(_scan_splits())
+        elif path == "/api/ckpts":
+            qs = dict(p.split("=", 1) for p in urlparse(self.path).query.split("&") if "=" in p)
+            self._send_json(_list_ckpts(qs.get("run", "")))
+        elif path == "/api/argschema":
+            self._send_json(_arg_schema())
+        elif path == "/api/defaults":
+            self._send_json(_schema_defaults())
+        elif path == "/api/launch_params":
+            self._send_json(_load_launch_params())
+        elif path == "/api/log":
+            qs = dict(p.split("=", 1) for p in urlparse(self.path).query.split("&") if "=" in p)
+            try:
+                offset = int(qs.get("offset", 0))
+            except ValueError:
+                offset = 0
+            self._send_json(_read_log(qs.get("run", ""), offset))
         elif path in ("/", "/index.html"):
             self._serve_file(VIZ_DIR / "index.html", "text/html; charset=utf-8")
         else:
             super().do_GET()
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/launch":
+            self._api_launch()
+            return
+        if parsed.path == "/api/stop":
+            qs = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
+            self._send_json(_stop_run(qs.get("run", "")))
+            return
+        if parsed.path == "/api/eval":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as exc:
+                self.send_error(400, f"Bad body: {exc}")
+                return
+            self._send_json(_eval_ckpt(
+                str(body.get("run", "")), str(body.get("ckpt", "")),
+                str(body.get("split", "test/hybrid")),
+                int(body.get("n_maps", 3)), int(body.get("steps", 256))))
+            return
+        if parsed.path != "/api/control":
+            self.send_error(404, "Unknown endpoint")
+            return
+        qs = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
+        run = qs.get("run", "")
+        run_dir = (RUNS_DIR / run).resolve()
+        # Path-traversal guard: the resolved dir must live under RUNS_DIR and exist.
+        if RUNS_DIR.resolve() not in run_dir.parents or not run_dir.is_dir():
+            self.send_error(400, "Invalid run")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            cmd = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as exc:
+            self.send_error(400, f"Bad body: {exc}")
+            return
+        if not isinstance(cmd, dict) or cmd.get("cmd") not in ("ckpt_eval", "switch_stage"):
+            self.send_error(400, "cmd must be ckpt_eval or switch_stage")
+            return
+        # Atomic write so the driver never reads a partial command.
+        tmp = run_dir / "control.json.tmp"
+        tmp.write_text(json.dumps(cmd))
+        tmp.replace(run_dir / "control.json")
+        self._send_json({"ok": True, "queued": cmd})
+
+    def _api_launch(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            params = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as exc:
+            self.send_error(400, f"Bad body: {exc}")
+            return
+        if not isinstance(params, dict):
+            self.send_error(400, "Body must be a JSON object of params")
+            return
+        try:
+            result = _launch_training(params)
+        except Exception as exc:
+            self.send_error(500, f"Launch failed: {exc}")
+            return
+        self._send_json(result)
+
     def _api_runs(self):
-        body = json.dumps(_scan_runs()).encode()
+        self._send_json(_scan_runs())
+
+    def _send_json(self, obj):
+        body = json.dumps(obj).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

@@ -4,6 +4,88 @@ Session-based log of design decisions, architectural understanding, observed pro
 
 ---
 
+## Session 2026-06-29 / 06-30 — StrategicHead removal, analytic-only, reward & critic overhaul
+
+Large cleanup + simplification pass. Goal: a genuinely *learned* policy — env supplies an analytic guidepost as context, but no longer hard-forces the agent toward it. **All pre-2026-06-29 checkpoints are broken (actor/critic input dims changed) → full retrain required. 5 sweep yamls reference deleted flags → obsolete.**
+
+### Done — architecture cleanup (06-29)
+
+- **StrategicHead fully deleted** + everything used only by it: `CAND_FEAT_DIM`, all `cand_*` (feat/valid/xy/idx/bf_first_hop) extraction + obs keys, Gumbel-ST, commitment knobs (`switch_margin`/`max_steps_on_option`/`disable_strategic`), `target_choice/logits/argmax`, `_diversity_loss`+`div_coef`, reward terms `target_switch`+`yield`, env `_objective_switch_and_yield`/`_zero_cand`/`_candidate_*`, graph `extract_topk_candidates`. Code is now **analytic-target-only**: env's `graph_lattice` picks the global target; actor does local control. `--target-mode` choices now `analytic|nearest` (no `learned`).
+- **next_hop_dir removed** from actor input → `actor_pre = Linear(d+K → d)` (was d+2K). Route still reaches the actor as context via `node_feat[5]` (guidepost ribbon) + `node_feat[2]` (utility) through the GAT; the explicit one-hot was redundant with message-passing.
+- **GAT self-loop added** (`gat.py MaskedGATLayer`): node attends to itself (K+1 slots, self always valid) → removed the all-invalid NaN fallback. Standard GAT (Veličković 2018).
+- **Dead `k_exp` line removed** (`gat.py`).
+- **Explicit per-step movement cost** (`explorer.py`): axial = `step_cost`, diagonal = `step_cost·√2` (via `graph.edge_len[action]/NR`), invalid/no-move = 0. New `reward_terms["step"]`.
+- Deleted head-only diag scripts: `measure_thrash`, `diag_decouple`, `diag_path_head`, `diag_division`, `diag_actor_pre`, `diag_loops`, stale `profile_step`. Architecture diagram: `docs/architecture.html`.
+
+### Done — reward study (06-29 → 06-30)
+
+- **`in_comm` dropped** from `critic_global` (derivable from `geo_pair`) → was 4-dim, briefly 3.
+- **`team_delta` (β) removed from reward** — double-counted novel cells already paid by `novel_scan` (reintroduced the free-ride novel_scan exists to kill). `team_reward_weight` now a dead knob (0); `team_delta` kept as a metric only.
+- **Set-op normalization fixed** — give/recv/overlap were `/N_max` (~24× smaller than novel AND map-size dependent) → now `/scan_norm` (map-independent units). Coefs rescaled to preserve train/easy magnitude: give 1.5→0.06, recv 0.5→0.02, overlap 3.0→0.12. `scan_norm_nodes=50` ≈ one sensor disk of lattice nodes (range 80px / NR 16 = 5 rings → π·5²≈78, minus occlusion/overlap ≈ 50).
+- **`progress_reward` REMOVED (06-30)** — it shaped `(d_prev−d_new)` toward the committed analytic target → soft-forced the policy to *follow the selector* instead of learning the criterion. Deleted block + reward-sum term + telemetry + `progress_reward_coef` (EnvCfg / run_train / `--progress-reward-coef`). BF machinery (`_dist_prev`/`_prev_target_node`) kept — still used by guidepost commitment.
+  - **Decided AGAINST analytic-PBRS** `γφ(s')−φ(s)` as a replacement: when the analytic target flips, φ changes basis → telescoping breaks → flip-farming (the exact bug the old BF-field code fought). The resulting beyond-window blindness is to be solved in **observation** (coarse global frontier channel, O1 — NOT yet done), not by bribing toward a target.
+- **`novel_scan` credit note**: it's privileged (the `& ~union_prev` subtraction uses team-union info the actor never observes → CTDE-legit). The controllable part ("go to MY visible frontier") is learnable; the unobservable overlap-variance is meant to be absorbed by the centralized critic baseline — which is *why* `critic_global` now carries redundancy/coverage (below).
+- **`completion_bonus=10` verified, left unchanged (R4)**: discounted-to-start `10·0.99^T` ≈ 0.18–1.3, but ≈ 9.9 at the finish-decision step (dominant) and ≈ half the dense return undiscounted. Raising it would inflate value-target variance (rare +10 outlier vs ~0.05/step → Welford std blows up → shrinks normalized dense gradients).
+
+### Done — critic_global extension (O2, 06-30)
+
+`critic_global` **3 → 8** (`CRITIC_GLOBAL_DIM`), all features ∈[0,1], M=1 guards → 0, built env-side in `_refresh_obs`. History-state critic (GRU) kept — unbiased per Amato CTDE §4.6.
+
+| # | feature | formula | role |
+|---|---|---|---|
+| 1 | explored_frac | union_free / free_total | non-stationarity |
+| 2 | t_frac | t / max_steps | non-stationarity |
+| 3 | geo_pair | nearest-teammate BF, mean, /diam | agent geometry (reuses Pass-1 `bf_dist_team`) |
+| 4 | coverage_rate | `Δexplored·T` clamp[0,5]/5 | progressing vs stalled (derivative) |
+| 5 | redundancy | `(Σ own_free − union)/union/(M−1)` | **lets critic explain novel_scan's ~union drops → lower adv variance** |
+| 6 | tgt_dist | BF agent→committed analytic target, mean, /diam | descriptive critic input — **no penalty/forcing** |
+| 7 | idle_frac | `(novel_count≤0)` mean over agents — *simple* idle | coordination health, no extra BF flood |
+| 8 | imbalance | `(max_share − 1/M)/(1 − 1/M)` | contribution skew |
+
+Critic distance is **descriptive-only** (a value-baseline input, never a reward term) → the "penalized forever for leaving the best frontier" failure mode does not apply (that only bites if distance enters the *reward*, which is exactly what `progress_reward` did and why it was cut). Chose *simple* idle (novel_count≤0) over the 3-clause refined idle to avoid an extra nearest-frontier BF flood; accepts that productive transit reads as "idle" — acceptable for a descriptive feature.
+
+### Implementation
+
+- `models/actor_critic.py`: StrategicHead class + `CAND_FEAT_DIM` gone; `actor_pre = Linear(d+K)`; `_strategic_gate`/`strategic_gate_eps` vestigial (trace.py compat); `CRITIC_GLOBAL_DIM = 8`.
+- `models/gat.py`: self-loop (K+1 slots), `k_exp` deleted.
+- `env/explorer.py`: reward block (step penalty, team_delta/progress removed, set-op `/scan_norm`); `critic_global` 8-feature build in `_refresh_obs`; new state `_prev_expl_frac` + `_idle_now` (init in `__init__`, reset auto-handled via `_refresh_obs`, per-env reset → Δ<0 → clamp0 → no spike); EnvCfg knobs removed/rescaled.
+- `train/buffer.py`, `train/mappo.py`, `train/driver.py`: cand/target_choice/div_loss wiring removed; buffer `critic_global` auto-sizes from `sample_obs`.
+- `scripts/train_args.py`, `scripts/run_train.py`, `eval/rollout.py`, `eval/trace.py`: strategic + progress flags removed; analytic-target rendering.
+- **Smoke-verified on GPU** (marlauder container, M=1 and M=2): env build, `critic_global` finite ∈[0,1] with correct M=1 guards, 8-step rollout, `model.act`, `model.evaluate`+backward (gradients finite), `critic_pre.in_features = 2·d+8 = 264`.
+
+### Open
+
+- **O1 — coarse global frontier/explored obs channel** (low-res): fills the beyond-window blindness reopened by removing `progress_reward`, keeping the policy *learned* (give it the info, don't bribe a direction). NOT done.
+- **SRU** (Spatially-Enhanced Recurrent Unit, arXiv 2506.05997): separate-branch decision pending. Motivated only if learned spatial memory of left-behind frontiers is needed beyond O1; needs TC-dropout / DML or underperforms.
+- **Dead knobs** still present (left in place, low priority): `scan_reward_weight`/`--scan-weight` (scan_self is diagnostic-only, not in reward), `proximity_penalty_coef=0`.
+- **5 obsolete sweep yamls** reference removed flags (`--top-k`, `--target-switch-pen`, `--switch-margin`, `--div-coef`, etc.): `sweep.yaml`, `sweep_stage2.yaml`, `sweep_div.yaml`, `sweep_stage0_commit.yaml`, `sweep_v06_belief.yaml` — delete vs rewrite undecided.
+
+---
+
+## Session 2026-06-26 — Realistic sensor + signal-strength comm model
+
+### Done
+
+Ported IR2's realistic comms + bumped sensor range, to make the physical layer verisimilar.
+
+- **Sensor range** `60 → 80` px (EnvCfg `sensor_range_px` default; `--sensor-range`). Matches IR2 `SENSOR_RANGE`. Fixed, not randomized (IR2 doesn't randomize the sensor). Old checkpoints restore their saved `60` via `from_ckpt_dict` → eval unaffected.
+- **Comm model** — new `comm_model` flag:
+  - `"los"` (EnvCfg default, back-compat): legacy hard `dist < comm_range_px` AND no GT obstacle on the segment.
+  - `"signal_strength"` (run_train CLI default): log-distance path-loss radio (IR2 / hal-03365129). Segment split into free vs obstacle length; `PL = PL_o + [10·γ_obst·log10(d_obst)+K]·(d_obst>0) + [10·γ·log10(d_free/d_o)+X_g]·(d_free≥d_o)`; connect iff `P_R = P_T − PL > ss_thresh`. **Walls attenuate (γ_obst=4) instead of hard-blocking.**
+- **Per-episode domain randomization**: shadowing noise `X_g ~ U[0,13]` (free), `K ~ U[0,13]` (obstacle) resampled per env reset (`_resample_ss_noise`, GPU). Effective free-space range ≈ 69–311 px depending on draw (centered ~150, near old fixed 120); walls cut it hard.
+- Default-`los` in EnvCfg but default-`signal_strength` in the CLI keeps old-ckpt eval faithful while new trainings opt in and persist `comm_model` in their ckpt.
+
+### Implementation
+
+`env/explorer.py`: EnvCfg fields (`comm_model`, `ss_*`); `_resample_ss_noise(idx_t)` GPU helper; `_comm_check` SS branch (fully vectorized over `[N]`, reuses the S-sample segment trace); `_ss_xg/_ss_k` `[N]` buffers allocated in `__init__`, resampled in both reset paths.
+`scripts/run_train.py`: `--comm-model`, `--sensor-range`, `--ss-thresh`; wired into EnvCfg.
+
+### Open
+
+- SS params (`PL_o=31`, `d_o=35`, thresholds) are IR2 pixel-scale values dropped onto MARLauder's 1000px/16NR scale — sane (range ~150px) but worth a sweep on `--ss-thresh` if comm too generous/strict.
+
+---
+
 ## Session 2026-05-27 (d) — Phase C: ego-centric subgraph encoder
 
 ### Done

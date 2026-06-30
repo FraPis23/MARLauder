@@ -34,6 +34,39 @@ def _dump_status(out_dir: Path, status: dict) -> None:
     tmp.replace(out_dir / "status.json")
 
 
+def _read_control(out_dir: Path) -> dict | None:
+    """Web control channel: the dashboard drops `control.json` into the run dir; we read and
+    DELETE it at the next iteration boundary so the command fires exactly once. Cheap existence
+    check per iter (no command = one stat() call). Malformed JSON is dropped with a warning."""
+    p = out_dir / "control.json"
+    if not p.exists():
+        return None
+    cmd: dict | None = None
+    try:
+        cmd = json.loads(p.read_text())
+    except Exception as exc:
+        print(f"[control] ignoring malformed control.json ({exc})")
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return cmd
+
+
+def _save_ckpt(out_dir: Path, model, vnorm, cfg, it: int, tag: str) -> Path:
+    """Write a checkpoint named <tag>.pt. Shared by milestone, on-demand, and final saves."""
+    ckpt_path = out_dir / f"{tag}.pt"
+    torch.save({
+        "iter": it,
+        "model": model.state_dict(),
+        "vnorm": vnorm.state_dict(),
+        "cfg": cfg.__dict__ | {"env": cfg.env.__dict__, "ppo": cfg.ppo.__dict__,
+                               "out_dir": str(out_dir), "n_agents": cfg.n_agents},
+    }, ckpt_path)
+    print(f"[ckpt] {ckpt_path}")
+    return ckpt_path
+
+
 @dataclass
 class TrainCfg:
     split: str = "train/easy"
@@ -44,12 +77,9 @@ class TrainCfg:
     rollout_len: int = 128
     d_hidden: int = 128
     n_heads: int = 4
-    n_hops: int = 2          # ego-centric encoder window radius; n_layers tied to this
-    n_layers: int = 2        # GAT layers; default tied to n_hops in make_env_model
-    switch_margin: float = 1.0     # Phase 1 — strategic target switches only when an alt beats committed by >this
-    max_steps_on_option: int = 24  # Phase 1 — horizon cap forcing a re-pick (escape unreachable target)
-    disable_strategic: bool = False  # Phase 3 — single-pointer ablation (bypass StrategicHead, use guidepost)
-    strategic_gate_eps: float = 0.0  # high-level gate: strategic head influences only when max ego-window utility < eps (0 = always on)
+    n_hops: int = 6          # ego-centric encoder window radius; n_layers tied to this
+    n_layers: int = 6        # GAT layers; default tied to n_hops in make_env_model (6 hops / 6 layers)
+    strategic_gate_eps: float = 0.0  # high-level gate: the analytic guidepost steers the actor only when max ego-window utility < eps (0 = always on)
     lr_actor: float = 3e-4
     lr_critic: float = 5e-4   # faster than actor (non-stationary value) but below paper's 1e-3 (oscillation risk)
     device: str = "cuda:0"
@@ -68,6 +98,26 @@ class TrainCfg:
     #   0–30%: (1.0, 0.0).  30–60%: (0.7, 0.3).  60–100%: (0.5, 0.5).
     curriculum: bool = False
     curriculum_splits: tuple = ("train/easy", "train/difficult")
+    # Performance-GATED curriculum (split-SWAP, not MultiSplit weighting). Trains on one split at
+    # a time and ADVANCES to the next split only when the eval suite score clears
+    # `curriculum_gate_score` (after a `curriculum_min_stage_iters` dwell on the current split).
+    # Split-swap (vs the legacy MultiSplit ramp) is required because easy (480×640) and difficult
+    # (1000×1000) have DIFFERENT canvases — a MultiSplit asserts a common canvas, so the easy→
+    # difficult mix is impossible. The model is canvas-agnostic (ego-window GAT) so it transfers;
+    # only the env + rollout buffer + hidden state are rebuilt on advance. Standalone — does NOT
+    # require `curriculum=True` (which drives the incompatible MultiSplit path).
+    curriculum_gated: bool = False
+    curriculum_gate_score: float = 0.5
+    curriculum_min_stage_iters: int = 20
+    curriculum_stage_splits: tuple = ("train/easy", "train/difficult")
+    # Per-stage max episode length (IR2-style: bigger maps need longer episodes to cover, 196→384).
+    # Empty → keep cfg.env.max_episode_steps for every stage. Else len must match stage_splits.
+    curriculum_stage_steps: tuple = ()
+    # Multi-split eval suite: extra map splits to evaluate at each eval tick (besides the
+    # training split). Each split gets its own 1-env Explorer (canvases differ) and is logged
+    # under eval/<split>/*. eval/score = mean over all suites (also the curriculum gate signal).
+    # Empty → single-suite legacy behavior on the training split.
+    eval_suite_splits: tuple = ()
     # Weights & Biases (off by default → no network unless --wandb). For sweeps the agent
     # passes hyperparameters as CLI flags; everything here is logged as the run config.
     wandb: bool = False
@@ -112,7 +162,20 @@ def _curriculum_weights(progress: float) -> list[float]:
 
 def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
     _normalize_cfg(cfg)
-    if cfg.curriculum:
+    if cfg.curriculum_gated:
+        # Gated curriculum: start on the FIRST stage split (single split; swapped on advance).
+        if cfg.curriculum_stage_steps and \
+                len(cfg.curriculum_stage_steps) != len(cfg.curriculum_stage_splits):
+            raise ValueError(
+                f"curriculum_stage_steps {cfg.curriculum_stage_steps} length must match "
+                f"curriculum_stage_splits {cfg.curriculum_stage_splits}")
+        if cfg.curriculum_stage_steps:
+            cfg.env.max_episode_steps = max(int(cfg.curriculum_stage_steps[0]), cfg.rollout_len)
+        split = load_split(cfg.curriculum_stage_splits[0], device=cfg.device)
+        env = Explorer(split, cfg.env, seed=cfg.seed)
+        print(f"[curriculum] GATED enabled, stages={list(cfg.curriculum_stage_splits)} "
+              f"start='{cfg.curriculum_stage_splits[0]}' max_steps={cfg.env.max_episode_steps}")
+    elif cfg.curriculum:
         splits = [load_split(name, device=cfg.device) for name in cfg.curriculum_splits]
         ms = MultiSplit(splits, weights=_curriculum_weights(0.0))
         env = Explorer(ms, cfg.env, seed=cfg.seed)
@@ -120,16 +183,9 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
     else:
         split = load_split(cfg.split, device=cfg.device)
         env = Explorer(split, cfg.env, seed=cfg.seed)
-    # J.3 — env-derived scales for the cross-agent diversity loss gate.
-    cfg.ppo.canvas_diag = float((env.H ** 2 + env.W ** 2) ** 0.5)
-    cfg.ppo.node_eps = float(cfg.env.nr) * 0.5
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
                             n_heads=cfg.n_heads, n_layers=cfg.n_layers,
-                            switch_margin=cfg.switch_margin,
-                            max_steps_on_option=cfg.max_steps_on_option,
-                            disable_strategic=cfg.disable_strategic,
-                            strategic_gate_eps=cfg.strategic_gate_eps,
-                            target_mode=cfg.env.analytic_target and "analytic" or "learned").to(cfg.device)
+                            strategic_gate_eps=cfg.strategic_gate_eps).to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead", dynamic=False)
@@ -168,8 +224,8 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         logp = out["logp"]
         v_norm = out["value"]
         value = vnorm.denormalize(v_norm)
-        obs_next, reward, done, info = env.step(action, target_choice=out["target_argmax"])
-        buf.store(t, obs, action, logp, value, reward, done, out["target_choice"])
+        obs_next, reward, done, info = env.step(action)
+        buf.store(t, obs, action, logp, value, reward, done)
         er = info["explored_rate"]
         stp = info["step"].float()
         # Accumulate reward-term + metric scalars.
@@ -227,8 +283,9 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
     return h_act, h_crit, ep_end_mean, len(ep_end_explored), agg
 
 
-def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx: int) -> None:
-    """Run a deterministic episode on (eval_split, map_idx) and save a GIF."""
+def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx: int,
+                   split_name: str | None = None) -> None:
+    """Run a deterministic episode on (split_name|eval_split, map_idx) and save a GIF."""
     import imageio.v2 as imageio
     import numpy as np
     from env.maps import sample_batch
@@ -236,7 +293,7 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
     from env.explorer import EnvCfg as _EnvCfg, Explorer as _Explorer
     from env.maps import load_split as _load
 
-    split = _load(cfg.eval_split, device=cfg.device)
+    split = _load(split_name or cfg.eval_split, device=cfg.device)
     # I.2 — mirror the FULL training env cfg (force flags, top_k, n_hops, ...) so the
     # eval render reflects the same comm/sharing behavior used in training.
     env_cfg = _EnvCfg.from_ckpt_dict(
@@ -266,14 +323,26 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
 EVAL_MAP_IDX = (120, 1543, 2877, 4012, 5530, 7211, 8650, 9904)
 
 
+def _eval_map_idxs(eval_env: Explorer, k: int) -> tuple[int, ...]:
+    """Evenly-spaced, in-range, deterministic map indices for a split's eval suite. The fixed
+    EVAL_MAP_IDX tuple targets the big train splits (idx up to ~9904); smaller test splits
+    (corridor=400) need indices clamped to their own size, else reload_map runs out of range."""
+    n = int(getattr(eval_env.split, "n", 0)) or len(EVAL_MAP_IDX)
+    k = max(1, min(k, n))
+    import numpy as _np
+    return tuple(int(i) for i in _np.linspace(0, n - 1, k).round().astype(int))
+
+
 @torch.no_grad()
-def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -> dict:
-    """Deterministic episodes on the fixed EVAL_MAP_IDX maps → eval/* metrics + eval/score.
+def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
+                    map_idxs: tuple[int, ...] | None = None) -> dict:
+    """Deterministic episodes on `map_idxs` (default EVAL_MAP_IDX) → eval/* metrics + eval/score.
 
     Coverage AUC pads an early (successful) finish with its final explored_rate so finishing
     sooner scores strictly higher. contrib_imbalance = max agent share − 1/M of union-new
     cells. sensing_overlap / comm_duty averaged over realized steps.
     """
+    eval_map_idx = tuple(map_idxs) if map_idxs is not None else EVAL_MAP_IDX
     was_training = model.training
     model.eval()
     M = cfg.n_agents
@@ -287,7 +356,7 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
     # active-in-window. Jain fairness catches one agent idle the WHOLE episode; concurrency
     # catches agents that ALTERNATE (Jain-fair but never working at the same time).
     W_CONC = 10
-    for midx in EVAL_MAP_IDX:
+    for midx in eval_map_idx:
         eval_env.reload_map(env_idx=0, map_idx=int(midx))
         h_act, h_crit = model.init_hidden(1, cfg.device)
         obs = eval_env.obs
@@ -301,8 +370,7 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
         s90 = float(T)
         for t in range(T):
             out = model.act(obs, h_act, h_crit, deterministic=True)
-            # No target_choice → target_switch penalty off at eval (reward unused anyway).
-            obs, _r, done, info = eval_env.step(out["action"], target_choice=out["target_argmax"])
+            obs, _r, done, info = eval_env.step(out["action"])
             h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
             er = float(info["explored_rate"][0].item())
             er_curve.append(er)
@@ -358,7 +426,7 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg) -
                           - cfg.score_w_idle * idle_m)
     if was_training:
         model.train()
-    n = float(len(EVAL_MAP_IDX))
+    n = float(len(eval_map_idx))
     mean_imb = sum(imbs) / n
     mean_score = sum(score_maps) / n
     var_score = sum((s - mean_score) ** 2 for s in score_maps) / n
@@ -426,18 +494,39 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     buf = Rollout(sample_obs, T=cfg.rollout_len, N=cfg.n_envs, M=cfg.n_agents,
                   d_hidden=cfg.d_hidden, device=cfg.device)
 
-    # v2 — persistent 1-env eval environment for the fixed eval suite. Mirrors the full
+    # v2 — persistent 1-env eval environment(s) for the fixed eval suite. Mirrors the full
     # training env cfg (force flags, top_k, n_hops, ...) so eval behavior matches training.
     eval_env_cfg = EnvCfg.from_ckpt_dict(cfg.env.__dict__, n_envs=1, n_agents=cfg.n_agents)
-    eval_suite_split = load_split(
-        cfg.curriculum_splits[0] if cfg.curriculum else cfg.split, device=cfg.device)
-    eval_env = Explorer(eval_suite_split, eval_env_cfg, seed=0)
+    train_eval_name = (cfg.curriculum_stage_splits[0] if cfg.curriculum_gated
+                       else cfg.curriculum_splits[0] if cfg.curriculum else cfg.split)
+    eval_env = Explorer(load_split(train_eval_name, device=cfg.device), eval_env_cfg, seed=0)
+    # Multi-split eval: one persistent 1-env Explorer per requested split (canvases differ →
+    # cannot reuse a single graph lattice). Falls back to the single training-split suite when
+    # eval_suite_splits is empty. Each entry: (short_name, Explorer, map_idxs).
+    K_EVAL = len(EVAL_MAP_IDX)
+    if cfg.eval_suite_splits:
+        eval_suites = []
+        for name in cfg.eval_suite_splits:
+            ev = Explorer(load_split(name, device=cfg.device), eval_env_cfg, seed=0)
+            short = name.split("/")[-1]
+            eval_suites.append((short, ev, _eval_map_idxs(ev, K_EVAL)))
+        print(f"[evalsuite] multi-split: {[s[0] for s in eval_suites]}")
+    else:
+        eval_suites = [("", eval_env, _eval_map_idxs(eval_env, K_EVAL))]
 
     steps_per_iter = cfg.n_envs * cfg.rollout_len
     n_iters = max(1, cfg.total_steps // steps_per_iter)
     milestones = {int(round(n_iters * p / 100.0)): p for p in ckpt_pct}
 
     print(f"[train] iters={n_iters}  steps/iter={steps_per_iter}  total≈{n_iters * steps_per_iter:,}")
+    # Gated-curriculum stage state: index into cfg.curriculum_stage_splits, advanced on eval
+    # score. env already starts on stage 0 (make_env_model). Advance SWAPS the split (rebuilds
+    # env + buffer) since stages can have different canvases.
+    cur_stage = 0
+    iters_on_stage = 0
+    if cfg.curriculum_gated:
+        print(f"[curriculum] GATED stage 0='{cfg.curriculum_stage_splits[0]}' "
+              f"gate_score={cfg.curriculum_gate_score} min_iters={cfg.curriculum_min_stage_iters}")
     total_train_time = 0.0      # cumulative collect+update time (eval-free)
     total_env_steps = 0
 
@@ -460,6 +549,13 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
 
     def _finalize() -> None:
         if status["state"] == "training":   # not already marked done
+            # Stop requested (web Stop button / docker stop / Ctrl-C) → SAVE THE POLICY before
+            # exiting so no training is ever lost. status["iter"] tracks the loop in-memory.
+            try:
+                _save_ckpt(cfg.out_dir, model, vnorm, cfg, int(status.get("iter", 0)), "ckpt_stop")
+                status["last_ckpt"] = "ckpt_stop"
+            except Exception as exc:
+                print(f"[finalize] policy save failed ({exc})")
             status["state"] = "stopped"
             _dump_status(cfg.out_dir, status)
     atexit.register(_finalize)
@@ -471,13 +567,104 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     except ValueError:
         pass   # not main thread (e.g. some sweep agents) — atexit still covers normal exit
 
+    def _ondemand_eval(evals: list, tag: str, env_steps: int) -> None:
+        """Run one or more eval suites on demand (web button). `evals` = list of
+        {"split": <name>, "n": <count>}; empty → default eval_split/eval_n_maps. Each suite
+        spins a fresh 1-env Explorer on its split, picks n evenly-spaced maps, logs eval/*,
+        AND emits a GIF + step-through trace per map → unlocks the web inspector (capture_trace
+        also copies inspector.html into the run dir)."""
+        from eval.trace import capture_trace
+        if not evals:
+            evals = [{"split": cfg.eval_split, "n": cfg.eval_n_maps}]
+        for spec in evals:
+            split_name = spec.get("split", cfg.eval_split)
+            n = int(spec.get("n", 1))
+            try:
+                split_obj = load_split(split_name, device=cfg.device)
+                ev = Explorer(split_obj, eval_env_cfg, seed=0)
+            except Exception as exc:
+                print(f"[control] eval split '{split_name}' load failed ({exc})")
+                continue
+            idxs = _eval_map_idxs(ev, n)
+            s = _run_eval_suite(model, ev, cfg, map_idxs=idxs)
+            short = split_name.split("/")[-1]
+            print(f"[control eval tag={tag}] {short}(n={len(idxs)}): "
+                  f"score={s['eval/score']:+.3f} auc={s['eval/coverage_auc']:.3f} "
+                  f"succ={s['eval/success_rate']:.2f} idle={s['eval/idle_rate_max']:.2f}")
+            if wb is not None:
+                wb.log({k.replace("eval/", f"eval/ondemand/{short}/"): v for k, v in s.items()},
+                       step=env_steps)
+            # GIF + trace per map → renders + inspector. capture_trace writes traces/<tag>/ +
+            # traces/index.json + inspector.html into the run dir, so the inspector unlocks.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()       # free fragmentation headroom for the render envs
+            for gi, midx in enumerate(idxs):
+                mtag = f"{tag}_{short}_m{gi}"
+                gif_path = cfg.out_dir / f"eval_{mtag}.gif"
+                try:
+                    _emit_eval_gif(model, cfg, gif_path, int(midx), split_name=split_name)
+                except Exception as exc:
+                    print(f"[control] gif '{mtag}' skipped ({exc})")
+                try:
+                    capture_trace(model, split_obj, cfg.env.__dict__, cfg.n_agents,
+                                  int(midx), cfg.eval_steps, cfg.out_dir, mtag, cfg.device)
+                except Exception as exc:
+                    print(f"[control] trace '{mtag}' skipped ({exc})")
+                if wb is not None and gif_path.exists():
+                    wb.log({f"behavior/ondemand_{short}_m{gi}": wb.Video(str(gif_path), fps=12,
+                                                                         format="gif")},
+                           step=env_steps)
+
     for it in range(1, n_iters + 1):
-        # H.5 — update curriculum weights each iter.
-        if cfg.curriculum and hasattr(env.split, "set_weights"):
+        status["iter"] = it          # in-memory only (no disk write) → _finalize saves at the right iter
+        # Web control channel — the dashboard drops control.json to (a) save a checkpoint + run
+        # the requested eval suites on demand, or (b) hand-switch the curriculum stage. Acted on
+        # at the iteration boundary, then consumed. model/optimizer/vnorm persist across a switch.
+        ctl = _read_control(cfg.out_dir)
+        if ctl:
+            kind = ctl.get("cmd")
+            if kind == "ckpt_eval":
+                tag = str(ctl.get("tag") or f"it{it:04d}")
+                _save_ckpt(cfg.out_dir, model, vnorm, cfg, it, f"ckpt_{tag}")
+                _ondemand_eval(ctl.get("evals", []), tag, total_env_steps)
+                status.update(iter=it, progress_pct=round(100.0 * it / n_iters, 1),
+                              last_ckpt=f"ckpt_{tag}", env_steps=total_env_steps)
+                _dump_status(cfg.out_dir, status)
+            elif kind == "switch_stage":
+                # Manual split swap — same rebuild as the gated advance (canvas/N_max may differ).
+                _STAGE = {"easy": ("train/easy", 196), "difficult": ("train/difficult", 384)}
+                if ctl.get("split"):
+                    new_split = str(ctl["split"])
+                    new_steps = int(ctl.get("max_steps", cfg.env.max_episode_steps))
+                elif ctl.get("stage") in _STAGE:
+                    new_split, new_steps = _STAGE[ctl["stage"]]
+                else:
+                    new_split = None
+                    print(f"[control] switch_stage: unknown stage/split ({ctl})")
+                if new_split:
+                    cfg.env.max_episode_steps = max(int(new_steps), cfg.rollout_len)
+                    env = Explorer(load_split(new_split, device=cfg.device), cfg.env, seed=cfg.seed)
+                    buf = Rollout(env.obs, T=cfg.rollout_len, N=cfg.n_envs, M=cfg.n_agents,
+                                  d_hidden=cfg.d_hidden, device=cfg.device)
+                    h_act, h_crit = model.init_hidden(cfg.n_envs, cfg.device)
+                    cfg.split = new_split
+                    iters_on_stage = 0
+                    status.update(split=new_split)
+                    _dump_status(cfg.out_dir, status)
+                    print(f"[control] MANUAL stage switch → '{new_split}' "
+                          f"max_steps={cfg.env.max_episode_steps}; env+buffer rebuilt "
+                          f"({env.H}×{env.W})")
+            else:
+                print(f"[control] unknown cmd ({ctl})")
+
+        # H.5 — update curriculum weights each iter. GATED mode advances on eval score (in the
+        # eval block below), so here only the legacy fixed time-ramp touches the weights.
+        if cfg.curriculum and not cfg.curriculum_gated and hasattr(env.split, "set_weights"):
             new_w = _curriculum_weights(it / max(1, n_iters))
             if new_w != env.split.weights:
                 env.split.set_weights(new_w)
                 print(f"[curriculum] iter={it} weights={new_w}")
+        iters_on_stage += 1
         buf.h_actor_init.copy_(h_act.detach())
         buf.h_critic_init.copy_(h_crit.detach())
         t_collect = time.time()
@@ -511,15 +698,51 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"pg={stats['pg_loss']:+.4f}  v={stats['v_loss']:.4f}  "
                   f"ent={stats['entropy']:.3f}  kl={stats['kl']:+.4f}  "
                   f"clip={stats['clipfrac']*100:.1f}%  "
-                  f"div={stats.get('div_loss', 0.0):.4f} "
                   f"redun={redundancy:.2f} stall={stall_rate*100:.0f}% "
                   f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
                   f"sps={sps_iter:.0f}({sps_all:.0f}avg)")
-        # v2 — fixed eval suite: deterministic episodes on EVAL_MAP_IDX. The sweep
+        # Live heartbeat for the web dashboard: refresh iter/progress/sps EVERY iter (status.json
+        # is a tiny atomic write; iters are seconds apart so this is free). Previously written only
+        # at milestones, so the card's iter + progress bar sat frozen between them.
+        status.update(iter=it, progress_pct=round(100.0 * it / n_iters, 1),
+                      env_steps=total_env_steps, sps=round(sps_iter),
+                      ep_end_pct=(round(ep_end_mean * 100, 1) if ep_end_n > 0
+                                  else status.get("ep_end_pct")))
+        _dump_status(cfg.out_dir, status)
+        # v2 — fixed eval suite: deterministic episodes on per-split fixed maps. The sweep
         # maximizes eval/score (comparable across trials — same maps, no sampling noise).
+        # Multi-split: run each suite, log eval/<split>/* + aggregate eval/* = mean over splits.
         eval_stats: dict = {}
         if it % cfg.eval_every == 0 or it == n_iters:
-            eval_stats = _run_eval_suite(model, eval_env, cfg)
+            per_suite = []
+            for short, ev, midxs in eval_suites:
+                s = _run_eval_suite(model, ev, cfg, map_idxs=midxs)
+                per_suite.append((short, s))
+                if short:   # multi-split: also expose each split's metrics
+                    for k, v in s.items():
+                        eval_stats[k.replace("eval/", f"eval/{short}/")] = v
+            # Aggregate = mean over suites → primary eval/* (and the curriculum gate signal).
+            keys = per_suite[0][1].keys()
+            for k in keys:
+                eval_stats[k] = sum(s[k] for _, s in per_suite) / len(per_suite)
+            # Inspector is mandatory for every run: on the FIRST eval tick (no traces yet) capture
+            # one trace so the inspector unlocks automatically — no button press needed. capture_trace
+            # also copies inspector.html into the run dir.
+            if not (cfg.out_dir / "traces" / "index.json").exists():
+                try:
+                    from eval.trace import capture_trace
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()   # free fragmentation headroom for the render env
+                    _short, _ev, _midxs = eval_suites[0]
+                    capture_trace(model, _ev.split, cfg.env.__dict__, cfg.n_agents,
+                                  int(_midxs[0]), cfg.eval_steps, cfg.out_dir,
+                                  f"auto_it{it:04d}", cfg.device)
+                    print(f"[inspector] auto trace captured (it={it}) → inspector unlocked")
+                except Exception as exc:
+                    print(f"[inspector] auto trace skipped ({exc})")
+            split_str = ("  [" + " ".join(
+                f"{sh or 'train'}={s['eval/score']:+.2f}" for sh, s in per_suite) + "]") \
+                if len(per_suite) > 1 else ""
             print(f"[evalsuite it={it:4d}] score={eval_stats['eval/score']:+.3f}"
                   f"±{eval_stats['eval/score_std']:.3f}  "
                   f"auc={eval_stats['eval/coverage_auc']:.3f}  "
@@ -530,7 +753,28 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"ov={eval_stats['eval/sensing_overlap']:.2f}  "
                   f"duty={eval_stats['eval/comm_duty']:.2f}  "
                   f"succ={eval_stats['eval/success_rate']:.2f}  "
-                  f"s90={eval_stats['eval/steps_to_90']:.0f}")
+                  f"s90={eval_stats['eval/steps_to_90']:.0f}{split_str}")
+            # GATED curriculum: advance to the next split when the suite score clears the gate
+            # AND the current stage has had its minimum dwell (avoids advancing on a noisy early
+            # spike). Advance SWAPS the training split → rebuild env + buffer (canvas/N_max may
+            # differ) and zero the hidden state; the model + optimizer + value-norm persist.
+            if (cfg.curriculum_gated
+                    and cur_stage < len(cfg.curriculum_stage_splits) - 1
+                    and eval_stats["eval/score"] >= cfg.curriculum_gate_score
+                    and iters_on_stage >= cfg.curriculum_min_stage_iters):
+                cur_stage += 1
+                iters_on_stage = 0
+                next_name = cfg.curriculum_stage_splits[cur_stage]
+                if cfg.curriculum_stage_steps:
+                    cfg.env.max_episode_steps = max(
+                        int(cfg.curriculum_stage_steps[cur_stage]), cfg.rollout_len)
+                env = Explorer(load_split(next_name, device=cfg.device), cfg.env, seed=cfg.seed)
+                buf = Rollout(env.obs, T=cfg.rollout_len, N=cfg.n_envs, M=cfg.n_agents,
+                              d_hidden=cfg.d_hidden, device=cfg.device)
+                h_act, h_crit = model.init_hidden(cfg.n_envs, cfg.device)
+                print(f"[curriculum] GATED advance → stage {cur_stage} split='{next_name}' "
+                      f"(score {eval_stats['eval/score']:+.3f} ≥ {cfg.curriculum_gate_score}); "
+                      f"env+buffer rebuilt (canvas {env.H}×{env.W}, max_steps={env.cfg.max_episode_steps})")
         if wb is not None:
             log = {
                 "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],

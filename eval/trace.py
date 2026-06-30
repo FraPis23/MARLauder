@@ -100,7 +100,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     completed = False        # episode reached complete_thresh coverage
     for t in range(n_steps):
         gate = model._strategic_gate(obs, M)
-        out = model.act(obs, h_act, h_crit, deterministic=True, nr=nr)
+        out = model.act(obs, h_act, h_crit, deterministic=True)
         rg = env._render_global
         nf = rg["node_feat"][0].cpu().numpy()
         nv = rg["node_valid"][0].cpu().numpy()
@@ -141,7 +141,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         Nw = nf_full.shape[2]
         with torch.no_grad():                                 # baseline logit at zeroed features
             obs_b = dict(obs); obs_b["node_feat"] = torch.zeros_like(nf_full)
-            base_logit = model.act(obs_b, h_act, h_crit, deterministic=True, nr=nr)["logits"][0].cpu().numpy()
+            base_logit = model.act(obs_b, h_act, h_crit, deterministic=True)["logits"][0].cpu().numpy()
         with torch.enable_grad():
             # Batch the S interpolation points into the env dimension (each alpha = one
             # independent env, actor is per-env) → ONE forward + M·K backward (not M·K·S).
@@ -153,7 +153,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             obs_g["node_feat"] = x
             ha = h_act.expand(IG_STEPS, *h_act.shape[1:])                # [S, M, d]
             hc = h_crit.expand(IG_STEPS, *h_crit.shape[1:])             # [S, d]
-            lg = model.act(obs_g, ha, hc, deterministic=True, nr=nr)["logits"]  # [S, M, K]
+            lg = model.act(obs_g, ha, hc, deterministic=True)["logits"]  # [S, M, K]
             for a in range(M):
                 for k in range(K):
                     if not bool(amask[a, k]):
@@ -176,7 +176,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             fr = compute_frontier(env.world.occupancy_torch[0:1, a])[0].cpu().numpy()
             agent_frames[a].append(paint_frontier(shade_occupancy_prob(prob), fr))   # → animated GIF later
 
-        obs, reward, done, info = env.step(out["action"], target_choice=out["target_argmax"])
+        obs, reward, done, info = env.step(out["action"])
         dbg = env._dbg_reward or {}
 
         rec = {"t": t, "agents": []}
@@ -291,7 +291,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             "final_explored": _r(explored) if explored is not None else None,
             "completed": bool(completed),
             "gate_eps": getattr(model, "strategic_gate_eps", 0.0),
-            "target_mode": getattr(model, "target_mode", "analytic"),
+            "target_mode": "analytic",
             "feat_names": F_NAMES}   # input-feature names for the per-neighbor attribution
     (tdir / "trace.json").write_text(json.dumps({"meta": meta, "steps": steps}))
 

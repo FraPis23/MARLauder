@@ -50,47 +50,15 @@ class EvalRollout:
         for t in range(self.cfg.max_steps):
             out = self.model.act(obs, h_act, h_crit, deterministic=self.cfg.deterministic)
             action = out["action"]
-            # G.3.a/b — snapshot strategic head's chosen target + BF path BEFORE env.step.
-            target_choice_t = out["target_choice"]                              # [N, M] long
-            cand_xy_now = obs["cand_xy"]                                        # [N, M, K, 2]
-            cand_idx_now = obs["cand_idx"]                                      # [N, M, K] long
-            bf_parent_now = obs["bf_parent_from_curr"]                          # [N, M, N_max]
-            curr_idx_global_now = obs["curr_idx_global"]                        # [N, M]
-            K_cand = cand_xy_now.shape[-2]
-            node_xy_global = env.graph.node_xy                                  # [N_max, 2]
-            strategic_target_xy: list[tuple[float, float]] = [(0.0, 0.0)] * M
-            strategic_path_xy: list[np.ndarray] = [None] * M                    # [P, 2] per ag
-            for ag in range(M):
-                k_slot = int(target_choice_t[e, ag].item())
-                if 0 <= k_slot < K_cand:
-                    strategic_target_xy[ag] = (
-                        float(cand_xy_now[e, ag, k_slot, 0].item()),
-                        float(cand_xy_now[e, ag, k_slot, 1].item()),
-                    )
-                    # Walk BF parent from cand back to curr to build correct path.
-                    cand_global = int(cand_idx_now[e, ag, k_slot].item())
-                    curr_global = int(curr_idx_global_now[e, ag].item())
-                    if cand_global >= 0:
-                        path_nodes = [cand_global]
-                        cur_n = cand_global
-                        # Walk parent ≤ 200 steps (safety). parent[v]=-1 means unreachable.
-                        for _ in range(200):
-                            par_n = int(bf_parent_now[e, ag, cur_n].item())
-                            if par_n < 0 or par_n == cur_n:
-                                break
-                            path_nodes.append(par_n)
-                            if par_n == curr_global:
-                                break
-                            cur_n = par_n
-                        # Reverse so path runs curr → ... → cand.
-                        path_nodes.reverse()
-                        xy_arr = np.array(
-                            [(float(node_xy_global[n, 0].item()),
-                              float(node_xy_global[n, 1].item())) for n in path_nodes],
-                            dtype=np.float32,
-                        )
-                        strategic_path_xy[ag] = xy_arr
-            obs, reward, done, info = env.step(action, target_choice=out["target_argmax"])
+            # The pursued target is the env's analytic guidepost: its world coords +
+            # curr→target BF path are shipped in obs. Snapshot BEFORE env.step.
+            gp_target_xy = obs["guidepost_target_xy"]                           # [N, M, 2]
+            strategic_target_xy: list[tuple[float, float]] = [
+                (float(gp_target_xy[e, ag, 0].item()), float(gp_target_xy[e, ag, 1].item()))
+                for ag in range(M)
+            ]
+            strategic_path_xy: list[np.ndarray] = [None] * M                    # use obs path below
+            obs, reward, done, info = env.step(action)
             h_act = out["hidden_actor"]
             h_crit = out["hidden_critic"]
             nonterm = (~done).float()

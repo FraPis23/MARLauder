@@ -44,6 +44,49 @@
   .empty-state code{color:var(--txt);background:#1c2330;padding:1px 6px;border-radius:4px}
   #foot{color:var(--dim);font-size:11px;margin-top:14px}
   .current-label{color:var(--ok);font-size:11px}
+  .control{margin-top:11px;padding-top:10px;border-top:1px solid var(--line)}
+  .ctl-title{color:var(--dim);font-size:10px;letter-spacing:.6px;text-transform:uppercase;margin:6px 0 5px}
+  .ctl-evals{display:flex;flex-direction:column;gap:5px;margin-bottom:6px}
+  .ctl-eval-row{display:flex;gap:6px;align-items:center}
+  .ctl-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+  .control select,.control input{background:#1c2330;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:3px 7px;font:inherit;font-size:11px}
+  .control select{flex:1;min-width:0}
+  .ctl-n{width:60px;flex-shrink:0}
+  .btn-del-eval{padding:3px 8px;flex-shrink:0}
+  .ctl-msg{font-size:11px;min-height:15px;color:var(--dim)}
+  .ctl-msg.ok{color:var(--ok)}
+  .ctl-msg.err{color:var(--warn)}
+  /* Launch panel */
+  .launch{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin-bottom:22px}
+  .launch-head{display:flex;align-items:center;gap:10px;padding:11px 16px;cursor:pointer;user-select:none}
+  .launch-head h2{font-size:13px;color:var(--accent);letter-spacing:.4px}
+  .launch-head .chev{margin-left:auto;color:var(--dim);transition:transform .15s}
+  .launch.open .chev{transform:rotate(90deg)}
+  .launch-body{display:none;padding:0 16px 14px;border-top:1px solid var(--line)}
+  .launch.open .launch-body{display:block}
+  .lform{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px;margin:12px 0}
+  .lf{display:flex;flex-direction:column;gap:3px}
+  .lf label{color:var(--dim);font-size:10px;letter-spacing:.4px;text-transform:uppercase}
+  .lf input,.lf select{background:#1c2330;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:5px 8px;font:inherit;font-size:12px}
+  .lf.wide{grid-column:1/-1}
+  .lf.check{flex-direction:row;align-items:center;gap:6px}
+  .lf.check label{text-transform:none;font-size:12px;color:var(--txt)}
+  .launch-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .launch-msg{font-size:12px;color:var(--dim)}
+  .launch-msg.ok{color:var(--ok)}
+  .launch-msg.err{color:var(--warn)}
+  /* Live log console + params view */
+  .console{display:none;margin-top:10px;background:#0a0c10;border:1px solid var(--line);border-radius:6px;
+           padding:9px 11px;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+           font-size:11px;line-height:1.45;color:#b8c4d8}
+  .console.open{display:block}
+  .params-view{display:none;margin-top:9px;background:#0a0c10;border:1px solid var(--line);border-radius:6px;
+               padding:9px 11px;font-size:11px;color:#b8c4d8;overflow:auto}
+  .params-view.open{display:block}
+  .params-view table{border-collapse:collapse;width:100%}
+  .params-view td{padding:2px 8px;border-bottom:1px solid #161b24}
+  .params-view td.k{color:var(--dim)}
+  .params-view td.v{color:var(--txt);text-align:right;word-break:break-all}
 </style>
 </head>
 <body>
@@ -52,6 +95,22 @@
   <p class="sub">auto-refreshes every 30 s &nbsp;·&nbsp; <a href="#" onclick="load();return false">refresh now</a></p>
 </header>
 
+<div class="launch" id="launch">
+  <div class="launch-head" onclick="document.getElementById('launch').classList.toggle('open')">
+    <h2>▶ Start a training</h2>
+    <span class="chev">▸</span>
+  </div>
+  <div class="launch-body">
+    <p class="sub" style="margin:10px 0 0">Every flag below. Hover a label for its description. Only non-default values are passed.</p>
+    <div class="lform" id="lform"></div>
+    <div class="launch-actions">
+      <button class="btn primary" onclick="startTraining()">Start training</button>
+      <button class="btn" onclick="resetLaunchForm()">Reset to defaults</button>
+      <span class="launch-msg" id="launch-msg"></span>
+    </div>
+  </div>
+</div>
+
 <div id="root"></div>
 <p id="foot"></p>
 
@@ -59,6 +118,94 @@
 const fmtTime = ts => ts
   ? new Date(ts * 1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
   : '—';
+
+// ---- Launch form (auto-built from /api/argschema) -------------------------------------
+let LAUNCH_DEFAULTS = null;
+let ARG_SCHEMA = null;
+
+function esc(s) { return String(s).replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+
+function buildLaunchForm(schema) {
+  const html = schema.filter(f => f.dest !== 'out').map(f => {
+    const tip = esc(f.help || '');
+    const lbl = `<label title="${tip}">${f.flag}</label>`;
+    if (f.kind === 'bool')
+      return `<div class="lf check" title="${tip}"><input data-k="${f.dest}" data-kind="bool" type="checkbox"><label>${f.flag}</label></div>`;
+    if (f.kind === 'choice') {
+      // optional choice (default null, e.g. --stage) needs an explicit "unset" option,
+      // else the select silently forces the first value → bogus flag passed.
+      const blank = (f.default === null || f.default === undefined)
+        ? `<option value="">(none / default)</option>` : '';
+      const opts = f.choices.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+      return `<div class="lf" title="${tip}">${lbl}<select data-k="${f.dest}" data-kind="choice">${blank}${opts}</select></div>`;
+    }
+    const step = f.kind === 'float' ? ' step="any"' : '';
+    const type = (f.kind === 'int' || f.kind === 'float') ? 'number' : 'text';
+    return `<div class="lf" title="${tip}">${lbl}<input data-k="${f.dest}" data-kind="${f.kind}" type="${type}"${step}></div>`;
+  }).join('');
+  // free-form catch-all for any flag not worth a field
+  const extra = `<div class="lf wide" title="raw args appended verbatim, e.g. --eval-suite-splits test/corridor,test/complex">
+    <label>extra args (raw)</label><input data-k="extra_args" data-kind="str" type="text"></div>`;
+  document.getElementById('lform').innerHTML = html + extra;
+}
+
+function fillLaunchForm(p) {
+  document.querySelectorAll('#lform [data-k]').forEach(el => {
+    const k = el.dataset.k;
+    if (!(k in p)) return;
+    if (el.dataset.kind === 'bool') el.checked = !!p[k];
+    else el.value = (p[k] === null || p[k] === undefined) ? '' : p[k];
+  });
+}
+
+function readLaunchForm() {
+  const p = {};
+  document.querySelectorAll('#lform [data-k]').forEach(el => {
+    const k = el.dataset.k, kind = el.dataset.kind;
+    if (kind === 'bool') p[k] = el.checked;
+    else if (kind === 'int') p[k] = el.value === '' ? null : (parseInt(el.value) || 0);
+    else if (kind === 'float') p[k] = el.value === '' ? null : (parseFloat(el.value) || 0);
+    else p[k] = el.value;
+  });
+  return p;
+}
+
+async function initLaunchForm() {
+  try {
+    const [schema, defaults, last] = await Promise.all([
+      fetch('/api/argschema').then(r => r.json()),
+      fetch('/api/defaults').then(r => r.json()),
+      fetch('/api/launch_params').then(r => r.json()),
+    ]);
+    ARG_SCHEMA = schema; LAUNCH_DEFAULTS = defaults;
+    buildLaunchForm(schema);
+    fillLaunchForm(last);   // last-used (persisted server-side), falls back to defaults
+  } catch(e) { document.getElementById('lform').innerHTML = '<p class="sub">launch API unavailable</p>'; }
+}
+
+function resetLaunchForm() {
+  if (LAUNCH_DEFAULTS) fillLaunchForm(LAUNCH_DEFAULTS);
+  setLaunchMsg('form reset to defaults (not yet saved — saved on next Start)', 'ok');
+}
+
+function setLaunchMsg(t, cls) {
+  const m = document.getElementById('launch-msg');
+  m.textContent = t; m.className = 'launch-msg ' + (cls || '');
+}
+
+async function startTraining() {
+  const p = readLaunchForm();
+  setLaunchMsg('launching…', '');
+  try {
+    const res = await fetch('/api/launch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(p),
+    });
+    if (!res.ok) { setLaunchMsg('error: HTTP ' + res.status, 'err'); return; }
+    const j = await res.json();
+    setLaunchMsg(`started: ${j.run} (pid ${j.pid})`, 'ok');
+    setTimeout(load, 1200);   // refresh the run list so the new card + log appear
+  } catch(e) { setLaunchMsg('error: ' + e.message, 'err'); }
+}
 
 function card(r, isCurrent) {
   const s = r.status;
@@ -100,6 +247,27 @@ function card(r, isCurrent) {
   const metaHtml = rows.map(([k,v]) => `<span>${k}</span>${v}`).join('');
   const canInspect = r.has_inspector && r.has_traces;
 
+  // Live control panel — only for an actively-training run on this host. Lets you fire an
+  // on-demand checkpoint+eval (choosing map type + count per suite) and hand-switch the stage.
+  const controlHtml = r.state === 'training' ? `
+    <div class="control" data-run="${encodeURIComponent(r.name)}">
+      <div class="ctl-title">On-demand checkpoint + eval</div>
+      <div class="ctl-evals"></div>
+      <div class="ctl-row">
+        <button class="btn btn-add-eval">+ map type</button>
+        <button class="btn primary btn-ckpt-eval">Checkpoint + Eval now</button>
+      </div>
+      <div class="ctl-title">Switch stage</div>
+      <div class="ctl-row">
+        <select class="ctl-stage">
+          <option value="easy">easy (train/easy @196)</option>
+          <option value="difficult">difficult (train/difficult @384)</option>
+        </select>
+        <button class="btn btn-switch">Switch</button>
+      </div>
+      <div class="ctl-msg"></div>
+    </div>` : '';
+
   return `<div class="card ${r.state}">
     <div class="name">${r.name} ${badgeHtml} ${currentLabel}</div>
     ${progressHtml}
@@ -107,14 +275,200 @@ function card(r, isCurrent) {
     <div class="actions">
       <a class="btn primary${canInspect?'':' off'}" href="/${r.name}/inspector.html">Open Inspector</a>
       <a class="btn" href="/${r.name}/" target="_blank">Browse files</a>
+      ${r.has_log ? `<button class="btn btn-log" data-run="${encodeURIComponent(r.name)}">Show log</button>` : ''}
+      ${r.has_params ? `<button class="btn btn-params" data-run="${encodeURIComponent(r.name)}">Params</button>` : ''}
+      ${r.has_ckpts ? `<button class="btn btn-evalck" data-run="${encodeURIComponent(r.name)}">Evaluate checkpoint</button>` : ''}
+      ${r.state === 'training' ? `<button class="btn btn-stop" data-run="${encodeURIComponent(r.name)}">Stop &amp; save</button>` : ''}
     </div>
+    ${r.has_ckpts ? `<div class="control evalck" data-run="${encodeURIComponent(r.name)}" style="display:none">
+      <div class="ctl-title">Evaluate a saved checkpoint → GIFs + inspector</div>
+      <div class="ctl-eval-row">
+        <select class="evk-ckpt" title="policy checkpoint"><option value="">loading…</option></select>
+        <select class="evk-split" title="map type">${splitOptions('test/hybrid')}</select>
+      </div>
+      <div class="ctl-row">
+        <input class="evk-n" type="number" min="1" max="32" value="3" title="how many maps">
+        <input class="evk-steps" type="number" min="16" max="2000" value="256" title="episode steps">
+        <button class="btn primary btn-evalck-run">Run eval</button>
+      </div>
+      <div class="ctl-msg"></div>
+    </div>` : ''}
+    ${r.has_params ? `<div class="params-view" data-run="${encodeURIComponent(r.name)}"></div>` : ''}
+    ${r.has_log ? `<pre class="console" data-run="${encodeURIComponent(r.name)}"></pre>` : ''}
+    ${controlHtml}
   </div>`;
 }
 
-async function load() {
+// ---- Live log console (poll /api/log, tail-follow) -------------------------------------
+const LOG_POLLERS = {};   // run → interval id
+
+async function pollLog(run, pre) {
+  const offset = parseInt(pre.dataset.offset || '0');
   try {
-    const runs = await fetch('/api/runs').then(r => r.json());
+    const j = await fetch(`/api/log?run=${run}&offset=${offset}`).then(r => r.json());
+    if (j.data) {
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      pre.textContent += j.data;
+      pre.dataset.offset = j.offset;
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+  } catch(e) { /* transient */ }
+}
+
+function toggleLog(run, pre) {
+  if (pre.classList.contains('open')) {
+    pre.classList.remove('open');
+    clearInterval(LOG_POLLERS[run]); delete LOG_POLLERS[run];
+  } else {
+    pre.classList.add('open');
+    pre.textContent = ''; pre.dataset.offset = '0';
+    pollLog(run, pre);
+    LOG_POLLERS[run] = setInterval(() => pollLog(run, pre), 1500);
+  }
+}
+
+async function toggleParams(run, view) {
+  if (view.classList.contains('open')) { view.classList.remove('open'); return; }
+  view.classList.add('open');
+  view.textContent = 'loading…';
+  try {
+    const j = await fetch(`/${run}/params.json`).then(r => r.json());
+    const p = j.params || j;
+    const rows = Object.entries(p).map(([k, v]) =>
+      `<tr><td class="k">${k}</td><td class="v">${v === '' ? '—' : v}</td></tr>`).join('');
+    view.innerHTML = `<table>${rows}</table>` +
+      (j.cmd ? `<div style="margin-top:7px;color:var(--dim);word-break:break-all">$ ${j.cmd}</div>` : '');
+  } catch(e) { view.textContent = 'no params.json'; }
+}
+
+let SPLITS = [];
+
+function splitOptions(sel) {
+  return SPLITS.map(s => `<option value="${s}"${s===sel?' selected':''}>${s}</option>`).join('');
+}
+
+function evalRowHtml() {
+  return `<div class="ctl-eval-row">
+    <select class="ctl-split">${splitOptions('test/complex')}</select>
+    <input class="ctl-n" type="number" min="1" max="64" value="3" title="how many maps">
+    <button class="btn btn-del-eval" title="remove">✕</button>
+  </div>`;
+}
+
+async function postControl(panel, body) {
+  const run = panel.dataset.run;
+  const msg = panel.querySelector('.ctl-msg');
+  msg.textContent = 'sending…';
+  try {
+    const res = await fetch(`/api/control?run=${run}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    msg.textContent = res.ok
+      ? `queued: ${body.cmd} (applies at next iteration)`
+      : `error: HTTP ${res.status}`;
+    msg.className = 'ctl-msg ' + (res.ok ? 'ok' : 'err');
+  } catch(e) {
+    msg.textContent = 'error: ' + e.message;
+    msg.className = 'ctl-msg err';
+  }
+}
+
+// Event delegation on #root — survives the innerHTML refresh every 30 s.
+function onRootClick(e) {
+  // Per-card log / params toggles (outside the .control panel).
+  if (e.target.classList.contains('btn-log')) {
+    const run = e.target.dataset.run;
+    const pre = e.target.closest('.card').querySelector(`.console[data-run="${run}"]`);
+    if (pre) { toggleLog(run, pre); e.target.textContent = pre.classList.contains('open') ? 'Hide log' : 'Show log'; }
+    return;
+  }
+  if (e.target.classList.contains('btn-params')) {
+    const run = e.target.dataset.run;
+    const view = e.target.closest('.card').querySelector(`.params-view[data-run="${run}"]`);
+    if (view) toggleParams(run, view);
+    return;
+  }
+  if (e.target.classList.contains('btn-evalck')) {
+    const run = e.target.dataset.run;
+    const panel = e.target.closest('.card').querySelector(`.evalck[data-run="${run}"]`);
+    if (!panel) return;
+    const showing = panel.style.display !== 'none';
+    panel.style.display = showing ? 'none' : 'block';
+    e.target.textContent = showing ? 'Evaluate checkpoint' : 'Hide eval';
+    if (!showing) {   // populate the checkpoint dropdown on open
+      const sel = panel.querySelector('.evk-ckpt');
+      fetch(`/api/ckpts?run=${run}`).then(r => r.json()).then(list => {
+        sel.innerHTML = list.length
+          ? list.map(c => `<option value="${c}">${c}</option>`).join('')
+          : '<option value="">(no checkpoints yet)</option>';
+      }).catch(() => { sel.innerHTML = '<option value="">(error)</option>'; });
+    }
+    return;
+  }
+  if (e.target.classList.contains('btn-evalck-run')) {
+    const panel = e.target.closest('.evalck'), run = panel.dataset.run;
+    const msg = panel.querySelector('.ctl-msg');
+    const ckpt = panel.querySelector('.evk-ckpt').value;
+    if (!ckpt) { msg.textContent = 'pick a checkpoint'; msg.className = 'ctl-msg err'; return; }
+    const body = {
+      run, ckpt,
+      split: panel.querySelector('.evk-split').value,
+      n_maps: Math.max(1, parseInt(panel.querySelector('.evk-n').value) || 1),
+      steps: Math.max(16, parseInt(panel.querySelector('.evk-steps').value) || 256),
+    };
+    msg.textContent = 'launching eval…'; msg.className = 'ctl-msg';
+    fetch('/api/eval', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+      .then(r => r.json())
+      .then(j => { msg.textContent = j.ok ? `eval running (pid ${j.pid}); inspector unlocks when done` : ('error: ' + (j.error || '')); msg.className = 'ctl-msg ' + (j.ok ? 'ok' : 'err'); })
+      .catch(err => { msg.textContent = 'error: ' + err.message; msg.className = 'ctl-msg err'; });
+    return;
+  }
+  if (e.target.classList.contains('btn-stop')) {
+    const run = e.target.dataset.run, btn = e.target;
+    if (!confirm(`Stop training "${run}" and save the policy (ckpt_stop.pt)?`)) return;
+    btn.textContent = 'stopping…'; btn.disabled = true;
+    fetch(`/api/stop?run=${run}`, { method: 'POST' })
+      .then(r => r.json())
+      .then(j => { btn.textContent = j.ok ? 'stopped (saved)' : ('err: ' + (j.error || '')); setTimeout(load, 1500); })
+      .catch(err => { btn.textContent = 'err'; btn.disabled = false; });
+    return;
+  }
+  const panel = e.target.closest('.control');
+  if (!panel) return;
+  if (e.target.classList.contains('btn-add-eval')) {
+    panel.querySelector('.ctl-evals').insertAdjacentHTML('beforeend', evalRowHtml());
+  } else if (e.target.classList.contains('btn-del-eval')) {
+    e.target.closest('.ctl-eval-row').remove();
+  } else if (e.target.classList.contains('btn-ckpt-eval')) {
+    const evals = [...panel.querySelectorAll('.ctl-eval-row')].map(row => ({
+      split: row.querySelector('.ctl-split').value,
+      n: Math.max(1, parseInt(row.querySelector('.ctl-n').value) || 1),
+    }));
+    postControl(panel, { cmd: 'ckpt_eval', tag: 'web' + Date.now(), evals });
+  } else if (e.target.classList.contains('btn-switch')) {
+    const stage = panel.querySelector('.ctl-stage').value;
+    if (confirm(`Switch this run to stage "${stage}"? Env + buffer rebuild; weights kept.`))
+      postControl(panel, { cmd: 'switch_stage', stage });
+  }
+}
+
+async function load() {
+  // Don't wipe the DOM while a live log console is open — the re-render would kill it.
+  // (The console keeps polling itself; use "refresh now" to update the run list.)
+  if (Object.keys(LOG_POLLERS).length) {
+    document.getElementById('foot').textContent =
+      'Auto-refresh paused (log open) · ' + new Date().toLocaleTimeString();
+    return;
+  }
+  try {
+    const [runs, splits] = await Promise.all([
+      fetch('/api/runs').then(r => r.json()),
+      SPLITS.length ? Promise.resolve(SPLITS) : fetch('/api/splits').then(r => r.json()).catch(() => []),
+    ]);
+    SPLITS = splits;
     const root = document.getElementById('root');
+    if (!root._ctlBound) { root.addEventListener('click', onRootClick); root._ctlBound = true; }
     if (!runs.length) {
       root.innerHTML = `<div class="empty-state">
         No runs yet.<br>
@@ -144,12 +498,17 @@ async function load() {
       </div>`;
     }
     root.innerHTML = html;
+    // Seed each fresh control panel with one eval row.
+    root.querySelectorAll('.ctl-evals').forEach(c => {
+      if (!c.children.length) c.insertAdjacentHTML('beforeend', evalRowHtml());
+    });
     document.getElementById('foot').textContent = 'Last fetched: ' + new Date().toLocaleTimeString();
   } catch(e) {
     document.getElementById('root').innerHTML = `<div class="empty-state">Error: ${e.message}</div>`;
   }
 }
 
+initLaunchForm();
 load();
 setInterval(load, 30000);
 </script>
