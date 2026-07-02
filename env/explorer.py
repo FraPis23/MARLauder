@@ -105,7 +105,12 @@ class EnvCfg:
     ss_xg_max: float = 13.0
     ss_k_min: float = 0.0               # obstacle shadowing noise K ~ U[min,max], per episode
     ss_k_max: float = 13.0
-    step_penalty_coef: float = 0.1     # total step penalty over episode = coef (scaled by 1/max_steps)
+    # Per-move traversal cost, charged PER LATTICE-EDGE LENGTH (not amortized over the episode):
+    # an AXIAL step costs `step_penalty_coef`, a DIAGONAL step costs `step_penalty_coef·√2` (it
+    # covers √2× the distance / takes √2× the time). Sized to be comparable to the dense terms
+    # (novel ~0.04-0.1 per productive step) so movement has a real price → shorter paths preferred,
+    # diagonals only taken when they actually cover more ground, and every loop step bleeds cost.
+    step_penalty_coef: float = 0.015   # axial-step cost in reward units (diagonal = ·√2)
     completion_bonus: float = 10.0     # reward given at the terminal step when explored >= threshold
     n_hops: int = 6                     # ego-centric encoder window radius (window_side = 2·n_hops + 3); GAT n_layers tied to this
     # Phase D — per-agent reward shaping (lattice-level set ops, baselined at last comm).
@@ -439,7 +444,7 @@ class Explorer:
         # NR for axial, NR·√2 for diagonal). Charged by the chosen action's edge length; an
         # invalid / no-move pick costs 0 (standing still is handled by the stall penalty).
         NR = float(self.cfg.nr)
-        step_cost = self.cfg.step_penalty_coef / max(1, self.cfg.max_episode_steps)
+        step_cost = self.cfg.step_penalty_coef                                       # per-axial-step cost
         move_len = self.graph.edge_len[action]                                       # [N, M] px
         chosen_valid_sp = torch.gather(
             self._last_obs["curr_nbr_valid"], -1, action.unsqueeze(-1)
@@ -553,16 +558,28 @@ class Explorer:
             sub_pos = torch.where(collide_wall.unsqueeze(-1), self.pos, sub_pos)
             # Agent-agent collision: asymmetric yield. Robots physically cannot overlap, but
             # reverting BOTH deadlocks adjacent agents contesting the same cell. Instead the
-            # lower-priority agent (higher _collision_key) yields (holds prev pos) while the
-            # winner advances. The winner reverts too only if it is STILL within min_dist of
-            # the loser's hold cell (true blockage, e.g. loser sits on the only path).
+            # lower-priority agent yields (holds prev pos) while the winner advances. The winner
+            # reverts too only if it is STILL within min_dist of the loser's hold cell (true
+            # blockage, e.g. loser sits on the only path).
+            #
+            # Priority = WHO ARRIVES FIRST: the agent closer to the contested meeting point
+            # (shorter remaining travel) wins the cell — an axial mover beats a diagonal mover
+            # aiming at the same node. Only when both are within eps of the meeting point (true
+            # geometric tie) does the per-episode random _collision_key break it.
             if self.M > 1:
                 key = self._collision_key                              # [N, M] lower = wins
+                tie_eps = min_agent_dist * 0.1                         # ~1/10 lattice = "same dist"
                 for i in range(self.M):
                     for j in range(i + 1, self.M):
                         d = (sub_pos[:, i] - sub_pos[:, j]).norm(dim=-1)   # [N]
                         collide = (d < min_agent_dist)                     # [N]
-                        i_wins = key[:, i] <= key[:, j]                    # [N]; tie → i (deterministic)
+                        meet = 0.5 * (sub_pos[:, i] + sub_pos[:, j])       # contested point [N, 2]
+                        di = (self.pos[:, i] - meet).norm(dim=-1)          # remaining travel of i
+                        dj = (self.pos[:, j] - meet).norm(dim=-1)          # remaining travel of j
+                        dist_tie = (di - dj).abs() <= tie_eps             # equal-distance → random
+                        i_wins = torch.where(dist_tie,                     # closer arrives first
+                                             key[:, i] <= key[:, j],       # tie: random priority
+                                             di <= dj)                     # else: nearer wins
                         i_loser = (collide & ~i_wins).unsqueeze(-1)        # [N, 1]
                         j_loser = (collide & i_wins).unsqueeze(-1)
                         sub_pos[:, i] = torch.where(i_loser, self.pos[:, i], sub_pos[:, i])

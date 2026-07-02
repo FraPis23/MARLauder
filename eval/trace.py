@@ -76,9 +76,14 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         compiled_wrapper = model.encoder
         model.encoder = _compiled_enc
 
-    # Per-neighbor logit attribution BY INPUT FEATURE. For each move-neighbor of the current
-    # node, contribution_f = (∂ neighbor-logit / ∂ feature_f) · feature_f (input×gradient) of
-    # that neighbor's own node features → "the values that brought this logit to that number".
+    # REAL GAT attention capture. store_attn makes every MaskedGATLayer keep the actual per-head
+    # neighbor-attention softmax it computed; store_logit_components plumbs it out of act() as
+    # _dbg_logits["enc_attn"]. These are the model's own weights — no estimation, no attribution.
+    model.store_logit_components = True
+    model.encoder.store_attn = True
+
+    # Node input-feature names (for the selected-node panel; these are raw obs values, not any
+    # attribution). Order matches node_feat channels 0..5.
     F_NAMES = ["x_rel", "y_rel", "utility", "age", "teammate_pot", "guidepost"]
 
     M = n_agents
@@ -121,55 +126,42 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         pos_all = rg["pos"][0].cpu().numpy()                  # [M, 2]
         lkp = rg["last_known_pos"][0].cpu().numpy()           # [M, M, 2]
         cmask = rg["comm_mask"][0].cpu().numpy()              # [M, M]
-        # Per move-neighbor logit attribution by INPUT FEATURE via Integrated Gradients.
-        # The action-logit = pointer score q(h_act)·k(nbr_emb)/√d — deeply NONLINEAR in the
-        # input features (GAT message passing → embeddings → GRU → bilinear pointer). IG gives,
-        # for the CLICKED neighbor's OWN node features, a value × weight = product decomposition:
-        #   weight_f  = ∫ ∂logit/∂feat_f dα   (integrated gradient = multiplier, independent of value)
-        #   product_f = weight_f · value_f    (this feature's contribution to the logit)
-        # Completeness:  logit = baseline + Σ_f product_f (own node) + other (rest of the window).
-        # "other" is the exact remainder (all OTHER window nodes), so it always reconstructs.
-        cn_local = obs["curr_nbr"][0].cpu().numpy()          # [M, K] window-local neighbor idx
-        Fdim = obs["node_feat"].shape[-1]
-        IG_STEPS = 64                                         # Riemann steps; max|recon−logit|≈0.02
-        dev = obs["node_feat"].device
-        feat_vals  = np.zeros((M, K, Fdim), dtype=np.float32)  # clicked neighbor's own feature values
-        feat_wts   = np.zeros((M, K, Fdim), dtype=np.float32)  # integrated gradient (weight) per feature
-        feat_prod  = np.zeros((M, K, Fdim), dtype=np.float32)  # weight · value (own-node contribution)
-        other_term = np.zeros((M, K), dtype=np.float32)        # contribution of all OTHER window nodes
-        nf_full = obs["node_feat"].detach()                   # [1, M, N_max, F]
-        Nw = nf_full.shape[2]
-        with torch.no_grad():                                 # baseline logit at zeroed features
-            obs_b = dict(obs); obs_b["node_feat"] = torch.zeros_like(nf_full)
-            base_logit = model.act(obs_b, h_act, h_crit, deterministic=True)["logits"][0].cpu().numpy()
-        with torch.enable_grad():
-            # Batch the S interpolation points into the env dimension (each alpha = one
-            # independent env, actor is per-env) → ONE forward + M·K backward (not M·K·S).
-            alphas = torch.linspace(0.5 / IG_STEPS, 1 - 0.5 / IG_STEPS, IG_STEPS,
-                                    device=dev).view(IG_STEPS, 1, 1, 1)
-            obs_g = {kk: (v.expand(IG_STEPS, *v.shape[1:]) if torch.is_tensor(v) and v.shape[0] == 1 else v)
-                     for kk, v in obs.items()}
-            x = (nf_full * alphas).clone().requires_grad_(True)          # [S, M, N_max, F]
-            obs_g["node_feat"] = x
-            ha = h_act.expand(IG_STEPS, *h_act.shape[1:])                # [S, M, d]
-            hc = h_crit.expand(IG_STEPS, *h_crit.shape[1:])             # [S, d]
-            lg = model.act(obs_g, ha, hc, deterministic=True)["logits"]  # [S, M, K]
+        # ---- REAL GAT attention (no estimation, no interpretation) ----
+        # act() stashed, per layer, the actual per-head neighbor-attention softmax used in message
+        # passing:  enc_attn[layer] = [1, M, W2, K+1, H].  Slot k∈[0,K) is the k-th window-local
+        # neighbor (obs["edge_idx"]); slot K is self. These are the EXACT weights the network
+        # computed — stepping `layer` in the viewer = stepping one real message-passing hop; the
+        # final layer's keys already summarize (L−1) hops, so layer L is the full L-hop result.
+        # Window-local node indices are mapped to GLOBAL lattice ids via obs["local_to_global"] so
+        # the viewer can colour the exact nodes on the map. Per-head kept SEPARATE: the model uses
+        # every head (concatenated → o_proj), so a head-mean is not a value the network uses — we
+        # never compute one. The viewer shows one real head at a time.
+        dbg = model._dbg_logits or {}
+        enc_attn = dbg.get("enc_attn")                       # list[L] of [1, M, W2, K+1, H] or None
+        l2g    = obs["local_to_global"][0].cpu().numpy()     # [M, W2] global id (-1 pad)
+        ei_loc = obs["edge_idx"][0].cpu().numpy()            # [M, W2, K] window-local nbr idx
+        ev_loc = obs["edge_valid"][0].cpu().numpy()          # [M, W2, K] bool
+        gat_agents = None
+        if enc_attn is not None:
+            Ln = len(enc_attn)
+            gat_agents = []
             for a in range(M):
-                for k in range(K):
-                    if not bool(amask[a, k]):
-                        continue
-                    if x.grad is not None:
-                        x.grad = None
-                    lg[:, a, k].sum().backward(retain_graph=True)        # ∂Σ_s logit_s / ∂x_s
-                    avg_grad = x.grad[:, a].mean(dim=0)                  # mean grad along path [N_max, F]
-                    nbl = int(cn_local[a, k])
-                    val = nf_full[0, a, nbl]                             # neighbor's own feature values [F]
-                    wt = avg_grad[nbl]                                   # integrated grad at own node [F]
-                    feat_vals[a, k] = val.cpu().numpy()
-                    feat_wts[a, k]  = wt.cpu().numpy()
-                    feat_prod[a, k] = (wt * val).cpu().numpy()           # own-node products (value·weight)
-                    total_ig = float((nf_full[0, a] * avg_grad).sum())   # IG over ALL window nodes
-                    other_term[a, k] = total_ig - float((wt * val).sum())  # remainder = other nodes
+                loc = np.array([i for i in range(l2g.shape[1]) if int(l2g[a, i]) >= 0], dtype=np.int64)
+                nodes = l2g[a, loc].astype(int).tolist()
+                nbr = np.full((loc.size, K), -1, dtype=np.int64)         # neighbor GLOBAL ids (-1 masked)
+                for c, i in enumerate(loc.tolist()):
+                    for k in range(K):
+                        if ev_loc[a, i, k]:
+                            nbr[c, k] = int(l2g[a, int(ei_loc[a, i, k])])
+                # weights [layer][head][node] = [self, n0..n_{K-1}], self moved to slot 0. All real.
+                # NOTE: not `W` — that name holds the map width (H, W = env.H, env.W) above.
+                w_layers = []
+                for l in range(Ln):
+                    al = np.round(enc_attn[l][0, a].cpu().numpy()[loc], 3)   # [V, K+1, H]
+                    per_head = [np.concatenate([al[:, K:K + 1, h], al[:, :K, h]], axis=1).tolist()
+                                for h in range(al.shape[-1])]
+                    w_layers.append(per_head)
+                gat_agents.append({"node": nodes, "nbr": nbr.tolist(), "w": w_layers})
 
         for a in range(M):
             prob = torch.sigmoid(env.world.occupancy_logodds_torch[0, a]).cpu().numpy()
@@ -206,16 +198,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "est": [_r(lkp[a, j, 0], 1), _r(lkp[a, j, 1], 1)],   # a's believed pos of j
                 "true": [_r(pos_all[j, 0], 1), _r(pos_all[j, 1], 1)],  # ground truth (UI shows only if comm)
             } for j in range(M) if j != a]
-            # Per move-neighbor (global node id), the by-feature attribution of its logit.
+            # Per move-neighbor GLOBAL node id (viewer maps a logit cell → the node it points to).
             curr_nbrs = [int(edge_idx[cur, k]) for k in range(K)]
-            nbr_attrib = [{
-                "node": curr_nbrs[k], "logit": _r(logits[a, k], 3),
-                "base": _r(base_logit[a, k], 3),    # logit at zeroed-features baseline (intercept)
-                "other": _r(other_term[a, k], 4),   # contribution of all OTHER window nodes (remainder)
-                "vals":    [_r(feat_vals[a, k, f], 3) for f in range(min(Fdim, 6))],   # feature value
-                "wts":     [_r(feat_wts[a, k, f], 4) for f in range(min(Fdim, 6))],    # weight (∫gradient)
-                "prod":    [_r(feat_prod[a, k, f], 4) for f in range(min(Fdim, 6))],   # product = wt·val
-            } for k in range(K) if bool(amask[a, k]) and curr_nbrs[k] >= 0]
             rec["agents"].append({
                 # one animated GIF per agent; "fi" = frame index (= step t) to seek to.
                 "frame": f"frames/a{a}.gif", "fi": t, "curr": cur, "target": int(tgt[a]),
@@ -230,7 +214,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "curr_nbrs": curr_nbrs,
                 "reward": rew, "nodes": nodes, "edges": edges,
                 "teammates": teammates,
-                "nbr_attrib": nbr_attrib,
+                # REAL per-layer, per-head GAT neighbor-attention softmax for this agent's window.
+                "gat": (gat_agents[a] if gat_agents is not None else None),
             })
         # True coverage from info (reset is disabled above, so occupancy is intact).
         explored = float(info["explored_rate"][0].item())
@@ -258,7 +243,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "value": None, "gate": 0, "action": -1,
                 "logits": [None] * K, "action_mask": [0] * K,
                 "guidepost_dir": [0.0] * K, "curr_nbrs": [-1] * K,
-                "reward": {}, "nodes": [], "edges": [], "nbr_attrib": [],
+                "reward": {}, "nodes": [], "edges": [], "gat": None,
                 # all agents share the complete map now → draw teammates solid at true pos.
                 "teammates": [{"j": int(j), "comm": 1,
                                "est":  [_r(pos_now[j, 0], 1), _r(pos_now[j, 1], 1)],
@@ -292,7 +277,11 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             "completed": bool(completed),
             "gate_eps": getattr(model, "strategic_gate_eps", 0.0),
             "target_mode": "analytic",
-            "feat_names": F_NAMES}   # input-feature names for the per-neighbor attribution
+            # GAT geometry for the attention viewer: n_layers = message-passing hops, n_heads =
+            # separate attention heads (all real, all used by the model).
+            "gat_layers": len(model.encoder.layers),
+            "gat_heads": int(getattr(model.encoder.layers[0], "n_heads", 1)),
+            "feat_names": F_NAMES}   # input-feature names for the node panel
     (tdir / "trace.json").write_text(json.dumps({"meta": meta, "steps": steps}))
 
     # maintain the episode picker index + ensure the viewer is present
@@ -309,6 +298,10 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     if viewer.exists():
         (Path(out_root) / "inspector.html").write_bytes(viewer.read_bytes())
 
+    # Turn the attention/debug stash back OFF before restoring the (possibly compiled) encoder —
+    # the driver reuses this same model to keep training, and store_attn would tax every forward.
+    model.encoder.store_attn = False
+    model.store_logit_components = False
     if _compiled_enc is not None:
         model.encoder = compiled_wrapper          # restore compiled encoder for training
     if was_training:

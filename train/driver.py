@@ -80,11 +80,13 @@ class TrainCfg:
     n_hops: int = 6          # ego-centric encoder window radius; n_layers tied to this
     n_layers: int = 6        # GAT layers; default tied to n_hops in make_env_model (6 hops / 6 layers)
     strategic_gate_eps: float = 0.0  # high-level gate: the analytic guidepost steers the actor only when max ego-window utility < eps (0 = always on)
+    use_gru: bool = True     # False = GRU ablation: actor/critic run feed-forward, no temporal memory
     lr_actor: float = 3e-4
     lr_critic: float = 5e-4   # faster than actor (non-stationary value) but below paper's 1e-3 (oscillation risk)
     device: str = "cuda:0"
     seed: int = 0
     compile: bool = False
+    init_ckpt: str | None = None   # warm-start: load model + value-norm from this .pt at startup (optimizer fresh). For stage-split relaunch (easy→difficult) at a different n_envs.
     # auto-eval GIF on each milestone ckpt
     eval_on_ckpt: bool = False
     eval_split: str = "train/easy"
@@ -185,7 +187,8 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
         env = Explorer(split, cfg.env, seed=cfg.seed)
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
                             n_heads=cfg.n_heads, n_layers=cfg.n_layers,
-                            strategic_gate_eps=cfg.strategic_gate_eps).to(cfg.device)
+                            strategic_gate_eps=cfg.strategic_gate_eps,
+                            use_gru=cfg.use_gru).to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead", dynamic=False)
@@ -462,6 +465,27 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
         torch.backends.cudnn.benchmark = True
     env, model = make_env_model(cfg)
     vnorm = ValueNormalizer().to(cfg.device)
+    # Warm-start (optional): load model + value-norm from a prior checkpoint. Used to relaunch a
+    # new stage (easy→difficult) at a DIFFERENT n_envs in a fresh process, avoiding the in-process
+    # curriculum swap (which coexists two envs + recaptures CUDA graphs). Optimizer stays fresh.
+    if cfg.init_ckpt:
+        ck = torch.load(cfg.init_ckpt, map_location=cfg.device, weights_only=False)
+        ck_sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+        # Reconcile the torch.compile "_orig_mod." key prefix between checkpoint and live model.
+        tgt = model.state_dict()
+        tgt_has_om = any("_orig_mod." in k for k in tgt)
+        ck_has_om = any("_orig_mod." in k for k in ck_sd)
+        if tgt_has_om and not ck_has_om:
+            ck_sd = {k.replace("encoder.", "encoder._orig_mod.", 1) if k.startswith("encoder.") else k: v
+                     for k, v in ck_sd.items()}
+        elif not tgt_has_om and ck_has_om:
+            ck_sd = {k.replace("._orig_mod.", ".", 1): v for k, v in ck_sd.items()}
+        missing, unexpected = model.load_state_dict(ck_sd, strict=False)
+        if isinstance(ck, dict) and "vnorm" in ck:
+            vnorm.load_state_dict(ck["vnorm"])
+        print(f"[init-ckpt] warm-started from {cfg.init_ckpt} "
+              f"(iter={ck.get('iter','?') if isinstance(ck,dict) else '?'}, "
+              f"missing={len(missing)} unexpected={len(unexpected)})")
     # Separate critic param group at a faster lr: the value target (coverage-left + time-left)
     # is highly non-stationary in this task, so the critic needs to track faster than the actor.
     # Paper Tab.7 uses Adam eps 1e-5 (vs torch default 1e-8). CTDE value-only modules.

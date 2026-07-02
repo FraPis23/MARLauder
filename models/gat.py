@@ -10,6 +10,17 @@ Input per layer:
                                 still embedded (zero in / zero out via masking).
 
 Output of layer: x' [B, N, F_out]
+
+Attention shaping (v0.7):
+  A1 — learnable PER-HEAD temperature. The fixed 1/sqrt(D) scaling drove q·k so small
+       (tiny input feats · /sqrt(32)) that the softmax stayed ~uniform and q/k received
+       almost no gradient (L0 stayed frozen at init). A per-head learnable τ multiplies
+       the score so each head can sharpen/soften on its own.
+  A2 — PER-HEAD structural feature bias. Each head gets an additive score term computed
+       from a FIXED SUBSET of the neighbor's RAW node features (geometry / utility /
+       teammate), injecting the routing signal directly and bypassing the gradient-starved
+       q/k path. This forces head specialization instead of the 4 heads collapsing onto
+       one diffuse pattern.
 """
 from __future__ import annotations
 
@@ -22,10 +33,33 @@ import torch.nn.functional as F
 from models.init_utils import apply_orthogonal
 
 
-class MaskedGATLayer(nn.Module):
-    """Single GAT-style layer with K=8 fixed neighbor padding."""
+# Default per-head raw-feature groups (feat order: 0 x_rel, 1 y_rel, 2 utility, 3 age,
+# 4 teammate_pot, 5 guidepost). Head 0→geometry, 1→utility, 2→teammate, rest free.
+def default_head_feat_groups(n_heads: int, feat_dim: int) -> list[list[int]]:
+    base = [[0, 1], [2], [4]]
+    groups: list[list[int]] = []
+    for h in range(n_heads):
+        g = base[h] if h < len(base) else []
+        groups.append([i for i in g if i < feat_dim])
+    return groups
 
-    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4, dropout: float = 0.0) -> None:
+
+class MaskedGATLayer(nn.Module):
+    """Single GAT-style layer with K=8 fixed neighbor padding.
+
+    Adds a learnable per-head temperature (A1) and a per-head structural feature bias (A2)
+    on the attention scores.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        n_heads: int = 4,
+        dropout: float = 0.0,
+        feat_dim: int | None = None,
+        head_feat_groups: list[list[int]] | None = None,
+    ) -> None:
         super().__init__()
         assert out_dim % n_heads == 0
         self.in_dim = in_dim
@@ -37,6 +71,27 @@ class MaskedGATLayer(nn.Module):
         self.v_proj = nn.Linear(in_dim, out_dim, bias=False)
         self.o_proj = nn.Linear(out_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
+
+        # A1 — per-head learnable temperature. score := (q·k)/sqrt(D) · τ_h. τ = exp(log_tau),
+        # clamped to [0.1, 10] so it can sharpen without runaway (τ→∞ collapses gradient again).
+        self.log_tau = nn.Parameter(torch.zeros(n_heads))
+
+        # A2 — per-head structural feature bias. bias_h(j) = Linear(raw_feat[j, group_h]) → scalar.
+        # Heads with an empty group get no bias (pure learned attention).
+        self.feat_dim = feat_dim
+        if feat_dim is not None:
+            self.head_feat_groups = (
+                head_feat_groups if head_feat_groups is not None
+                else default_head_feat_groups(n_heads, feat_dim)
+            )
+            self.bias_proj = nn.ModuleDict({
+                str(h): nn.Linear(len(g), 1)
+                for h, g in enumerate(self.head_feat_groups) if len(g) > 0
+            })
+        else:
+            self.head_feat_groups = [[] for _ in range(n_heads)]
+            self.bias_proj = nn.ModuleDict()
+
         # Inspector hook: when store_attn, keep the per-node neighbor-attention softmax of the
         # last forward (detached) so the viewer can show which neighbors a node aggregates from.
         self.store_attn = False
@@ -44,10 +99,11 @@ class MaskedGATLayer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,           # [B, N, F]
+        x: torch.Tensor,           # [B, N, F_embed]
         edge_idx: torch.Tensor,    # [B, N, K] long
         edge_valid: torch.Tensor,  # [B, N, K] bool
         node_valid: torch.Tensor,  # [B, N] bool
+        node_feat: torch.Tensor | None = None,  # [B, N, F_raw] RAW feats for the structural bias
     ) -> torch.Tensor:
         B, N, _ = x.shape
         K = edge_idx.shape[-1]
@@ -76,8 +132,29 @@ class MaskedGATLayer(nn.Module):
         v_all = torch.cat([v_nbr, v.unsqueeze(2)], dim=2)                        # [B, N, K+1, H, D]
         valid_all = torch.cat([edge_valid, self_valid], dim=2)                   # [B, N, K+1]
 
-        # Attention scores: (q · k_all) / sqrt(D), invalid edges → -inf (self never masked).
+        # Attention scores: (q · k_all) / sqrt(D), then A1 per-head temperature.
         scores = (q.unsqueeze(2) * k_all).sum(dim=-1) / math.sqrt(D)             # [B, N, K+1, H]
+        tau = self.log_tau.exp().clamp(0.1, 10.0)                                # [H]
+        scores = scores * tau
+
+        # A2 — per-head structural bias from the neighbor's RAW features (self slot included).
+        # Build the full [B, N, K+1, H] bias then add once (compile-safe, no in-place index-set).
+        if node_feat is not None and len(self.bias_proj) > 0:
+            Fr = node_feat.shape[-1]
+            feat_flat = node_feat.reshape(B, N, Fr)
+            fidx = safe_idx.reshape(B, N * K).unsqueeze(-1).expand(B, N * K, Fr)
+            feat_nbr = torch.gather(feat_flat, 1, fidx).view(B, N, K, Fr)        # [B, N, K, F_raw]
+            feat_all = torch.cat([feat_nbr, node_feat.unsqueeze(2)], dim=2)      # [B, N, K+1, F_raw]
+            bias_cols = []
+            for h in range(H):
+                key = str(h)
+                if key not in self.bias_proj:
+                    bias_cols.append(torch.zeros(B, N, K + 1, device=x.device, dtype=scores.dtype))
+                else:
+                    g = self.head_feat_groups[h]
+                    bias_cols.append(self.bias_proj[key](feat_all[..., g]).squeeze(-1))  # [B, N, K+1]
+            scores = scores + torch.stack(bias_cols, dim=-1)                     # [B, N, K+1, H]
+
         scores = scores.masked_fill(~valid_all.unsqueeze(-1), float("-inf"))
         attn = F.softmax(scores, dim=2)                                          # [B, N, K+1, H]
         attn = self.dropout(attn)
@@ -99,12 +176,23 @@ class GATEncoder(nn.Module):
     def __init__(self, in_dim: int, d: int = 128, n_heads: int = 4, n_layers: int = 2) -> None:
         super().__init__()
         self.input_proj = nn.Linear(in_dim, d)
-        self.layers = nn.ModuleList([MaskedGATLayer(d, d, n_heads=n_heads) for _ in range(n_layers)])
+        # Layers take the RAW feature dim (in_dim) so the A2 structural bias reads the original
+        # geometry/utility/teammate features, not the evolving embedding.
+        self.layers = nn.ModuleList([
+            MaskedGATLayer(d, d, n_heads=n_heads, feat_dim=in_dim) for _ in range(n_layers)
+        ])
         self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
         self.act = nn.GELU()
         self.last_attn: list | None = None   # inspector: per-layer [B,N,K,H] from last forward
         # MAPPO paper Tab.7 — orthogonal init across all GAT projections.
         apply_orthogonal(self)
+        # A2 — start the structural-bias projections SMALL so they nudge (not dominate) early
+        # training, then grow as the signal proves useful. (apply_orthogonal set them to gain √2.)
+        for layer in self.layers:
+            for lin in layer.bias_proj.values():
+                nn.init.orthogonal_(lin.weight, 0.1)
+                if lin.bias is not None:
+                    nn.init.zeros_(lin.bias)
 
     def forward(
         self,
@@ -118,7 +206,7 @@ class GATEncoder(nn.Module):
         attns = []
         for layer, norm in zip(self.layers, self.norms):
             res = h
-            h = layer(h, edge_idx, edge_valid, node_valid)
+            h = layer(h, edge_idx, edge_valid, node_valid, node_feat=node_feat)
             if self.store_attn:
                 attns.append(layer._last_attn)
             h = norm(res + self.act(h))

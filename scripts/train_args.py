@@ -78,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
     ap.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
     ap.add_argument("--strategic-gate-eps", type=float, default=0.0, help="High-level gate: the analytic guidepost next-hop direction steers the actor ONLY on steps where max utility in the ego window < this. 0 = gate off (always influences). The global target is consulted only when local exploration is exhausted")
+    ap.add_argument("--no-gru", action="store_true", help="GRU ablation: run actor+critic feed-forward with NO temporal memory (bypass both GRUCells). Trains a separate model to measure whether recurrence matters")
+    ap.add_argument("--init-ckpt", default=None, help="Warm-start: load model + value-norm from this .pt at startup (optimizer stays fresh). Use to relaunch a new stage (easy→difficult) at a different --n-envs in a fresh process (avoids the in-process curriculum swap + CUDA-graph recapture)")
     ap.add_argument("--target-mode", choices=["analytic", "nearest"], default="analytic", help="Env-owned global-target rule. analytic: deterministic rendezvous-aware scored frontier (util/(1+β·d)·rdv·separation). nearest: the closest reachable frontier by BF distance (no scoring/rendezvous)")
     ap.add_argument("--target-beta", type=float, default=1.0, help="Analytic target: distance discount β in util/(1+β·d/NR). Higher = prefer nearer frontiers")
     ap.add_argument("--target-lambda", type=float, default=1.0, help="Analytic target: rendezvous pull strength λ. 0 = pure exploration; 1 = a full-offer teammate can double a frontier's score")

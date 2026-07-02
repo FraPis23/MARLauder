@@ -30,11 +30,14 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--split", default="test/hybrid")
     ap.add_argument("--map-idx", type=int, default=0)
-    ap.add_argument("--n-agents", type=int, default=2)
+    ap.add_argument("--n-agents", type=int, default=None, help="default: from ckpt cfg, else 2")
     ap.add_argument("--steps", type=int, default=120)
-    ap.add_argument("--d-hidden", type=int, default=128)
-    ap.add_argument("--n-heads", type=int, default=4)
-    ap.add_argument("--n-layers", type=int, default=2)
+    # Architecture args default to None → auto-detected from the checkpoint so the traced model
+    # EXACTLY matches the trained one (critical: a layer/head/dim mismatch loads wrong weights and
+    # every number in the trace, attention included, becomes fiction). CLI value overrides.
+    ap.add_argument("--d-hidden", type=int, default=None, help="default: from ckpt")
+    ap.add_argument("--n-heads", type=int, default=None, help="default: from ckpt")
+    ap.add_argument("--n-layers", type=int, default=None, help="default: from ckpt")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, default=Path("/workspace/MARLauder/runs/trace_run"))
     ap.add_argument("--tag", default=None, help="trace name (default ckpt+map)")
@@ -47,10 +50,28 @@ def main() -> None:
     cfg_peek = ckpt.get("cfg", {})
     env_peek = cfg_peek.get("env", {}) if isinstance(cfg_peek, dict) else {}
 
-    model = MarlActorCritic(n_agents=args.n_agents, d=args.d_hidden,
-                            n_heads=args.n_heads, n_layers=args.n_layers).to(args.device)
     sd = {k: (v.to(args.device) if torch.is_tensor(v) else v) for k, v in ckpt["model"].items()}
     sd = {k.replace("encoder._orig_mod.", "encoder."): v for k, v in sd.items()}
+
+    # ---- Auto-detect architecture from the checkpoint so the traced model == trained model ----
+    import re
+    cfg = cfg_peek if isinstance(cfg_peek, dict) else {}
+    # n_layers: count distinct encoder GAT layers in the state dict (authoritative).
+    lyr = {int(m.group(1)) for k in sd for m in [re.search(r"encoder\.layers\.(\d+)\.", k)] if m}
+    det_layers = (max(lyr) + 1) if lyr else 2
+    # d_hidden: input_proj output dim. n_heads: from cfg (not recoverable from shapes alone).
+    det_d = sd["encoder.input_proj.weight"].shape[0] if "encoder.input_proj.weight" in sd else 128
+    det_agents = int(cfg.get("n_agents", 2))
+    n_layers = args.n_layers if args.n_layers is not None else det_layers
+    d_hidden = args.d_hidden if args.d_hidden is not None else int(cfg.get("d_hidden", det_d))
+    n_heads  = args.n_heads  if args.n_heads  is not None else int(cfg.get("n_heads", 4))
+    n_agents = args.n_agents if args.n_agents is not None else det_agents
+    use_gru = bool(cfg.get("use_gru", True))   # honor a GRU-ablation checkpoint (else it'd run recurrence it never trained with)
+    print(f"[trace] arch: n_layers={n_layers} d={d_hidden} n_heads={n_heads} n_agents={n_agents} "
+          f"use_gru={use_gru} (detected layers={det_layers}, d={det_d})")
+
+    model = MarlActorCritic(n_agents=n_agents, d=d_hidden,
+                            n_heads=n_heads, n_layers=n_layers, use_gru=use_gru).to(args.device)
     if "path_bias" in sd and "path_bias_learn" not in sd:
         sd["path_bias_learn"] = sd.pop("path_bias")
     msd = model.state_dict()
@@ -65,7 +86,7 @@ def main() -> None:
 
     split = load_split(args.split, device=args.device)
     tag = args.tag or f"{args.ckpt.stem}_m{args.map_idx}"
-    capture_trace(model, split, env_peek, args.n_agents, args.map_idx,
+    capture_trace(model, split, env_peek, n_agents, args.map_idx,
                   args.steps, args.out, tag, args.device)
     print(f"[view] http://localhost:8080/{args.out.name}/inspector.html  (Docker already serves runs/ on :8080)")
 

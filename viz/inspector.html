@@ -87,6 +87,9 @@
       <option value="agents">all agents · local maps</option>
     </select></label>
     <label><input type="checkbox" id="teammates" checked/> teammates</label>
+    <label title="paint the selected node's real GAT attention weights on the map (click a node first)"><input type="checkbox" id="attnShow"/> GAT attn (paint)</label>
+    <label title="message-passing layer = hop. Higher = neighbours already carry info from further away.">hop: <select id="attnLayer"></select></label>
+    <label title="one of the model's parallel attention heads. No preset meaning — learned subspaces.">head: <select id="attnHead"></select></label>
     <span id="hint">load a trace, then click a node</span>
   </div>
   <div id="stage"><canvas id="cv"></canvas></div>
@@ -103,7 +106,7 @@
   <h3>action logits (8 neighbors)</h3>
   <div class="bar8" id="bar8"></div>
   <div id="hint2" style="margin-top:6px;color:var(--dim)"></div>
-  <h3 id="attribTitle">logit · by feature</h3>
+  <h3 id="attribTitle">GAT attention</h3>
   <table id="attrib"></table>
   <div id="attribHint" style="margin-top:6px;color:var(--dim);font-size:11px"></div>
   <h3>reward breakdown (received entering this step)</h3>
@@ -112,7 +115,8 @@
   <table id="node"><tr><td class="k">—</td></tr></table>
 </div>
 <script>
-const A = { trace:null, dir:".", t:0, agent:0, field:"util", edges:true, grid:true, view:"single", teammates:true, sel:null, actSel:null, playing:false, img:new Image(), _rid:0 };
+const A = { trace:null, dir:".", t:0, agent:0, field:"util", edges:true, grid:true, view:"single", teammates:true, sel:null, actSel:null, playing:false, img:new Image(), _rid:0,
+  attnShow:false, attnLayer:0, attnHead:0 };   // GAT attention overlay: layer = hop, head = one of the model's real heads (no mean)
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
 const $ = id => document.getElementById(id);
 
@@ -202,8 +206,22 @@ async function loadTrace(url){
   $("slider").max = A.trace.steps.length-1;
   $("agent").innerHTML = "";
   for(let a=0;a<A.trace.meta.n_agents;a++){ const o=document.createElement("option"); o.value=a;o.text="agent "+a; $("agent").add(o);}
+  populateAttnControls();
   A.t=0; A.agent=0; A.actSel=null; A.sel=null; render();
   $("hint").textContent = `map ${A.trace.meta.map_idx} · ${A.trace.steps.length} steps · gate_eps=${A.trace.meta.gate_eps} · ${A.trace.meta.target_mode}`;
+}
+
+// Fill the hop (layer) + head selectors from the trace's real GAT geometry. Layers = hops,
+// heads = the model's real attention heads (no mean option — the model doesn't average them).
+function populateAttnControls(){
+  const m=A.trace.meta, L=m.gat_layers||0, H=m.gat_heads||0;
+  const lay=$("attnLayer"), hd=$("attnHead");
+  lay.innerHTML=""; for(let l=0;l<L;l++){ const o=document.createElement("option"); o.value=l;
+    o.text=`hop ${l+1}/${L}`+(l===0?" (nearest)":l===L-1?" (farthest)":""); lay.add(o); }
+  hd.innerHTML="";  for(let h=0;h<H;h++){ const o=document.createElement("option"); o.value=h; o.text=`head ${h}/${H-1}`; hd.add(o); }
+  if(A.attnLayer>=L) A.attnLayer=Math.max(0,L-1);
+  if(A.attnHead>=H)  A.attnHead=Math.max(0,H-1);
+  lay.value=A.attnLayer; hd.value=A.attnHead;
 }
 
 function fitCanvas(){
@@ -256,6 +274,50 @@ function drawNodes(){
     ctx.fillStyle=getCSS("--ok"); ctx.beginPath();ctx.arc(ex,ey,3,0,6.283);ctx.fill(); }
   // sel ring
   if(A.sel!=null){ const s=ag.nodes.find(n=>n.i===A.sel); if(s){ctx.strokeStyle="#fff";ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(s.x,s.y,6,0,6.283);ctx.stroke();} }
+  // REAL GAT attention overlay: the selected node's own neighbor-attention weights at the chosen
+  // layer(hop)/head. Numbers shown are the exact softmax weights the model computed.
+  if(A.attnShow) drawAttn(ag);
+}
+
+// The selected node's real GAT attention row: for layer A.attnLayer + head A.attnHead, the
+// weight it gives each neighbor + itself. Returns null if no GAT data or nothing selected.
+function gatRow(ag){
+  const g=ag&&ag.gat; if(!g||A.sel==null) return null;
+  const idx=g.node.indexOf(A.sel); if(idx<0) return null;              // selected node not in this window
+  const L=Math.min(A.attnLayer, g.w.length-1), H=Math.min(A.attnHead, g.w[L].length-1);
+  const row=g.w[L][H][idx], nb=g.nbr[idx];                            // row = [self, n0..n_{K-1}]
+  const nbrs=[]; for(let k=0;k<nb.length;k++) if(nb[k]>=0) nbrs.push({g:nb[k], w:row[k+1]});
+  return {selfW:row[0], nbrs, layer:L, head:H};
+}
+// weight 0..1 (normalized to the row max) → dim blue (low) to hot red (high).
+function attnColor(t){ t=Math.max(0,Math.min(1,t)); const lo=[40,60,120], hi=[255,80,80];
+  return `rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*t)).join(",")})`; }
+// Compass direction of node p relative to node s (lattice-aligned). y grows downward → N is up.
+function dirLabel(s,p){ const e=1e-3, dx=p.x-s.x, dy=p.y-s.y;
+  return ((dy<-e?'N':dy>e?'S':'')+(dx<-e?'W':dx>e?'E':''))||'·'; }
+// Short outlined label (no filled box → no crowding when nodes are close).
+function attnLabel(ctx,x,y,txt){ ctx.font="bold 10px ui-monospace,monospace"; ctx.textAlign="center";
+  ctx.lineWidth=2.6; ctx.strokeStyle="rgba(5,7,11,.9)"; ctx.strokeText(txt,x,y);
+  ctx.fillStyle="#fff"; ctx.fillText(txt,x,y); ctx.textAlign="start"; ctx.lineWidth=1; }
+// Paint the SELECTED node's real GAT attention: colour + disc size = weight, a short compass
+// label per neighbour fanned outward. Exact numbers live in the side panel (matched by colour).
+function drawAttn(ag){
+  const gr=gatRow(ag); if(!gr) return;
+  const pos={}; for(const n of ag.nodes) pos[n.i]=n;
+  const s=pos[A.sel]; if(!s) return;
+  const wmax=Math.max(1e-6, gr.selfW, ...gr.nbrs.map(n=>n.w));
+  for(const nb of gr.nbrs){ const p=pos[nb.g]; if(!p) continue;
+    const t=nb.w/wmax;
+    ctx.strokeStyle=attnColor(t); ctx.globalAlpha=.5+.45*t; ctx.lineWidth=1+4*t;
+    ctx.beginPath(); ctx.moveTo(s.x,s.y); ctx.lineTo(p.x,p.y); ctx.stroke(); ctx.globalAlpha=1;
+    ctx.fillStyle=attnColor(t); ctx.beginPath(); ctx.arc(p.x,p.y,3+4*t,0,6.283); ctx.fill();
+    ctx.lineWidth=0.6; ctx.strokeStyle="#000"; ctx.stroke();
+    const dx=p.x-s.x, dy=p.y-s.y, L=Math.hypot(dx,dy)||1;       // fan the label outward from centre
+    attnLabel(ctx, p.x+dx/L*8, p.y+dy/L*8, dirLabel(s,p));
+  }
+  // selected node itself: white disc sized by its self-weight + white ring.
+  ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(s.x,s.y,3+4*(gr.selfW/wmax),0,6.283); ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle="#fff"; ctx.beginPath(); ctx.arc(s.x,s.y,9,0,6.283); ctx.stroke(); ctx.lineWidth=1;
 }
 function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v); }
 
@@ -456,8 +518,10 @@ function panels(){
       <div class="fill" style="${fillStyle};opacity:.55"></div>
       <span class="val">${fin_v?v.toFixed(2):'—'}</span>${gp?'<span class="gpf">→</span>':''}</div>`;
   }).join("");
-  $("hint2").innerHTML = `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked &nbsp;·&nbsp; <b>click a cell</b> → breakdown below`
-    + `<br>bar diverges from mid-line: <span style="color:#365275">▲ positive (up)</span> &nbsp; <span style="color:#9c4a58">▼ negative (down)</span>`;
+  $("hint2").innerHTML = `Raw pointer scores over the 8 move-neighbours (the actor samples a direction from these). `
+    + `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked.`
+    + `<br>Bar diverges from mid-line: <span style="color:#365275">▲ positive (up)</span> &nbsp; <span style="color:#9c4a58">▼ negative (down)</span>.`
+    + `<br><b>Click a cell</b> → selects that neighbour node & shows its GAT attention below.`;
   // reward — component terms first, then a separator, then `total` as the sum result.
   // Show the reward RECEIVED entering the current state = the reward of the PREVIOUS
   // transition (step t-1's action). The trace records reward together with the state+action
@@ -496,52 +560,38 @@ function showNode(){
     + (n.i===ag.curr?row("•","CURR"):"") + (n.i===ag.target?row("•","TARGET"):"");
 }
 
-// Attribution for ONE clicked action-logit cell. For the clicked neighbor's OWN node features,
-// Integrated Gradients gives  weight_f = ∫∂logit/∂feat dα  (multiplier, independent of value)
-// and  product_f = weight_f · value_f  (this feature's contribution). The logit reconstructs as
-//   baseline (blank obs) + Σ product_f + other (rest of the ego window) = logit.
+// REAL GAT attention for the SELECTED node. For the chosen layer(hop)+head, shows the exact
+// softmax weight the node gives each neighbor + itself — the actual numbers the model computed
+// in message passing. No estimation, no attribution, no head-mean. Softmax → weights sum to 1
+// over {valid neighbors + self}. Stepping the hop selector walks real message-passing layers.
 function showAttrib(){
   const ag=curAgent(), tEl=$("attribTitle"), aEl=$("attrib"), hEl=$("attribHint");
-  const names=A.trace.meta.feat_names||["x_rel","y_rel","utility","age","teammate_pot","guidepost"];
-  const k = (A.actSel!=null) ? A.actSel : ag.action;          // default = chosen action
-  if(k==null || k<0){ tEl.innerHTML="logit · by feature"; aEl.innerHTML="<tr><td class=k>click a logit cell above</td></tr>"; hEl.textContent=""; return; }
-  const node=(ag.curr_nbrs||[])[k];
-  const at=(ag.nbr_attrib||[]).find(x=>x.node===node);
-  tEl.innerHTML=`logit · by feature <span style="color:var(--txt);font-weight:400;text-transform:none;letter-spacing:0">· dir ${k}${at?` · logit = ${at.logit}`:''}</span>`;
-  if(!at || !at.wts){      // masked direction, or a stale trace without weight/product fields
-    aEl.innerHTML=`<tr><td class=k>${ag.action_mask&&!ag.action_mask[k]?'masked direction — no action logit':'no attribution for this cell'}</td></tr>`;
-    hEl.innerHTML=(at&&!at.wts)?`<span style="color:var(--warn)">⚠ STALE trace (no weight/product) — regenerate it.</span>`:"";
-    return;
-  }
-  const base=at.base||0, other=at.other||0;
-  const prodSum=at.prod.reduce((s,c)=>s+(c||0),0), recon=base+prodSum+other;
-  const wmax=Math.max(1e-6,...at.wts.map(x=>Math.abs(x||0)));
-  const wAbsTot=Math.max(1e-9, at.wts.reduce((s,c)=>s+Math.abs(c||0),0));   // for weight %
-  const wbar=(w)=>{ const t=Math.abs(w)/wmax*46, col=w>=0?'#365275':'#9c4a58';
-    const side=w>=0?`left:50%;width:${t}%`:`right:50%;width:${t}%`;
-    return `<td><div class="fbar"><div class="z"></div><div class="f" style="${side};background:${col}"></div></div></td>`; };
-  const num=(c,b)=>`<td class="v ${c<0?'neg':c>0?'pos':''}"${b?' style="font-weight:600"':''}>${c>=0?'+':''}${c.toFixed(3)}</td>`;
-  let rows=`<tr><td class=k>feature</td><td class=v>value</td><td class=v>weight</td><td style="width:30%">weight (bar)</td><td class=v>wt%</td><td class=v>product</td></tr>`;
-  for(let f=0;f<at.wts.length;f++){
-    const w=at.wts[f]||0, val=at.vals[f], p=at.prod[f]||0, pct=Math.abs(w)/wAbsTot*100;
-    rows+=`<tr><td class=k>${names[f]||('f'+f)}</td><td class=v>${val==null?'·':val.toFixed(2)}</td>`
-      +`<td class="v" style="opacity:.85">${w>=0?'+':''}${w.toFixed(3)}</td>${wbar(w)}`
-      +`<td class="v" style="opacity:.7">${pct.toFixed(0)}%</td>${num(p)}</tr>`;
-  }
-  // separator, then the terms that add up to the logit (product column = the additive value).
-  rows+=`<tr><td colspan=6 style="border-bottom:1px solid var(--line);padding:0"></td></tr>`;
-  const term=(label,v)=>`<tr><td class=k style="opacity:.75">${label}</td><td class=v>·</td><td class=v>·</td><td></td><td class=v>·</td>${num(v)}</tr>`;
-  rows+=term("baseline (blank obs)",base);
-  rows+=term("Σ products (this cell)",prodSum);
-  rows+=term("other window nodes",other);
-  const bad=Math.abs(recon-at.logit)>0.5;
-  rows+=`<tr><td class=k style="font-weight:600;color:var(--txt)">Σ = logit</td><td class=v>·</td><td class=v>·</td>`
-    +`<td style="text-align:right;opacity:.6;font-size:11px">${bad?'<span style="color:var(--warn)">recon '+recon.toFixed(2)+'≠</span>':'recon '+recon.toFixed(2)}</td>`
-    +`<td class=v>·</td><td class="v" style="font-weight:600">${at.logit.toFixed(3)}</td></tr>`;
+  const m=A.trace.meta;
+  if(!ag.gat){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>no GAT attention in this trace — regenerate it</td></tr>"; hEl.textContent=""; return; }
+  if(A.sel==null){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>click a node on the map to see its real attention</td></tr>"; hEl.textContent=""; return; }
+  const gr=gatRow(ag);
+  if(!gr){ tEl.innerHTML="GAT attention"; aEl.innerHTML=`<tr><td class=k>node #${A.sel} is outside this agent's ego window (no attention row)</td></tr>`; hEl.textContent=""; return; }
+  const L=m.gat_layers||gr.layer+1, H=m.gat_heads||gr.head+1;
+  tEl.innerHTML=`GAT attention <span style="color:var(--txt);font-weight:400;text-transform:none;letter-spacing:0">· node #${A.sel} · hop ${gr.layer+1}/${L} · head ${gr.head}/${H-1}</span>`;
+  const pos={}; for(const n of ag.nodes) pos[n.i]=n; const s=pos[A.sel];
+  const wmax=Math.max(1e-6, gr.selfW, ...gr.nbrs.map(n=>n.w));
+  // colour swatch matches the map disc (t = weight / row-max); dir = compass to the neighbour.
+  const sw=(t)=>`<span class="swatch" style="background:${attnColor(t)}"></span>`;
+  const bar=(w)=>{ const t=Math.max(0,w)/wmax*46; return `<td><div class="fbar"><div class="f" style="left:0;width:${t}%;background:${attnColor(w/wmax)}"></div></div></td>`; };
+  const rowsData=gr.nbrs.map(nb=>({...nb, dir: s&&pos[nb.g]?dirLabel(s,pos[nb.g]):'?'})).sort((a,b)=>b.w-a.w);
+  let sum=gr.selfW;
+  let rows=`<tr><td class=k>attends to</td><td class=v>weight</td><td style="width:34%">share</td></tr>`;
+  rows+=`<tr><td class=k><span class="swatch" style="background:#fff"></span>self (this node)</td>`
+      +`<td class="v" style="font-weight:600">${gr.selfW.toFixed(3)}</td>${bar(gr.selfW)}</tr>`;
+  for(const nb of rowsData){ sum+=nb.w;
+    rows+=`<tr><td class=k>${sw(nb.w/wmax)}${nb.dir} · #${nb.g}</td><td class=v>${nb.w.toFixed(3)}</td>${bar(nb.w)}</tr>`; }
+  rows+=`<tr><td colspan=3 style="border-bottom:1px solid var(--line);padding:0"></td></tr>`;
+  rows+=`<tr><td class=k style="opacity:.75">Σ (softmax = 1)</td><td class=v style="opacity:.75">${sum.toFixed(3)}</td><td></td></tr>`;
   aEl.innerHTML=rows;
-  hEl.innerHTML = bad
-    ? `<span style="color:var(--warn)">⚠ reconstruction ≠ logit — STALE trace. Regenerate it.</span>`
-    : `weight = ∫ ∂logit/∂feature (sensitivity, independent of the value) · product = weight × value (this feature's push on the logit) · wt% = share of total |weight|. baseline + Σ products + other = logit.`;
+  hEl.innerHTML=`<b>What this is:</b> how much node #${A.sel}'s features are copied from each neighbour (and itself) at this message-passing step. Exact softmax weights the model computed — no estimate, no mean.<br>`
+    +`<b>hop ${gr.layer+1}/${L}</b>: message-passing layer. Higher hop = the neighbours themselves already carry info from further away (${gr.layer+1} cells).<br>`
+    +`<b>head ${gr.head}/${H-1}</b>: one of ${H} parallel attention heads. Heads have <i>no names or preset meaning</i> — they are learned subspaces; switch heads to see if they specialize.<br>`
+    +`<b>weight</b> = share of features taken (all rows sum to 1). Map: <span style="color:#ff5050">red/big</span> = high, <span style="color:#3a4890">blue/small</span> = low; white = the selected node.`;
 }
 
 // node picking
@@ -555,16 +605,20 @@ cv.addEventListener("click",e=>{
 });
 
 // Click an action-logit cell → show its by-feature breakdown (no map-node click needed).
+// Click a logit cell → highlight it AND select the neighbour node it points to, so the GAT
+// attention panel (+ map overlay) shows that neighbour's real attention.
 $("bar8").addEventListener("click",e=>{
   const cell=e.target.closest(".cell"); if(!cell || cell.dataset.k==null) return;
-  A.actSel=parseInt(cell.dataset.k); blurActive(); panels();
+  A.actSel=parseInt(cell.dataset.k);
+  const g=(curAgent().curr_nbrs||[])[A.actSel]; if(g!=null && g>=0) A.sel=g;
+  blurActive(); render();
 });
 
 $("loadBtn").onclick=()=>$("file").click();
 $("file").onchange=e=>{ const f=e.target.files[0]; if(!f)return; const u=URL.createObjectURL(f);
   // file:// won't resolve relative frames; recommend http.server. Still load JSON for non-image inspection.
   fetch(u).then(r=>r.json()).then(j=>{A.trace=j;A.dir="./";$("slider").max=j.steps.length-1;
-    $("agent").innerHTML="";for(let a=0;a<j.meta.n_agents;a++){const o=document.createElement("option");o.value=a;o.text="agent "+a;$("agent").add(o);} A.t=0;render();}); };
+    $("agent").innerHTML="";for(let a=0;a<j.meta.n_agents;a++){const o=document.createElement("option");o.value=a;o.text="agent "+a;$("agent").add(o);} populateAttnControls(); A.t=0;render();}); };
 $("prev").onclick=()=>{A.t=Math.max(0,A.t-1);render();};
 $("next").onclick=()=>{A.t=Math.min(A.trace.steps.length-1,A.t+1);render();};
 $("slider").oninput=e=>{A.t=+e.target.value;render();};
@@ -574,6 +628,9 @@ $("edges").onchange=e=>{A.edges=e.target.checked;render();};
 $("grid").onchange=e=>{A.grid=e.target.checked;blurActive();render();};
 $("view").onchange=e=>{A.view=e.target.value;render();};
 $("teammates").onchange=e=>{A.teammates=e.target.checked;render();};
+$("attnShow").onchange=e=>{A.attnShow=e.target.checked;render();};
+$("attnLayer").onchange=e=>{A.attnLayer=+e.target.value;blurActive();render();};
+$("attnHead").onchange=e=>{A.attnHead=+e.target.value;blurActive();render();};
 $("play").onclick=()=>{ A.playing=!A.playing; $("play").textContent=A.playing?"⏸ Pause":"▶ Play";
   const tick=()=>{ if(!A.playing)return; if(A.t<A.trace.steps.length-1){A.t++;render();setTimeout(tick,180);} else A.playing=false,$("play").textContent="▶ Play"; }; tick(); };
 // A button/select keeps focus after a click, so Space/Enter would re-fire it instead of

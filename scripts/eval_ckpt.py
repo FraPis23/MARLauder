@@ -45,6 +45,7 @@ def _load_model(ckpt_path: Path, n_agents: int, d_hidden: int, n_heads: int,
     model.load_state_dict(sd, strict=False)
     if isinstance(cfg_peek, dict):
         model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
+        model.use_gru = bool(cfg_peek.get("use_gru", True))   # honor a GRU-ablation checkpoint
     model.eval()
     return model, env_peek
 

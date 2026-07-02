@@ -78,6 +78,7 @@ def main() -> None:
     # Restore high-level strategic gate + target mode from the training cfg (mutable attrs).
     if isinstance(cfg_peek, dict):
         model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
+        model.use_gru = bool(cfg_peek.get("use_gru", True))   # honor a GRU-ablation checkpoint
     model.eval()
     print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}  strategic_gate_eps={model.strategic_gate_eps}")
 

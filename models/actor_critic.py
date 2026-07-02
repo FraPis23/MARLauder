@@ -75,10 +75,15 @@ class PointerHead(nn.Module):
 
 class MarlActorCritic(nn.Module):
     def __init__(self, n_agents: int = 1, d: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 strategic_gate_eps: float = 0.0) -> None:
+                 strategic_gate_eps: float = 0.0, use_gru: bool = True) -> None:
         super().__init__()
         self.M = n_agents
         self.d = d
+        # GRU ablation switch. use_gru=False bypasses both recurrent cells: the actor query is the
+        # feed-forward actor_in and the critic input is the feed-forward joint, with NO temporal
+        # memory across steps. The GRUCell modules are still built (so their params exist for
+        # checkpoint compatibility) but never called. Set at construction from cfg.use_gru.
+        self.use_gru = bool(use_gru)
         # Inspector hook: when True, act() stashes the pointer-attention logits + the (purely
         # visual) guidepost first-hop direction into self._dbg_logits. The guidepost is NOT
         # added to the logits; the model must learn to follow it via node_feat[5] / the actor-
@@ -172,6 +177,14 @@ class MarlActorCritic(nn.Module):
         """Build the actor GRU input: curr_emb || prev_action."""
         return self.actor_pre(torch.cat([curr_emb, prev_action], dim=-1))
 
+    def _step_actor(self, actor_in: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
+        """Recurrent actor step, or feed-forward passthrough when use_gru is False (ablation)."""
+        return self.gru_actor(actor_in, h_in) if self.use_gru else actor_in
+
+    def _step_critic(self, joint: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
+        """Recurrent critic step, or feed-forward passthrough when use_gru is False (ablation)."""
+        return self.gru_critic(joint, h_in) if self.use_gru else joint
+
     def act(
         self,
         obs: dict,
@@ -184,7 +197,7 @@ class MarlActorCritic(nn.Module):
         h_all, curr_emb, nbr_embs = self._encode(obs)
         actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K))
         h_act_in = hidden_actor.reshape(B, self.d)
-        h_act_out = self.gru_actor(actor_in, h_act_in)              # [B, d]
+        h_act_out = self._step_actor(actor_in, h_act_in)              # [B, d]
         pointer_logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
         logits = pointer_logits
         # Inspector: stash the pointer logits + per-layer GAT neighbor attention.
@@ -209,7 +222,7 @@ class MarlActorCritic(nn.Module):
 
         curr_emb_per_agent = curr_emb.view(N, M, self.d)
         joint = self.critic_pre(self._critic_in(curr_emb_per_agent, obs.get("critic_global")))
-        h_crit_out = self.gru_critic(joint, hidden_critic)
+        h_crit_out = self._step_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
 
         return {
@@ -235,7 +248,7 @@ class MarlActorCritic(nn.Module):
         _, curr_emb, nbr_embs = self._encode(obs)
         actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K))
         h_act_in = hidden_actor.reshape(B, self.d)
-        h_act_out = self.gru_actor(actor_in, h_act_in)
+        h_act_out = self._step_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
@@ -245,7 +258,7 @@ class MarlActorCritic(nn.Module):
 
         curr_emb_per_agent = curr_emb.view(N, M, self.d)
         joint = self.critic_pre(self._critic_in(curr_emb_per_agent, obs.get("critic_global")))
-        h_crit_out = self.gru_critic(joint, hidden_critic)
+        h_crit_out = self._step_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
 
         return {
@@ -310,7 +323,7 @@ class MarlActorCritic(nn.Module):
         curr_emb_flat = curr_emb.reshape(B, self.d)
         actor_in = self._actor_in(curr_emb_flat, prev_action.reshape(B, K))
         h_act_in = hidden_actor.reshape(B, self.d)
-        h_act_out = self.gru_actor(actor_in, h_act_in)
+        h_act_out = self._step_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs.reshape(B, K, self.d),
                               action_mask.reshape(B, K))
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
@@ -320,7 +333,7 @@ class MarlActorCritic(nn.Module):
         entropy = dist.entropy()
 
         joint = self.critic_pre(self._critic_in(curr_emb, critic_global))
-        h_crit_out = self.gru_critic(joint, hidden_critic)
+        h_crit_out = self._step_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
         return {
             "logp": logp.view(N, M),
