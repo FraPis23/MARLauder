@@ -19,7 +19,19 @@
   .card:hover{border-color:#3a4a62}
   .card.training{border-color:var(--ok)}
   .card.stopped{border-color:var(--amber)}
-  .name{font-size:14px;font-weight:600;margin-bottom:8px;word-break:break-all;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .name{font-size:14px;font-weight:600;margin-bottom:2px;word-break:break-all;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .name-text{cursor:pointer;border-bottom:1px dashed transparent;padding:1px 2px;border-radius:3px}
+  .name-text:hover{border-bottom-color:var(--accent);color:var(--accent)}
+  .name-text.locked{cursor:default}
+  .name-text.locked:hover{border-bottom-color:transparent;color:inherit}
+  .name-input{font:inherit;font-size:14px;font-weight:600;background:#1c2330;color:var(--txt);
+              border:1px solid var(--accent);border-radius:4px;padding:1px 5px;min-width:120px}
+  .icon-btn{background:none;border:none;cursor:pointer;font-size:13px;padding:8px 8px;border-radius:4px;
+            color:var(--dim);opacity:.75;line-height:1;margin-left:auto}
+  .icon-btn:hover{opacity:1;background:#1c2330;color:var(--accent)}
+  .icon-btn.has-note{color:var(--accent);opacity:1}
+  .note-panel{margin:2px 0 8px;padding:8px 10px;background:#11151d;border:1px solid var(--line);border-radius:6px}
+  .note-view{white-space:pre-wrap;word-break:break-word;color:var(--txt);font-size:12px;margin-bottom:6px}
   .badge{padding:2px 8px;border-radius:9px;font-size:10px;font-weight:700;letter-spacing:.6px;flex-shrink:0;display:inline-flex;align-items:center;gap:4px}
   .badge.training{background:rgba(107,217,104,.12);color:var(--ok);border:1px solid var(--ok)}
   .badge.stopped{background:rgba(255,206,84,.1);color:var(--amber);border:1px solid var(--amber)}
@@ -64,7 +76,7 @@
   .launch.open .chev{transform:rotate(90deg)}
   .launch-body{display:none;padding:0 16px 14px;border-top:1px solid var(--line)}
   .launch.open .launch-body{display:block}
-  .lform{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px;margin:12px 0}
+  .lform{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px;margin:10px 0 4px}
   .lf{display:flex;flex-direction:column;gap:3px}
   .lf label{color:var(--dim);font-size:10px;letter-spacing:.4px;text-transform:uppercase}
   .lf input,.lf select{background:#1c2330;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:5px 8px;font:inherit;font-size:12px}
@@ -72,6 +84,18 @@
   .lf.check{flex-direction:row;align-items:center;gap:6px}
   .lf.check label{text-transform:none;font-size:12px;color:var(--txt)}
   .launch-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  /* run-name field: prominent, above the categorized flags */
+  .runname-field{margin:12px 0;padding:10px 12px;background:#11151d;border:1px solid var(--line);border-radius:6px}
+  .runname-field label{color:var(--txt);font-size:11px;font-weight:600;letter-spacing:.3px}
+  .runname-field input{margin-top:5px;width:100%;max-width:340px;background:#1c2330;color:var(--txt);
+                        border:1px solid var(--line);border-radius:5px;padding:6px 9px;font:inherit;font-size:12px}
+  /* categorized, collapsible flag sections */
+  #lcats details.lcat{margin:8px 0;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  #lcats details.lcat summary{padding:7px 11px;cursor:pointer;user-select:none;font-size:11px;
+    letter-spacing:.4px;text-transform:uppercase;color:var(--accent);background:#11151d;list-style:revert}
+  #lcats details.lcat summary::marker{color:var(--dim)}
+  #lcats details.lcat .lcat-count{color:var(--dim);text-transform:none;letter-spacing:0;font-weight:400}
+  #lcats details.lcat .lform{padding:10px 11px 4px}
   .launch-msg{font-size:12px;color:var(--dim)}
   .launch-msg.ok{color:var(--ok)}
   .launch-msg.err{color:var(--warn)}
@@ -87,12 +111,27 @@
   .params-view td{padding:2px 8px;border-bottom:1px solid #161b24}
   .params-view td.k{color:var(--dim)}
   .params-view td.v{color:var(--txt);text-align:right;word-break:break-all}
+  /* header sort control */
+  .hdr-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .hdr-row select{background:#1c2330;color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:3px 8px;font:inherit;font-size:11px}
+  /* notes (icon-triggered, at title height — see .note-panel above) */
+  .notes-row{display:flex;gap:7px;align-items:center;margin-bottom:6px}
+  .notes-text{width:100%;min-height:44px;resize:vertical;background:#1c2330;color:var(--txt);
+              border:1px solid var(--line);border-radius:5px;padding:6px 8px;font:inherit;font-size:11px}
+  .note-msg{font-size:11px;color:var(--dim)}
+  .note-msg.ok{color:var(--ok)} .note-msg.err{color:var(--warn)}
 </style>
 </head>
 <body>
 <header>
   <h1>MARLauder · Training Runs</h1>
-  <p class="sub">auto-refreshes every 30 s &nbsp;·&nbsp; <a href="#" onclick="load();return false">refresh now</a></p>
+  <div class="hdr-row">
+    <p class="sub">auto-refreshes every 30 s &nbsp;·&nbsp; <a href="#" onclick="load();return false">refresh now</a></p>
+    <label class="sub">sort: <select id="sortMode">
+      <option value="recent">most recent first</option>
+      <option value="status">group by status (done ↑, stopped ↓)</option>
+    </select></label>
+  </div>
 </header>
 
 <div class="launch" id="launch">
@@ -101,8 +140,12 @@
     <span class="chev">▸</span>
   </div>
   <div class="launch-body">
-    <p class="sub" style="margin:10px 0 0">Every flag below. Hover a label for its description. Only non-default values are passed.</p>
-    <div class="lform" id="lform"></div>
+    <p class="sub" style="margin:10px 0 0">Hover a label for its description. Only non-default values are passed.</p>
+    <div class="runname-field">
+      <label>Run name</label> <span class="sub">— optional, leave blank for an automatic unique name</span>
+      <input id="runNameField" type="text" placeholder="e.g. gat_ablation_1 (blank = auto-named, timestamped)">
+    </div>
+    <div id="lcats"></div>
     <div class="launch-actions">
       <button class="btn primary" onclick="startTraining()">Start training</button>
       <button class="btn" onclick="resetLaunchForm()">Reset to defaults</button>
@@ -119,38 +162,71 @@ const fmtTime = ts => ts
   ? new Date(ts * 1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
   : '—';
 
+// Material Symbols "description" glyph (page, folded corner) — a note/document icon, drawn
+// inline so it needs no external font/network fetch. fill="currentColor" lets it pick up
+// .icon-btn's CSS color (dim when empty, accent when a note exists) with no JS re-render.
+const NOTE_ICON_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" '
+  + 'style="vertical-align:-2px"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 '
+  + '1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>';
+
 // ---- Launch form (auto-built from /api/argschema) -------------------------------------
 let LAUNCH_DEFAULTS = null;
 let ARG_SCHEMA = null;
 
 function esc(s) { return String(s).replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
 
+function fieldHtml(f) {
+  const tip = esc(f.help || '');
+  const lbl = `<label title="${tip}">${f.flag}</label>`;
+  if (f.kind === 'bool')
+    return `<div class="lf check" title="${tip}"><input data-k="${f.dest}" data-kind="bool" type="checkbox"><label>${f.flag}</label></div>`;
+  if (f.kind === 'choice') {
+    // optional choice (default null, e.g. --stage) needs an explicit "unset" option,
+    // else the select silently forces the first value → bogus flag passed.
+    const blank = (f.default === null || f.default === undefined)
+      ? `<option value="">(none / default)</option>` : '';
+    const opts = f.choices.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+    return `<div class="lf" title="${tip}">${lbl}<select data-k="${f.dest}" data-kind="choice">${blank}${opts}</select></div>`;
+  }
+  const step = f.kind === 'float' ? ' step="any"' : '';
+  const type = (f.kind === 'int' || f.kind === 'float') ? 'number' : 'text';
+  return `<div class="lf" title="${tip}">${lbl}<input data-k="${f.dest}" data-kind="${f.kind}" type="${type}"${step}></div>`;
+}
+
+// Grouped by `category` (the argparse add_argument_group() title — see scripts/train_args.py),
+// each a collapsible <details> so ~70 flags don't dump onto the screen at once. 'out' is
+// server-managed (the run-name field above drives it); 'force' is driven by the
+// exists-confirm flow, not a checkbox — both hidden from the rendered grid.
 function buildLaunchForm(schema) {
-  const html = schema.filter(f => f.dest !== 'out').map(f => {
-    const tip = esc(f.help || '');
-    const lbl = `<label title="${tip}">${f.flag}</label>`;
-    if (f.kind === 'bool')
-      return `<div class="lf check" title="${tip}"><input data-k="${f.dest}" data-kind="bool" type="checkbox"><label>${f.flag}</label></div>`;
-    if (f.kind === 'choice') {
-      // optional choice (default null, e.g. --stage) needs an explicit "unset" option,
-      // else the select silently forces the first value → bogus flag passed.
-      const blank = (f.default === null || f.default === undefined)
-        ? `<option value="">(none / default)</option>` : '';
-      const opts = f.choices.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
-      return `<div class="lf" title="${tip}">${lbl}<select data-k="${f.dest}" data-kind="choice">${blank}${opts}</select></div>`;
-    }
-    const step = f.kind === 'float' ? ' step="any"' : '';
-    const type = (f.kind === 'int' || f.kind === 'float') ? 'number' : 'text';
-    return `<div class="lf" title="${tip}">${lbl}<input data-k="${f.dest}" data-kind="${f.kind}" type="${type}"${step}></div>`;
-  }).join('');
-  // free-form catch-all for any flag not worth a field
-  const extra = `<div class="lf wide" title="raw args appended verbatim, e.g. --eval-suite-splits test/corridor,test/complex">
-    <label>extra args (raw)</label><input data-k="extra_args" data-kind="str" type="text"></div>`;
-  document.getElementById('lform').innerHTML = html + extra;
+  const cats = [], byCat = {};
+  for (const f of schema) {
+    if (f.dest === 'out' || f.dest === 'force') continue;
+    const c = f.category || 'Other';
+    if (!byCat[c]) { byCat[c] = []; cats.push(c); }
+    byCat[c].push(f);
+  }
+  const section = (key, title, fieldsHtml, defaultOpen) => {
+    const saved = localStorage.getItem(key);
+    const open = saved !== null ? saved === '1' : defaultOpen;
+    return `<details class="lcat" data-key="${key}"${open ? ' open' : ''}>
+      <summary>${esc(title)}</summary>
+      <div class="lform">${fieldsHtml}</div>
+    </details>`;
+  };
+  const html = cats.map(c => section('lcat_' + slug(c),
+    `${c} (${byCat[c].length})`, byCat[c].map(fieldHtml).join(''), c === 'Run' || c === 'Scale & episode')
+  ).join('') + section('lcat_extra', 'Extra args',
+    `<div class="lf wide" title="raw args appended verbatim, e.g. --eval-suite-splits test/corridor,test/complex">
+      <label>extra args (raw)</label><input data-k="extra_args" data-kind="str" type="text"></div>`, false);
+  document.getElementById('lcats').innerHTML = html;
+  document.querySelectorAll('#lcats details.lcat').forEach(d => {
+    d.addEventListener('toggle', () => localStorage.setItem(d.dataset.key, d.open ? '1' : '0'));
+  });
 }
 
 function fillLaunchForm(p) {
-  document.querySelectorAll('#lform [data-k]').forEach(el => {
+  document.querySelectorAll('#lcats [data-k]').forEach(el => {
     const k = el.dataset.k;
     if (!(k in p)) return;
     if (el.dataset.kind === 'bool') el.checked = !!p[k];
@@ -160,7 +236,7 @@ function fillLaunchForm(p) {
 
 function readLaunchForm() {
   const p = {};
-  document.querySelectorAll('#lform [data-k]').forEach(el => {
+  document.querySelectorAll('#lcats [data-k]').forEach(el => {
     const k = el.dataset.k, kind = el.dataset.kind;
     if (kind === 'bool') p[k] = el.checked;
     else if (kind === 'int') p[k] = el.value === '' ? null : (parseInt(el.value) || 0);
@@ -180,7 +256,7 @@ async function initLaunchForm() {
     ARG_SCHEMA = schema; LAUNCH_DEFAULTS = defaults;
     buildLaunchForm(schema);
     fillLaunchForm(last);   // last-used (persisted server-side), falls back to defaults
-  } catch(e) { document.getElementById('lform').innerHTML = '<p class="sub">launch API unavailable</p>'; }
+  } catch(e) { document.getElementById('lcats').innerHTML = '<p class="sub">launch API unavailable</p>'; }
 }
 
 function resetLaunchForm() {
@@ -193,8 +269,14 @@ function setLaunchMsg(t, cls) {
   m.textContent = t; m.className = 'launch-msg ' + (cls || '');
 }
 
-async function startTraining() {
+// `force` is only ever set internally, after the user confirms an overwrite below — never a
+// user-facing checkbox, so a stray leftover value can't silently overwrite a FUTURE launch
+// (the server also strips it before persisting "last used" params, see web_server.py).
+async function startTraining(force) {
   const p = readLaunchForm();
+  const runName = document.getElementById('runNameField').value.trim();
+  if (runName) p.out_name = runName;
+  if (force) p.force = true;
   setLaunchMsg('launching…', '');
   try {
     const res = await fetch('/api/launch', {
@@ -202,9 +284,35 @@ async function startTraining() {
     });
     if (!res.ok) { setLaunchMsg('error: HTTP ' + res.status, 'err'); return; }
     const j = await res.json();
+    if (!j.ok) {
+      if (j.error === 'exists') {
+        if (confirm(`Run "${j.run}" already exists. Overwrite it?`)) return startTraining(true);
+        setLaunchMsg('cancelled', '');
+        return;
+      }
+      setLaunchMsg('error: ' + (j.error || 'launch failed'), 'err');
+      return;
+    }
     setLaunchMsg(`started: ${j.run} (pid ${j.pid})`, 'ok');
     setTimeout(load, 1200);   // refresh the run list so the new card + log appear
   } catch(e) { setLaunchMsg('error: ' + e.message, 'err'); }
+}
+
+function b64(s) { return btoa(unescape(encodeURIComponent(s || ''))); }
+function unb64(s) { try { return decodeURIComponent(escape(atob(s || ''))); } catch(e) { return ''; } }
+function escMultiline(s) { return esc(s).replace(/\n/g, '<br>'); }
+
+function noteViewHtml(run, text) {
+  return `<div class="note-view">${escMultiline(text)}</div>
+    <div class="notes-row"><button class="btn btn-note-edit" data-run="${run}">Edit note</button></div>`;
+}
+function noteEditHtml(run, text) {
+  return `<textarea class="notes-text" data-run="${run}" placeholder="note: how did this run go?">${esc(text || '')}</textarea>
+    <div class="notes-row">
+      <button class="btn primary btn-save-note" data-run="${run}">Save note</button>
+      <button class="btn btn-cancel-note" data-run="${run}">Cancel</button>
+      <span class="note-msg"></span>
+    </div>`;
 }
 
 function card(r, isCurrent) {
@@ -245,7 +353,7 @@ function card(r, isCurrent) {
   rows.push(['updated', `<span class="v">${fmtTime(r.last_mtime)}</span>`]);
 
   const metaHtml = rows.map(([k,v]) => `<span>${k}</span>${v}`).join('');
-  const canInspect = r.has_inspector && r.has_traces;
+  const canInspect = r.has_traces;   // inspector.html is served canonically now, no per-run copy
 
   // Live control panel — only for an actively-training run on this host. Lets you fire an
   // on-demand checkpoint+eval (choosing map type + count per suite) and hand-switch the stage.
@@ -268,8 +376,21 @@ function card(r, isCurrent) {
       <div class="ctl-msg"></div>
     </div>` : '';
 
+  const enc = encodeURIComponent(r.name);
+  const canRename = r.state !== 'training';
+  const hasNote = !!(r.notes && r.notes.trim());
+  const nameHtml = canRename
+    ? `<span class="name-text" data-orig="${esc(r.name)}" title="click to rename">${esc(r.name)}</span>`
+    : `<span class="name-text locked" title="stop training to rename">${esc(r.name)}</span>`;
+
   return `<div class="card ${r.state}">
-    <div class="name">${r.name} ${badgeHtml} ${currentLabel}</div>
+    <div class="name">
+      ${nameHtml} ${badgeHtml} ${currentLabel}
+      <button class="icon-btn btn-note-toggle${hasNote ? ' has-note' : ''}" data-run="${enc}" title="${hasNote ? 'view/edit note' : 'add note'}">${NOTE_ICON_SVG}</button>
+    </div>
+    <div class="note-panel" data-run="${enc}" data-note-b64="${b64(r.notes || '')}" style="display:${hasNote ? 'block' : 'none'}">
+      ${hasNote ? noteViewHtml(enc, r.notes) : ''}
+    </div>
     ${progressHtml}
     <div class="meta">${metaHtml}</div>
     <div class="actions">
@@ -298,6 +419,10 @@ function card(r, isCurrent) {
     ${controlHtml}
   </div>`;
 }
+
+// Notes currently mid-edit (unsaved textarea open) — load()'s periodic root.innerHTML refresh
+// must not wipe these out from under the user, same guard as the live-log console below.
+const EDITING_NOTES = new Set();   // run → in edit mode
 
 // ---- Live log console (poll /api/log, tail-follow) -------------------------------------
 const LOG_POLLERS = {};   // run → interval id
@@ -374,6 +499,51 @@ async function postControl(panel, body) {
   }
 }
 
+// Click-to-rename: swaps the title span for a text input; Enter/blur commits, Escape reverts.
+// Disallowed for 'training' runs (name-text.locked, filtered out before this ever fires — an
+// active process still holds paths/handles into the old dir). Duplicate names are refused by
+// the server (/api/rename); the error surfaces inline for ~2s instead of an alert().
+function startRenameInline(span) {
+  const orig = span.dataset.orig;
+  const input = document.createElement('input');
+  input.type = 'text'; input.value = orig; input.className = 'name-input'; input.dataset.orig = orig;
+  span.replaceWith(input);
+  input.focus(); input.select();
+  let done = false;
+  const revert = () => { if (done) return; done = true; input.replaceWith(makeNameSpan(orig)); };
+  const commit = () => {
+    if (done) return;
+    const next = input.value.trim();
+    if (!next || next === orig) { revert(); return; }
+    done = true;
+    input.disabled = true;
+    fetch(`/api/rename?run=${encodeURIComponent(orig)}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ new_name: next }),
+    }).then(r => r.json()).then(j => {
+      if (!j.ok) {
+        input.title = j.error || 'rename failed';
+        input.style.borderColor = 'var(--warn)';
+        input.disabled = false; done = false;
+        setTimeout(() => revert(), 2000);
+        return;
+      }
+      load();   // full refresh: card + every data-run reference must pick up the new name
+    }).catch(() => { input.disabled = false; done = false; revert(); });
+  };
+  input.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); revert(); }
+  });
+  input.addEventListener('blur', () => commit());
+}
+function makeNameSpan(name) {
+  const span = document.createElement('span');
+  span.className = 'name-text'; span.dataset.orig = name; span.title = 'click to rename';
+  span.textContent = name;
+  return span;
+}
+
 // Event delegation on #root — survives the innerHTML refresh every 30 s.
 function onRootClick(e) {
   // Per-card log / params toggles (outside the .control panel).
@@ -424,6 +594,55 @@ function onRootClick(e) {
       .catch(err => { msg.textContent = 'error: ' + err.message; msg.className = 'ctl-msg err'; });
     return;
   }
+  if (e.target.classList.contains('name-text') && !e.target.classList.contains('locked')) {
+    startRenameInline(e.target);
+    return;
+  }
+  if (e.target.classList.contains('btn-note-toggle')) {
+    const run = e.target.dataset.run;
+    const panel = e.target.closest('.card').querySelector(`.note-panel[data-run="${run}"]`);
+    if (!panel) return;
+    const showing = panel.style.display !== 'none';
+    if (showing) { panel.style.display = 'none'; EDITING_NOTES.delete(run); return; }
+    const text = unb64(panel.dataset.noteB64);
+    if (text.trim()) { panel.innerHTML = noteViewHtml(run, text); }
+    else { panel.innerHTML = noteEditHtml(run, text); EDITING_NOTES.add(run); }
+    panel.style.display = 'block';
+    return;
+  }
+  if (e.target.classList.contains('btn-note-edit')) {
+    const panel = e.target.closest('.note-panel'), run = panel.dataset.run;
+    panel.innerHTML = noteEditHtml(run, unb64(panel.dataset.noteB64));
+    EDITING_NOTES.add(run);
+    return;
+  }
+  if (e.target.classList.contains('btn-cancel-note')) {
+    const panel = e.target.closest('.note-panel'), run = panel.dataset.run;
+    const text = unb64(panel.dataset.noteB64);
+    EDITING_NOTES.delete(run);
+    if (text.trim()) panel.innerHTML = noteViewHtml(run, text);
+    else panel.style.display = 'none';
+    return;
+  }
+  if (e.target.classList.contains('btn-save-note')) {
+    const panel = e.target.closest('.note-panel'), run = panel.dataset.run;
+    const text = panel.querySelector('.notes-text').value;
+    const msg = panel.querySelector('.note-msg');
+    msg.textContent = 'saving…'; msg.className = 'note-msg';
+    fetch(`/api/notes?run=${run}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ text }),
+    }).then(r => r.json()).then(j => {
+      if (!j.ok) { msg.textContent = 'error: ' + (j.error || ''); msg.className = 'note-msg err'; return; }
+      EDITING_NOTES.delete(run);
+      panel.dataset.noteB64 = b64(text);
+      const iconBtn = panel.closest('.card').querySelector(`.btn-note-toggle[data-run="${run}"]`);
+      if (iconBtn) iconBtn.classList.toggle('has-note', !!text.trim());
+      if (text.trim()) panel.innerHTML = noteViewHtml(run, text);
+      else panel.style.display = 'none';
+    }).catch(err => { msg.textContent = 'error: ' + err.message; msg.className = 'note-msg err'; });
+    return;
+  }
   if (e.target.classList.contains('btn-stop')) {
     const run = e.target.dataset.run, btn = e.target;
     if (!confirm(`Stop training "${run}" and save the policy (ckpt_stop.pt)?`)) return;
@@ -454,11 +673,12 @@ function onRootClick(e) {
 }
 
 async function load() {
-  // Don't wipe the DOM while a live log console is open — the re-render would kill it.
-  // (The console keeps polling itself; use "refresh now" to update the run list.)
-  if (Object.keys(LOG_POLLERS).length) {
+  // Don't wipe the DOM while a live log console OR a note edit box is open — the re-render
+  // would kill it (and silently drop whatever the user was mid-typing into a note).
+  if (Object.keys(LOG_POLLERS).length || EDITING_NOTES.size) {
     document.getElementById('foot').textContent =
-      'Auto-refresh paused (log open) · ' + new Date().toLocaleTimeString();
+      'Auto-refresh paused (' + (EDITING_NOTES.size ? 'editing a note' : 'log open') + ') · '
+      + new Date().toLocaleTimeString();
     return;
   }
   try {
@@ -480,22 +700,30 @@ async function load() {
     }
 
     const currentName = runs.find(r => r.state === 'training')?.name ?? null;
-
-    const sections = [
-      { key: 'training', label: 'In progress' },
-      { key: 'stopped',  label: 'Stopped / interrupted' },
-      { key: 'done',     label: 'Finished' },
-      { key: 'empty',    label: 'Empty' },
-    ];
+    const sortMode = document.getElementById('sortMode').value;
 
     let html = '';
-    for (const { key, label } of sections) {
-      const group = runs.filter(r => r.state === key);
-      if (!group.length) continue;
-      html += `<div class="section">
-        <div class="section-label">${label} (${group.length})</div>
-        <div class="grid">${group.map(r => card(r, r.name === currentName)).join('')}</div>
-      </div>`;
+    if (sortMode === 'status') {
+      // Grouped view, most-recent-first within each group. Requested order: training on top,
+      // then done, then stopped, then empty (done ranks above stopped, not the reverse).
+      const sections = [
+        { key: 'training', label: 'In progress' },
+        { key: 'done',     label: 'Finished' },
+        { key: 'stopped',  label: 'Stopped / interrupted' },
+        { key: 'empty',    label: 'Empty' },
+      ];
+      for (const { key, label } of sections) {
+        const group = runs.filter(r => r.state === key).sort((a, b) => b.last_mtime - a.last_mtime);
+        if (!group.length) continue;
+        html += `<div class="section">
+          <div class="section-label">${label} (${group.length})</div>
+          <div class="grid">${group.map(r => card(r, r.name === currentName)).join('')}</div>
+        </div>`;
+      }
+    } else {
+      // Chronological: every run in one list, most recently touched on top, regardless of state.
+      const ordered = [...runs].sort((a, b) => b.last_mtime - a.last_mtime);
+      html = `<div class="section"><div class="grid">${ordered.map(r => card(r, r.name === currentName)).join('')}</div></div>`;
     }
     root.innerHTML = html;
     // Seed each fresh control panel with one eval row.
@@ -507,6 +735,10 @@ async function load() {
     document.getElementById('root').innerHTML = `<div class="empty-state">Error: ${e.message}</div>`;
   }
 }
+
+const sortSel = document.getElementById('sortMode');
+sortSel.value = localStorage.getItem('marlauder_sort_mode') || 'recent';
+sortSel.onchange = () => { localStorage.setItem('marlauder_sort_mode', sortSel.value); load(); };
 
 initLaunchForm();
 load();

@@ -18,7 +18,6 @@ from env.frontier import compute_frontier
 from eval.render import shade_occupancy_prob, paint_frontier
 from models.actor_critic import K
 
-_REPO = Path(__file__).resolve().parent.parent
 _KOFF = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]
 
 
@@ -138,6 +137,11 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         # never compute one. The viewer shows one real head at a time.
         dbg = model._dbg_logits or {}
         enc_attn = dbg.get("enc_attn")                       # list[L] of [1, M, W2, K+1, H] or None
+        enc_contrib = dbg.get("enc_contrib")                 # list[L] of [1, M, W2, K+1] or None
+        #   `enc_contrib` = the REAL per-neighbor value-contribution magnitude ‖c_j‖ to the output
+        #   embedding, combining all H heads exactly as the model does (attn × value → o_proj mix,
+        #   NOT a head-mean). This is the honest "global" weight the viewer shows by default; the
+        #   per-head softmax (enc_attn) is the drill-down. Both are exact, no estimation.
         l2g    = obs["local_to_global"][0].cpu().numpy()     # [M, W2] global id (-1 pad)
         ei_loc = obs["edge_idx"][0].cpu().numpy()            # [M, W2, K] window-local nbr idx
         ev_loc = obs["edge_valid"][0].cpu().numpy()          # [M, W2, K] bool
@@ -156,12 +160,19 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 # weights [layer][head][node] = [self, n0..n_{K-1}], self moved to slot 0. All real.
                 # NOTE: not `W` — that name holds the map width (H, W = env.H, env.W) above.
                 w_layers = []
+                c_layers = []
                 for l in range(Ln):
                     al = np.round(enc_attn[l][0, a].cpu().numpy()[loc], 3)   # [V, K+1, H]
                     per_head = [np.concatenate([al[:, K:K + 1, h], al[:, :K, h]], axis=1).tolist()
                                 for h in range(al.shape[-1])]
                     w_layers.append(per_head)
-                gat_agents.append({"node": nodes, "nbr": nbr.tolist(), "w": w_layers})
+                    # combined REAL value-contribution ‖c_j‖ [self, n0..n_{K-1}]; self moved to slot 0.
+                    if enc_contrib is not None:
+                        cl = enc_contrib[l][0, a].cpu().numpy()[loc]          # [V, K+1]
+                        cl = np.round(np.concatenate([cl[:, K:K + 1], cl[:, :K]], axis=1), 4)
+                        c_layers.append(cl.tolist())
+                gat_agents.append({"node": nodes, "nbr": nbr.tolist(), "w": w_layers,
+                                   "c": (c_layers if enc_contrib is not None else None)})
 
         for a in range(M):
             prob = torch.sigmoid(env.world.occupancy_logodds_torch[0, a]).cpu().numpy()
@@ -281,10 +292,16 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             # separate attention heads (all real, all used by the model).
             "gat_layers": len(model.encoder.layers),
             "gat_heads": int(getattr(model.encoder.layers[0], "n_heads", 1)),
+            # Per-head A2 raw-feature groups → the viewer labels heads by what they specialize on
+            # (head0→geometry, head1→utility, head2→teammate, …). Real config, not an inference.
+            "head_feat_groups": (model.encoder.head_feat_groups()
+                                 if hasattr(model.encoder, "head_feat_groups") else None),
             "feat_names": F_NAMES}   # input-feature names for the node panel
     (tdir / "trace.json").write_text(json.dumps({"meta": meta, "steps": steps}))
 
-    # maintain the episode picker index + ensure the viewer is present
+    # maintain the episode picker index (the viewer itself is served canonically by
+    # viz/web_server.py for any /<run>/inspector.html request — no per-run copy, so it's never
+    # stale at whatever version existed when this run's traces happened to be captured)
     idx_path = Path(out_root) / "traces" / "index.json"
     try:
         index = json.loads(idx_path.read_text()) if idx_path.exists() else []
@@ -294,9 +311,6 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
              "final_explored": meta["final_explored"], "completed": bool(completed)}
     index = [e for e in index if e.get("tag") != tag] + [entry]
     idx_path.write_text(json.dumps(index, indent=1))
-    viewer = _REPO / "viz" / "inspector.html"
-    if viewer.exists():
-        (Path(out_root) / "inspector.html").write_bytes(viewer.read_bytes())
 
     # Turn the attention/debug stash back OFF before restoring the (possibly compiled) encoder —
     # the driver reuses this same model to keep training, and store_attn would tax every forward.

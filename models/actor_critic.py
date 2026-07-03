@@ -206,9 +206,14 @@ class MarlActorCritic(nn.Module):
             if getattr(self.encoder, "last_attn", None) is not None:
                 enc_attn = [a.view(N, M, a.shape[-3], a.shape[-2], a.shape[-1])
                             for a in self.encoder.last_attn]
+            enc_contrib = None
+            if getattr(self.encoder, "last_contrib", None) is not None:
+                enc_contrib = [c.view(N, M, c.shape[-2], c.shape[-1])
+                               for c in self.encoder.last_contrib]
             self._dbg_logits = {
-                "pointer":   pointer_logits.detach().view(N, M, K),   # GAT pointer attention score
-                "enc_attn":  enc_attn,                                 # GAT per-layer neighbor attention
+                "pointer":     pointer_logits.detach().view(N, M, K),  # GAT pointer attention score
+                "enc_attn":    enc_attn,                               # GAT per-layer neighbor attention
+                "enc_contrib": enc_contrib,                            # per-layer real value-contrib norm
             }
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)

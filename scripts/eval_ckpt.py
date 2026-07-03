@@ -22,32 +22,9 @@ import torch
 
 from env.explorer import EnvCfg, Explorer
 from env.maps import load_split
+from eval.ckpt_loader import load_model_from_ckpt
 from eval.rollout import EvalCfg, EvalRollout
 from eval.trace import capture_trace
-from models.actor_critic import MarlActorCritic
-
-
-def _load_model(ckpt_path: Path, n_agents: int, d_hidden: int, n_heads: int,
-                n_layers: int, device: str):
-    """Mirror trace_episode.py's tolerant checkpoint loader."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg_peek = ckpt.get("cfg", {})
-    env_peek = cfg_peek.get("env", {}) if isinstance(cfg_peek, dict) else {}
-    model = MarlActorCritic(n_agents=n_agents, d=d_hidden,
-                            n_heads=n_heads, n_layers=n_layers).to(device)
-    sd = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in ckpt["model"].items()}
-    sd = {k.replace("encoder._orig_mod.", "encoder."): v for k, v in sd.items()}
-    if "path_bias" in sd and "path_bias_learn" not in sd:
-        sd["path_bias_learn"] = sd.pop("path_bias")
-    msd = model.state_dict()
-    for k in [k for k in sd if k in msd and msd[k].shape != sd[k].shape]:
-        del sd[k]
-    model.load_state_dict(sd, strict=False)
-    if isinstance(cfg_peek, dict):
-        model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
-        model.use_gru = bool(cfg_peek.get("use_gru", True))   # honor a GRU-ablation checkpoint
-    model.eval()
-    return model, env_peek
 
 
 def main() -> None:
@@ -55,17 +32,23 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--split", default="test/hybrid")
     ap.add_argument("--n-maps", type=int, default=3, help="how many evenly-spaced maps to evaluate")
-    ap.add_argument("--n-agents", type=int, default=2)
+    ap.add_argument("--n-agents", type=int, default=None, help="default: from ckpt cfg, else 2")
     ap.add_argument("--steps", type=int, default=256)
-    ap.add_argument("--d-hidden", type=int, default=128)
-    ap.add_argument("--n-heads", type=int, default=4)
-    ap.add_argument("--n-layers", type=int, default=2)
+    # Architecture args default to None → auto-detected from the checkpoint (see
+    # eval.ckpt_loader) so this ALWAYS evaluates with the exact architecture the checkpoint was
+    # trained with. A mismatch here doesn't crash — load_state_dict(strict=False) silently drops
+    # the shape-mismatched layers, so the eval score becomes fiction with no error to flag it.
+    ap.add_argument("--d-hidden", type=int, default=None, help="default: from ckpt")
+    ap.add_argument("--n-heads", type=int, default=None, help="default: from ckpt")
+    ap.add_argument("--n-layers", type=int, default=None, help="default: from ckpt (encoder depth)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, required=True, help="run dir to write GIFs + traces into")
     args = ap.parse_args()
 
-    model, env_peek = _load_model(args.ckpt, args.n_agents, args.d_hidden,
-                                  args.n_heads, args.n_layers, args.device)
+    model, env_peek = load_model_from_ckpt(args.ckpt, args.device, n_agents=args.n_agents,
+                                           d_hidden=args.d_hidden, n_heads=args.n_heads,
+                                           n_layers=args.n_layers)
+    args.n_agents = int(getattr(model, "M", args.n_agents or 2))   # resolved value, for env_cfg below
     split = load_split(args.split, device=args.device)
     n = int(getattr(split, "n", 0)) or 1
     k = max(1, min(args.n_maps, n))
@@ -94,7 +77,7 @@ def main() -> None:
             print(f"[eval_ckpt] gif {gif.name} explored={stats['final_explored']*100:.1f}%")
         except Exception as exc:
             print(f"[eval_ckpt] gif {tag} skipped ({exc})")
-        # Inspector trace (also copies inspector.html into the run dir)
+        # Inspector trace (viewer itself is served canonically by web_server.py)
         try:
             capture_trace(model, split, env_peek or {}, args.n_agents,
                           int(midx), args.steps, args.out, tag, args.device)

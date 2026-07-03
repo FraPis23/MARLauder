@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -46,6 +47,7 @@ def _scan_splits() -> list[str]:
 # choices, and help (tooltip). Last-used values persist server-side (survive browser close AND
 # power-off) in runs/.launch_params.json; the defaults themselves come from the schema.
 LAUNCH_PARAMS_FILE = RUNS_DIR / ".launch_params.json"
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")   # run-folder name allow-list (rename + launch)
 
 
 def _arg_schema() -> list[dict]:
@@ -108,14 +110,42 @@ def _build_cmd(p: dict) -> list[str]:
     return cmd
 
 
-def _launch_training(params: dict) -> dict:
-    """Spawn a detached run_train.py. Fresh dir runs/<run-name>_<timestamp>; stdout+stderr →
-    that dir's train.log. start_new_session detaches it so it outlives the web server."""
-    import subprocess
+def _next_auto_name(base: str) -> str:
+    """base_<timestamp>, suffixed _2/_3/... on the (rare) chance that exact name is already
+    taken — e.g. two launches within the same second. Never returns an existing dir, so
+    auto-named runs (no explicit name typed) can never silently collide."""
     import time
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    name = f"{base}_{stamp}"
+    n = 2
+    while (RUNS_DIR / name).exists():
+        name = f"{base}_{stamp}_{n}"
+        n += 1
+    return name
+
+
+def _launch_training(params: dict) -> dict:
+    """Spawn a detached run_train.py. stdout+stderr → the run dir's train.log.
+    start_new_session detaches it so it outlives the web server.
+
+    Naming: `out_name` in params is an explicit folder name the user typed (from the launch
+    form's "Run name" field) — if it already exists, this refuses UNLESS `force` is set, so the
+    frontend can catch the {"error": "exists"} and re-ask/re-send with force after a JS confirm.
+    Leaving out_name blank auto-generates a name that's guaranteed not to collide (no
+    confirmation needed — nothing to overwrite)."""
     base = (str(params.get("wandb_run_name", "") or "run").strip().replace("/", "_")) or "run"
-    run = f"{base}_{time.strftime('%Y%m%d_%H%M%S')}"
+    requested = str(params.get("out_name", "") or "").strip()
+    force = bool(params.get("force"))
+    if requested:
+        if not _SAFE_NAME.match(requested):
+            return {"ok": False, "error": "run name must be non-empty and use only letters/digits/._-"}
+        run = requested
+    else:
+        run = _next_auto_name(base)
     run_dir = RUNS_DIR / run
+    if run_dir.exists() and not force:
+        return {"ok": False, "error": "exists", "run": run}
+    import subprocess
     run_dir.mkdir(parents=True, exist_ok=True)
     cmd = _build_cmd(params) + ["--out", str(run_dir)]
     # Persist this run's exact params alongside its outputs (audit / reproduce).
@@ -124,10 +154,15 @@ def _launch_training(params: dict) -> dict:
     logf = open(run_dir / "train.log", "wb")
     logf.write(("$ " + " ".join(cmd) + "\n\n").encode())
     logf.flush()
+    # Redirecting stdout to a real (non-tty) file here means run_train.py's own tee (which only
+    # kicks in when stdout is a tty — i.e. a bare CLI launch) stays a no-op, so the file is never
+    # written twice.
     env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
     proc = subprocess.Popen(cmd, cwd=str(_REPO), stdout=logf, stderr=subprocess.STDOUT,
                             start_new_session=True, env=env)
-    _save_launch_params(params)
+    # Persist as "last used" for form prefill — MINUS the per-launch decisions (a specific
+    # out_name / a force-overwrite confirmation must never silently apply to the NEXT launch).
+    _save_launch_params({k: v for k, v in params.items() if k not in ("out_name", "force")})
     return {"ok": True, "run": run, "pid": proc.pid, "cmd": " ".join(cmd)}
 
 
@@ -183,6 +218,41 @@ def _eval_ckpt(run: str, ckpt: str, split: str, n_maps: int, steps: int) -> dict
     return {"ok": True, "pid": proc.pid, "cmd": " ".join(cmd)}
 
 
+def _run_state(run: str) -> str | None:
+    for r in _scan_runs():
+        if r["name"] == run:
+            return r["state"]
+    return None
+
+
+def _rename_run(old: str, new: str) -> dict:
+    """Rename a finished run's directory. Refused for 'training' (an active process still holds
+    paths/handles into the old dir) — safe for done/stopped/empty."""
+    if not new or not _SAFE_NAME.match(new):
+        return {"ok": False, "error": "new name must be non-empty and use only letters/digits/._-"}
+    old_dir = (RUNS_DIR / old).resolve()
+    if RUNS_DIR.resolve() not in old_dir.parents or not old_dir.is_dir():
+        return {"ok": False, "error": "invalid run"}
+    state = _run_state(old)
+    if state == "training":
+        return {"ok": False, "error": "can't rename a run that's still training — stop it first"}
+    new_dir = RUNS_DIR / new
+    if new_dir.exists():
+        return {"ok": False, "error": f"'{new}' already exists"}
+    old_dir.rename(new_dir)
+    return {"ok": True, "name": new}
+
+
+def _save_note(run: str, text: str) -> dict:
+    d = (RUNS_DIR / run).resolve()
+    if RUNS_DIR.resolve() not in d.parents or not d.is_dir():
+        return {"ok": False, "error": "invalid run"}
+    tmp = d / "notes.json.tmp"
+    tmp.write_text(json.dumps({"text": text}))
+    tmp.replace(d / "notes.json")
+    return {"ok": True}
+
+
 def _stop_run(run: str) -> dict:
     """Graceful stop+save: SIGTERM the run's training PID. The driver's signal handler saves
     the policy (ckpt_stop.pt) before exiting. PID is read from the run's status.json."""
@@ -226,7 +296,6 @@ def _scan_runs() -> list[dict]:
     for d in sorted(RUNS_DIR.iterdir()):
         if not d.is_dir() or d.name.startswith("."):
             continue
-        has_inspector = (d / "inspector.html").exists()
         has_traces    = (d / "traces" / "index.json").exists()
         has_final     = (d / "final.pt").exists()
 
@@ -271,10 +340,17 @@ def _scan_runs() -> list[dict]:
         else:
             state = "empty"
 
+        notes = ""
+        notes_file = d / "notes.json"
+        if notes_file.exists():
+            try:
+                notes = json.loads(notes_file.read_text()).get("text", "")
+            except Exception:
+                pass
+
         runs.append({
             "name":          d.name,
             "state":         state,
-            "has_inspector": has_inspector,
             "has_traces":    has_traces,
             "has_log":       (d / "train.log").exists(),
             "has_params":    (d / "params.json").exists(),
@@ -283,6 +359,7 @@ def _scan_runs() -> list[dict]:
             "last_mtime":    last_mtime,
             "n_traces":      n_traces,
             "status":        status,   # full status.json (progress %, ep_end, etc.) or null
+            "notes":         notes,
         })
 
     _order = {"training": 0, "stopped": 1, "done": 2, "empty": 3}
@@ -318,6 +395,11 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(_read_log(qs.get("run", ""), offset))
         elif path in ("/", "/index.html"):
             self._serve_file(VIZ_DIR / "index.html", "text/html; charset=utf-8")
+        elif path.endswith("/inspector.html"):
+            # Served canonically here (not the per-run copy trace.py used to drop into each run
+            # dir) so every run always gets the CURRENT inspector, never one frozen at whatever
+            # viz/inspector.html looked like the last time that run's traces were captured.
+            self._serve_file(VIZ_DIR / "inspector.html", "text/html; charset=utf-8")
         else:
             super().do_GET()
 
@@ -329,6 +411,26 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/stop":
             qs = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
             self._send_json(_stop_run(qs.get("run", "")))
+            return
+        if parsed.path == "/api/rename":
+            qs = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as exc:
+                self.send_error(400, f"Bad body: {exc}")
+                return
+            self._send_json(_rename_run(qs.get("run", ""), str(body.get("new_name", "")).strip()))
+            return
+        if parsed.path == "/api/notes":
+            qs = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as exc:
+                self.send_error(400, f"Bad body: {exc}")
+                return
+            self._send_json(_save_note(qs.get("run", ""), str(body.get("text", ""))))
             return
         if parsed.path == "/api/eval":
             try:

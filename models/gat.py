@@ -94,8 +94,13 @@ class MaskedGATLayer(nn.Module):
 
         # Inspector hook: when store_attn, keep the per-node neighbor-attention softmax of the
         # last forward (detached) so the viewer can show which neighbors a node aggregates from.
+        # We ALSO stash `_last_contrib`: the real per-neighbor value-contribution magnitude to the
+        # output embedding (‖c_j‖ through o_proj). This is the honest "how the H heads combine at
+        # the end" number — the model concatenates heads and mixes them with o_proj, it never means
+        # them, so a head-mean of attention is not a value the network uses. See forward().
         self.store_attn = False
         self._last_attn: torch.Tensor | None = None
+        self._last_contrib: torch.Tensor | None = None
 
     def forward(
         self,
@@ -161,6 +166,17 @@ class MaskedGATLayer(nn.Module):
 
         if self.store_attn:
             self._last_attn = attn.detach()                                     # [B, N, K+1, H]
+            # REAL per-neighbor value-contribution to the OUTPUT embedding, combining heads exactly
+            # the way the model does (attn × value, then the o_proj mix — no head-mean). Because
+            # o_proj is linear, out − bias = Σ_slot c_slot with
+            #   c_slot = Σ_h attn[slot,h] · (O_h · v[slot,h]),  O_h = o_proj.weight[:, h·D:(h+1)·D].
+            # ‖c_slot‖₂ is that neighbor/self's contribution magnitude to the 128-d embedding. This
+            # is exact (not an estimate); eval-only, detached, does not touch training.
+            with torch.no_grad():
+                wv = attn.unsqueeze(-1) * v_all                                  # [B, N, K+1, H, D]
+                O = self.o_proj.weight.view(self.out_dim, H, D)                  # [out_dim, H, D]
+                c = torch.einsum("ohd,bnshd->bnso", O, wv)                       # [B, N, K+1, out_dim]
+                self._last_contrib = c.norm(dim=-1).detach()                    # [B, N, K+1]
         out = (attn.unsqueeze(-1) * v_all).sum(dim=2)                            # [B, N, H, D]
         out = out.reshape(B, N, H * D)
         out = self.o_proj(out)                                                   # [B, N, out_dim]
@@ -183,7 +199,8 @@ class GATEncoder(nn.Module):
         ])
         self.norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(n_layers)])
         self.act = nn.GELU()
-        self.last_attn: list | None = None   # inspector: per-layer [B,N,K,H] from last forward
+        self.last_attn: list | None = None   # inspector: per-layer [B,N,K+1,H] from last forward
+        self.last_contrib: list | None = None  # inspector: per-layer [B,N,K+1] real value-contrib norm
         # MAPPO paper Tab.7 — orthogonal init across all GAT projections.
         apply_orthogonal(self)
         # A2 — start the structural-bias projections SMALL so they nudge (not dominate) early
@@ -203,16 +220,23 @@ class GATEncoder(nn.Module):
     ) -> torch.Tensor:
         h = self.input_proj(node_feat)
         h = h * node_valid.unsqueeze(-1).float()
-        attns = []
+        attns, contribs = [], []
         for layer, norm in zip(self.layers, self.norms):
             res = h
             h = layer(h, edge_idx, edge_valid, node_valid, node_feat=node_feat)
             if self.store_attn:
                 attns.append(layer._last_attn)
+                contribs.append(layer._last_contrib)
             h = norm(res + self.act(h))
             h = h * node_valid.unsqueeze(-1).float()
         self.last_attn = attns if self.store_attn else None
+        self.last_contrib = contribs if self.store_attn else None
         return h
+
+    def head_feat_groups(self) -> list[list[int]]:
+        """Per-head raw-feature groups (A2 structural bias) — real config, used to label heads
+        in the inspector (head0→geometry, head1→utility, head2→teammate, …). Read from layer 0."""
+        return list(self.layers[0].head_feat_groups)
 
     @property
     def store_attn(self) -> bool:

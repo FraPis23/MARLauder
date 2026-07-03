@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -20,18 +21,73 @@ from train.driver import TrainCfg, train
 from train.mappo import MAPPOCfg
 
 
+class _Tee:
+    """Duplicates writes to the real stream + a log file, so the web dashboard's live console
+    works no matter how training was launched (web launcher already redirects stdout to a file
+    itself; a bare CLI run previously had no train.log at all → 'Show log' button never appeared)."""
+
+    def __init__(self, stream, logfile) -> None:
+        self._stream = stream
+        self._logfile = logfile
+
+    def write(self, data) -> int:
+        self._stream.write(data)
+        self._logfile.write(data)
+        self._logfile.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._logfile.flush()
+
+
+def _unique_dir(base: Path) -> Path:
+    """base if free, else base_2, base_3, ... — never returns a dir that already exists."""
+    if not base.exists():
+        return base
+    n = 2
+    while (cand := base.parent / f"{base.name}_{n}").exists():
+        n += 1
+    return cand
+
+
 def main() -> None:
     ap = build_parser()
     args = ap.parse_args()
+    out_was_explicit = args.out is not None
 
-    # Auto-create a fresh run dir when --out is omitted: runs/<run-name|run>_<timestamp>.
-    # Keeps every training isolated without typing a unique --out each launch.
+    # Auto-create a fresh run dir when --out is omitted: runs/<run-name|run>_<timestamp>,
+    # collision-safe (suffix _2, _3, ... if that exact name is somehow already taken — e.g.
+    # two launches within the same second). Never silently reuses/overwrites another run.
     if args.out is None:
         import time as _time
         _stamp = _time.strftime("%Y%m%d_%H%M%S")
         _base = (args.wandb_run_name or "run").strip().replace("/", "_") or "run"
-        args.out = Path("/workspace/MARLauder/runs") / f"{_base}_{_stamp}"
+        args.out = _unique_dir(Path("/workspace/MARLauder/runs") / f"{_base}_{_stamp}")
         print(f"[out] auto run dir → {args.out}")
+    else:
+        args.out = Path(args.out)
+
+    # An EXPLICIT --out that already holds a PRIOR TRAINING (a checkpoint or a status.json) is
+    # someone reusing a name on purpose (or by mistake) — never overwrite silently. Checked via
+    # actual training artifacts, not "any file in the dir": the web launcher always drops
+    # params.json + opens train.log into a fresh dir BEFORE spawning this process, so a plain
+    # "non-empty" check would misfire on every single web-launched run.
+    _has_prior_training = args.out.exists() and (
+        any(args.out.glob("*.pt")) or (args.out / "status.json").exists()
+    )
+    if out_was_explicit and _has_prior_training:
+        if args.force:
+            print(f"[out] --force: overwriting existing run dir {args.out}")
+        elif sys.stdin.isatty():
+            resp = input(f"[out] '{args.out}' already holds a previous training. Overwrite? [y/N] ").strip().lower()
+            if resp not in ("y", "yes"):
+                print("[out] aborted.")
+                sys.exit(1)
+        else:
+            print(f"[out] ERROR: '{args.out}' already holds a previous training. "
+                  f"Pass --force to overwrite, or pick a different --out. Refusing to run non-interactively.")
+            sys.exit(1)
 
     # IR2-style MANUAL curriculum: --stage picks a single split + its episode length and
     # disables any auto-advance. One stage per run; relaunch with the next --stage to advance.
@@ -44,6 +100,28 @@ def main() -> None:
         args.max_episode_steps = _STAGE_STEPS[args.stage]
         print(f"[stage] MANUAL curriculum: stage='{args.stage}' "
               f"split='{args.split}' max_episode_steps={args.max_episode_steps}")
+
+    # Mirror stdout/stderr into <out>/train.log so the web dashboard's live log console works
+    # even for a bare CLI launch (previously train.log only existed when the web launcher had
+    # redirected the subprocess's stdout to it → 'Show log' never appeared for CLI runs). Only
+    # do this when stdout is a tty: the web launcher already redirects stdout to a real train.log
+    # file itself, so tee-ing again here would duplicate every line.
+    if sys.stdout.isatty():
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        _logf = open(Path(args.out) / "train.log", "a", buffering=1)
+        _logf.write(f"\n$ {' '.join(sys.argv)}\n\n")
+        sys.stdout = _Tee(sys.stdout, _logf)
+        sys.stderr = _Tee(sys.stderr, _logf)
+
+    # Same gap for params.json: the web launcher writes one (form params the dashboard's
+    # "Params" button reads), but a bare CLI launch never did → the button never appeared for
+    # those runs. Write the fully-resolved argparse values here too, unless the web launcher
+    # already dropped its own params.json moments ago (don't clobber its richer {params, cmd}).
+    _params_path = Path(args.out) / "params.json"
+    if not _params_path.exists():
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        _params_path.write_text(json.dumps(
+            {"params": vars(args), "cmd": " ".join(sys.argv)}, indent=2, default=str))
 
     cfg = TrainCfg(
         split=args.split,
