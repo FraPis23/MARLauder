@@ -143,6 +143,9 @@ class EnvCfg:
     # RADAR (feat[6/7]) travel-cost discount per hop beyond the ego-window horizon. Lower = more
     # myopic (only just-beyond mass matters); higher = far mass carries further. See build_radar.
     radar_gamma: float = 0.92
+    # Ablation: zero the guidepost channel (node_feat[5]) so the policy sees no analytic route —
+    # tests whether the radar out-of-window channels subsume the guidepost.
+    disable_guidepost: bool = False
     # Stall penalty — heavy cost for standing still (no net displacement this step). Catches
     # collision-revert holds AND invalid/curr-node picks. Pressures agents to reroute /
     # separate instead of deadlocking. δ_stall ≫ revisit so standing still is "heavily penalized".
@@ -1339,6 +1342,11 @@ class Explorer:
                 pot = torch.exp(-d_min / scale_px)                            # +inf → 0
                 pot = torch.nan_to_num(pot, nan=0.0, posinf=0.0, neginf=0.0)
                 infos[a]["node_feat"][..., 4] = pot * infos[a]["node_valid"].float()
+
+        # Guidepost ablation: blank the guidepost channel so the model sees no analytic route.
+        if self.cfg.disable_guidepost:
+            for a in range(self.M):
+                infos[a]["node_feat"][..., 5] = 0.0
 
         # ---- Render-global stash (eval/debug only) — full-graph utility/validity for the GIF,
         # since obs ships only the ego window. Gated so training pays nothing. ----

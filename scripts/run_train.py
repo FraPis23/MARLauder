@@ -191,6 +191,7 @@ def main() -> None:
             proximity_penalty_coef=args.proximity_pen,
             revisit_penalty_coef=args.revisit_pen,
             revisit_window=args.revisit_window,
+            disable_guidepost=args.no_guidepost,
             stall_penalty_coef=args.stall_pen,
             analytic_target=True,   # env always owns the global target (StrategicHead removed)
             target_kind=("nearest" if args.target_mode == "nearest" else "analytic"),
