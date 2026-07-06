@@ -95,6 +95,8 @@
       <option value="team">teammate_pot</option>
       <option value="gp">guidepost</option>
       <option value="bf">bf_dist→target</option>
+      <option value="bu">radar · utility (out-of-window)</option>
+      <option value="bt">radar · teammate (out-of-window)</option>
     </select></label>
     <label><input type="checkbox" id="edges" checked/> edges</label>
     <label><input type="checkbox" id="grid" checked/> ego grid</label>
@@ -233,6 +235,17 @@ function ramp(t){ // 0..1 -> dim blue -> amber
   t=Math.max(0,Math.min(1,t)); const lo=[46,64,120], hi=[255,210,60];
   return `rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*t)).join(",")})`;
 }
+// Per-field color ramp so utility-type and teammate-type fields read as DIFFERENT hues at a
+// glance: utility (util/ub/uv/bu) = amber/gold, teammate (team/bt) = magenta. Radar channels
+// (bu/bt) share their base field's hue so "radar utility" looks like utility and "radar teammate"
+// like teammate — you can tell what you're looking at from the color alone.
+function rampField(f,t){
+  t=Math.max(0,Math.min(1,t));
+  const mix=(lo,hi)=>`rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*t)).join(",")})`;
+  if(f==="team"||f==="bt") return mix([50,30,70],[255,90,235]);   // teammate → magenta
+  if(f==="util"||f==="ub"||f==="uv"||f==="bu") return mix([46,64,120],[255,210,60]); // utility → amber
+  return ramp(t);                                                 // age/gp/bf → default blue→amber
+}
 function fieldVal(n,f){ let v=n[f]; if(v===null||v===undefined) return null; return v; }
 
 function curStep(){ return A.trace.steps[A.t]; }
@@ -351,7 +364,7 @@ function drawNodes(){
       }
     } else {
       const v=fieldVal(n,A.field);
-      col = v===null? "#33405a" : ramp((v-lo)/(hi-lo));
+      col = v===null? "#33405a" : rampField(A.field,(v-lo)/(hi-lo));
       rad = A.sel&&A.sel===n.i?5:3;
     }
     ctx.fillStyle=col;
@@ -713,8 +726,11 @@ function showNode(){
   // utility seed = boundary-pixel ribbon × (FLOOR + (1−FLOOR)·detectable-volume), then diffused.
   const ubv = n.ub!=null?row("&nbsp;&nbsp;↳ boundary px",n.ub):"";
   const uvv = n.uv!=null?row("&nbsp;&nbsp;↳ detectable vol",n.uv):"";
+  const buv = n.bu!=null?row("radar util (out-of-win)",n.bu):"";
+  const btv = n.bt!=null?row("radar teammate (out-of-win)",n.bt):"";
   $("node").innerHTML = row("utility (diffused)",n.util)+ubv+uvv
     +row("age",n.age)+row("teammate_pot",n.team)+row("guidepost",n.gp)+row("bf→target (nodes)",n.bf)
+    +buv+btv
     + (n.i===ag.curr?row("•","CURR"):"") + (n.i===ag.target?row("•","TARGET"):"");
 }
 

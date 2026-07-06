@@ -133,8 +133,16 @@ class EnvCfg:
     give_bonus_coef: float = 0.06           # ζ_give: NEW cells I bring to teammate at rendezvous
     recv_bonus_coef: float = 0.02           # ζ_recv: NEW cells I get from teammate at rendezvous
     overlap_penalty_coef: float = 0.12      # η_lap: cells we BOTH scanned independently since last comm
-    revisit_penalty_coef: float = 0.05      # γ: penalty per step on a node visited in last W steps
+    revisit_penalty_coef: float = 0.10      # γ: penalty per step on a node visited in last W steps.
+                                            # Raised 0.05→0.10 (2×): a tight 2-node ping-pong (age=2,
+                                            # graduated ≈0.75 → 0.075/step) now costs ≈1.5× a novel step,
+                                            # so cycling is clearly worse than any explored-area shuffle.
+                                            # Ceiling ~0.15; >0.2 over-corrects (punishes legit backtrack
+                                            # out of a dead-end room + the old both-agents ping-pong bug).
     revisit_window: int = 8                 # W: lookback window for revisit detection
+    # RADAR (feat[6/7]) travel-cost discount per hop beyond the ego-window horizon. Lower = more
+    # myopic (only just-beyond mass matters); higher = far mass carries further. See build_radar.
+    radar_gamma: float = 0.92
     # Stall penalty — heavy cost for standing still (no net displacement this step). Catches
     # collision-revert holds AND invalid/curr-node picks. Pressures agents to reroute /
     # separate instead of deadlocking. δ_stall ≫ revisit so standing still is "heavily penalized".
@@ -1164,6 +1172,23 @@ class Explorer:
             self._dist_curr_prev[:, a] = bf_dist_from_curr
             info["bf_dist_from_curr"]  = bf_dist_from_curr
             info["bf_parent_from_curr"] = bf_parent_from_curr   # [N, N_max] predecessor on path from curr
+            # ---- RADAR (feat[6] b_util, feat[7] b_teammate): compress the world BEYOND the ego
+            # window onto the geodesic receptive-horizon nodes so the feed-forward policy gets a
+            # heading toward far exploration mass / teammates (anti-loop without recurrence). Uses
+            # the FREE-graph BF just computed. teammate_src = each OTHER agent's last-known node.
+            if self.M > 1:
+                others = [j for j in range(self.M) if j != a]
+                lkp = self.last_known_pos[:, a, others, :]                          # [N, M-1, 2]
+                lx = (lkp[..., 0] / float(self.graph.NR)).long().clamp(0, self.graph.LW - 1)
+                ly = (lkp[..., 1] / float(self.graph.NR)).long().clamp(0, self.graph.LH - 1)
+                teammate_src = ly * self.graph.LW + lx                              # [N, M-1]
+            else:
+                teammate_src = None
+            b_util, b_team = self.graph.build_radar(
+                info, teammate_src=teammate_src, gamma_r=float(self.cfg.radar_gamma),
+            )
+            info["node_feat"][..., 6] = b_util
+            info["node_feat"][..., 7] = b_team
             # H.3 — BF from each teammate's last-known position → info["bf_dist_team"].
             if self.M > 1:
                 self._bf_from_teammates(info, a)

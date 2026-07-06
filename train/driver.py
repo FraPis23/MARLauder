@@ -323,7 +323,11 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
 # v2 — fixed validation maps for the eval suite. Same 8 indices for every run/trial on
 # every machine → cross-trial scores are comparable ("same exam"). These become validation
 # maps: final reporting must use fresh random maps / test splits, not these.
-EVAL_MAP_IDX = (120, 1543, 2877, 4012, 5530, 7211, 8650, 9904)
+# 32 evenly-spaced map indices across the big train splits (idx up to ~9904). Enlarged from 8 →
+# eval/score sampling variance shrinks ~2× (succ resolution 1/32 vs 1/8), so best-checkpoint
+# selection and run-to-run comparison stop being dominated by map luck. _eval_map_idxs re-derives
+# evenly-spaced indices per split from len(this), so smaller splits stay in-range.
+EVAL_MAP_IDX = tuple(int(round(i * 9904 / 31)) for i in range(32))
 
 
 def _eval_map_idxs(eval_env: Explorer, k: int) -> tuple[int, ...]:
@@ -548,6 +552,12 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     # env + buffer) since stages can have different canvases.
     cur_stage = 0
     iters_on_stage = 0
+    # Best-checkpoint tracking: keep the iterate with the highest eval/score, not just the last.
+    # The eval curve is non-monotonic (PPO + high-variance dense reward) → final.pt is a random
+    # iterate that may be far below the run's actual peak. ckpt_best.pt is overwritten whenever a
+    # new eval tick beats the running max, so the run always leaves behind its best model.
+    best_eval_score = float("-inf")
+    best_eval_iter = -1
     if cfg.curriculum_gated:
         print(f"[curriculum] GATED stage 0='{cfg.curriculum_stage_splits[0]}' "
               f"gate_score={cfg.curriculum_gate_score} min_iters={cfg.curriculum_min_stage_iters}")
@@ -778,6 +788,12 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"duty={eval_stats['eval/comm_duty']:.2f}  "
                   f"succ={eval_stats['eval/success_rate']:.2f}  "
                   f"s90={eval_stats['eval/steps_to_90']:.0f}{split_str}")
+            # Best-checkpoint selection: overwrite ckpt_best.pt whenever this eval beats the peak.
+            if eval_stats["eval/score"] > best_eval_score:
+                best_eval_score = eval_stats["eval/score"]
+                best_eval_iter = it
+                _save_ckpt(cfg.out_dir, model, vnorm, cfg, it, "ckpt_best")
+                print(f"[best] new best eval/score={best_eval_score:+.3f} at it={it} → ckpt_best.pt")
             # GATED curriculum: advance to the next split when the suite score clears the gate
             # AND the current stage has had its minimum dwell (avoids advancing on a noisy early
             # spike). Advance SWAPS the training split → rebuild env + buffer (canvas/N_max may

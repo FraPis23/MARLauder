@@ -166,9 +166,13 @@ def _launch_training(params: dict) -> dict:
     return {"ok": True, "run": run, "pid": proc.pid, "cmd": " ".join(cmd)}
 
 
-def _read_log(run: str, offset: int) -> dict:
-    """Incremental tail of a run's train.log from `offset` bytes → for the live console."""
-    p = (RUNS_DIR / run / "train.log").resolve()
+_LOG_FILES = {"train.log", "eval.log", "eval_best.log"}   # whitelist for the live console
+
+
+def _read_log(run: str, offset: int, file: str = "train.log") -> dict:
+    """Incremental tail of a run's whitelisted log from `offset` bytes → for the live console."""
+    fname = file if file in _LOG_FILES else "train.log"
+    p = (RUNS_DIR / run / fname).resolve()
     if RUNS_DIR.resolve() not in p.parents or not p.exists():
         return {"data": "", "offset": offset, "exists": False}
     size = p.stat().st_size
@@ -216,6 +220,27 @@ def _eval_ckpt(run: str, ckpt: str, split: str, n_maps: int, steps: int) -> dict
     proc = subprocess.Popen(cmd, cwd=str(_REPO), stdout=logf, stderr=subprocess.STDOUT,
                             start_new_session=True, env=env)
     return {"ok": True, "pid": proc.pid, "cmd": " ".join(cmd)}
+
+
+def _eval_best(run: str, split: str, n_maps: int) -> dict:
+    """Spawn scripts/eval_best.py: score EVERY milestone/final ckpt of a run on N>=32 maps (one
+    batched rollout each), rank them, and copy the winner to <run>/ckpt_best.pt. Independent of
+    training → works on done/stopped runs. Split/steps/agents default to the run's own ckpt cfg."""
+    import subprocess
+    d = (RUNS_DIR / run).resolve()
+    if RUNS_DIR.resolve() not in d.parents or not d.is_dir():
+        return {"ok": False, "error": "invalid run"}
+    cmd = ["python", "-u", "scripts/eval_best.py", "--run", str(d),
+           "--n-maps", str(max(32, int(n_maps)))]
+    if split:
+        cmd += ["--split", str(split)]
+    logf = open(d / "eval_best.log", "ab")
+    logf.write(("\n$ " + " ".join(cmd) + "\n").encode())
+    logf.flush()
+    env = dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+    proc = subprocess.Popen(cmd, cwd=str(_REPO), stdout=logf, stderr=subprocess.STDOUT,
+                            start_new_session=True, env=env)
+    return {"ok": True, "pid": proc.pid, "cmd": " ".join(cmd), "log": "eval_best.log"}
 
 
 def _run_state(run: str) -> str | None:
@@ -392,7 +417,7 @@ class Handler(SimpleHTTPRequestHandler):
                 offset = int(qs.get("offset", 0))
             except ValueError:
                 offset = 0
-            self._send_json(_read_log(qs.get("run", ""), offset))
+            self._send_json(_read_log(qs.get("run", ""), offset, qs.get("file", "train.log")))
         elif path in ("/", "/index.html"):
             self._serve_file(VIZ_DIR / "index.html", "text/html; charset=utf-8")
         elif path.endswith("/inspector.html"):
@@ -443,6 +468,18 @@ class Handler(SimpleHTTPRequestHandler):
                 str(body.get("run", "")), str(body.get("ckpt", "")),
                 str(body.get("split", "test/hybrid")),
                 int(body.get("n_maps", 3)), int(body.get("steps", 256))))
+            return
+        if parsed.path == "/api/eval_best":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as exc:
+                self.send_error(400, f"Bad body: {exc}")
+                return
+            self._send_json(_eval_best(
+                str(body.get("run", "")),
+                str(body.get("split", "")),
+                int(body.get("n_maps", 32))))
             return
         if parsed.path != "/api/control":
             self.send_error(404, "Unknown endpoint")

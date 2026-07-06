@@ -31,7 +31,7 @@ from torch.distributions import Categorical
 from models.gat import GATEncoder
 from models.init_utils import apply_orthogonal, orthogonal_
 
-F_IN = 6
+F_IN = 8   # 0 x_rel, 1 y_rel, 2 utility, 3 age, 4 teammate, 5 guidepost, 6 radar-util, 7 radar-teammate
 K = 8
 # CTDE critic-only global state (value head, never seen by actors → no execution leak):
 #   [explored_frac, t/max_steps, geo_pair, coverage_rate, redundancy, tgt_dist, idle_frac, imbalance].
@@ -51,6 +51,12 @@ class PointerHead(nn.Module):
         self.q = nn.Linear(d, d)
         self.k = nn.Linear(d, d)
         self.d = d
+        # Learnable temperature (mirrors GAT A1). The fixed 1/sqrt(d) scaling with d=128 (sqrt≈11.3)
+        # drove q·k so small that the pointer softmax stayed near-uniform → the agent picked
+        # essentially at random among valid neighbors → wander / ping-pong loops. τ = exp(log_tau)
+        # clamped to [0.1, 10] lets the head sharpen its neighbor ranking without runaway.
+        # Init 0 → τ=1 → identity at start (back-compat: old ckpts miss this param, load fresh at 1).
+        self.log_tau = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -61,6 +67,7 @@ class PointerHead(nn.Module):
         q = self.q(query).unsqueeze(1)
         k = self.k(keys)
         scores = (q * k).sum(dim=-1) / math.sqrt(self.d)            # [B, K]
+        scores = scores * self.log_tau.exp().clamp(0.1, 10.0)       # A1-style learnable sharpening
         any_valid = mask.any(dim=-1, keepdim=True)
         mask_eff = torch.where(any_valid.expand_as(mask), mask, torch.ones_like(mask))
         # Finite large-negative (fp16-safe -1e4): keeps Categorical valid under fp16 / NaN-prone

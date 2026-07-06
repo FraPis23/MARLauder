@@ -362,8 +362,10 @@ class GraphLattice:
         li_curr = (robot_xy[:, 1] / float(self.NR)).long().clamp(0, self.LH - 1)
         curr_idx = li_curr * self.LW + lj_curr                   # [N]
 
-        # 6) Per-node features (7 dims).
-        node_feat = torch.zeros((N, self.N_max, 6), dtype=torch.float32, device=dev)
+        # 6) Per-node features (8 dims). Channels 0-5 filled here / by Explorer; 6-7 are the
+        #    RADAR boundary-summary channels (b_util, b_teammate), written by Explorer.build_radar
+        #    onto the geodesic receptive-horizon nodes (0 everywhere else). See build_radar().
+        node_feat = torch.zeros((N, self.N_max, 8), dtype=torch.float32, device=dev)
         curr_xy = self.node_xy[curr_idx]                          # [N, 2]
         # EGO-SCALE normalization. The GAT only ever sees the (2·n_hops+3)² window centered on
         # curr, so the relative coords of in-window nodes span at most ±window_radius·NR px.
@@ -384,6 +386,8 @@ class GraphLattice:
         node_feat[..., 3] = age
         # feat[4] teammate BF-proximity potential (M>1, written by Explorer)
         # feat[5] guidepost (filled by build_guidepost if called)
+        # feat[6] b_util  — RADAR: geodesically-routed out-of-window utility mass (Explorer)
+        # feat[7] b_teammate — RADAR: geodesically-routed out-of-window teammate direction (Explorer)
         node_feat = node_feat * node_valid.unsqueeze(-1).float()
 
         # 7) curr_nbr gather.
@@ -634,6 +638,77 @@ class GraphLattice:
                     break
 
         return dist, parent
+
+    @torch.no_grad()
+    def build_radar(
+        self,
+        info: dict[str, torch.Tensor],
+        teammate_src: torch.Tensor | None = None,   # [N, T] long: teammate last-known node idxs (-1 = none)
+        gamma_r: float = 0.92,
+        util_norm: float = 8.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """RADAR boundary summary: compress the KNOWN world BEYOND the ego window onto the
+        geodesic receptive-horizon nodes, so a feed-forward (no-recurrence) policy still gets a
+        direction toward far exploration mass / teammates.
+
+        Reuses the FREE-graph BF from curr already in info (bf_dist_from_curr / bf_parent_from_curr):
+          - horizon = nodes within D_h = n_hops·NR px of curr (⇒ ≤ n_hops graph hops even along an
+            all-axial path, so inside the neighbours' n_layers-hop receptive field);
+          - a node BEYOND the horizon routes its mass DOWN its parent chain to the first node
+            at/inside the horizon (its traversable GATEWAY) — obstacle-aware, the path bends around
+            walls; never a straight-line projection through a wall;
+          - weight = gamma_r ** (hops beyond horizon) — a travel-cost discount, so nearer-beyond
+            mass dominates. Normalised by a FIXED constant (stationary — no per-env max).
+
+        Returns (b_util, b_teammate), each [N, N_max], nonzero only on horizon gateway nodes.
+        """
+        dev = info["node_feat"].device
+        N = info["node_feat"].shape[0]
+        dist = info["bf_dist_from_curr"]                  # [N, N_max] px cost, +inf if unreachable
+        parent = info["bf_parent_from_curr"]              # [N, N_max] predecessor toward curr (-1 root/none)
+        utility = info["utility"]                         # [N, N_max] ∈ [0, 1]
+        node_valid = info["node_valid"]
+        NR = float(self.NR)
+        D_h = float(self.n_hops) * NR                     # receptive horizon radius in px
+        gamma = torch.as_tensor(float(gamma_r), device=dev)
+
+        reachable = torch.isfinite(dist) & node_valid
+        beyond = reachable & (dist > D_h)                 # [N, N_max]
+
+        # Gateway: walk parent pointers until dist ≤ D_h (or the chain roots at -1). Pointer-follow;
+        # `need.any()` early-exits at ≈graph-diameter iterations (checked every 8, like the BF), NOT
+        # the N_max cap. Nodes already inside the horizon map to themselves (their mass is 0 anyway).
+        g = torch.arange(self.N_max, device=dev).unsqueeze(0).expand(N, -1).clone()   # [N, N_max]
+        for it in range(self.guidepost_iters):
+            dist_g = torch.gather(dist, 1, g)
+            par_g = torch.gather(parent, 1, g)
+            need = (dist_g > D_h) & (par_g >= 0)
+            g = torch.where(need, par_g.clamp(min=0), g)
+            if it % 8 == 0 and not bool(need.any().item()):
+                break
+
+        # Travel-cost discount over the hops BEYOND the horizon (px excess / NR ≈ graph hops).
+        excess_hops = (dist - D_h).clamp(min=0.0) / NR
+        w = torch.pow(gamma, excess_hops)                                             # [N, N_max]
+
+        b_util = torch.zeros((N, self.N_max), device=dev)
+        src_w = torch.where(beyond, utility * w, torch.zeros_like(utility))           # only beyond mass
+        b_util.scatter_add_(1, g, src_w)
+        b_util = (b_util / float(util_norm)).clamp(0.0, 1.0)
+
+        b_team = torch.zeros((N, self.N_max), device=dev)
+        if teammate_src is not None and teammate_src.numel() > 0:
+            T = teammate_src.shape[1]
+            for t in range(T):
+                src = teammate_src[:, t]                                              # [N], -1 = none
+                src_safe = src.clamp(min=0)
+                d_src = torch.gather(dist, 1, src_safe.unsqueeze(1)).squeeze(1)       # [N]
+                g_src = torch.gather(g, 1, src_safe.unsqueeze(1)).squeeze(1)          # [N] gateway
+                w_src = torch.pow(gamma, (d_src - D_h).clamp(min=0.0) / NR)
+                use = (src >= 0) & torch.isfinite(d_src) & (d_src > D_h)              # only beyond-horizon teammates
+                b_team.scatter_add_(1, g_src.unsqueeze(1), (use.float() * w_src).unsqueeze(1))
+        b_team = b_team.clamp(0.0, 1.0)
+        return b_util, b_team
 
     @torch.no_grad()
     def analytic_next_hop(

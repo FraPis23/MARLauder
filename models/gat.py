@@ -34,9 +34,14 @@ from models.init_utils import apply_orthogonal
 
 
 # Default per-head raw-feature groups (feat order: 0 x_rel, 1 y_rel, 2 utility, 3 age,
-# 4 teammate_pot, 5 guidepost). Head 0→geometry, 1→utility, 2→teammate, rest free.
+# 4 teammate_pot, 5 guidepost). Head 0→geometry, 1→utility, 2→teammate, 3→guidepost, rest free.
+# Head 3 gets a DEDICATED structural bias on feat[5] (the analytic guidepost ribbon): it's the only
+# anti-loop / beyond-window steering signal and was previously routed ONLY through the gradient-starved
+# input_proj + generic q/k path (no head read it directly) → weakest pathway of any feature. Giving it
+# its own A2 head injects the route directly, so an agent that runs out of local utility follows the
+# guidepost instead of stalling in a loop.
 def default_head_feat_groups(n_heads: int, feat_dim: int) -> list[list[int]]:
-    base = [[0, 1], [2], [4]]
+    base = [[0, 1], [2], [4], [5]]
     groups: list[list[int]] = []
     for h in range(n_heads):
         g = base[h] if h < len(base) else []

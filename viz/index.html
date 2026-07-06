@@ -399,6 +399,7 @@ function card(r, isCurrent) {
       ${r.has_log ? `<button class="btn btn-log" data-run="${encodeURIComponent(r.name)}">Show log</button>` : ''}
       ${r.has_params ? `<button class="btn btn-params" data-run="${encodeURIComponent(r.name)}">Params</button>` : ''}
       ${r.has_ckpts ? `<button class="btn btn-evalck" data-run="${encodeURIComponent(r.name)}">Evaluate checkpoint</button>` : ''}
+      ${r.has_ckpts ? `<button class="btn btn-evalbest" data-run="${encodeURIComponent(r.name)}" title="Score every ckpt on 32 maps → save the best as ckpt_best.pt">Find best ckpt</button>` : ''}
       ${r.state === 'training' ? `<button class="btn btn-stop" data-run="${encodeURIComponent(r.name)}">Stop &amp; save</button>` : ''}
     </div>
     ${r.has_ckpts ? `<div class="control evalck" data-run="${encodeURIComponent(r.name)}" style="display:none">
@@ -429,8 +430,9 @@ const LOG_POLLERS = {};   // run → interval id
 
 async function pollLog(run, pre) {
   const offset = parseInt(pre.dataset.offset || '0');
+  const file = pre.dataset.file || 'train.log';
   try {
-    const j = await fetch(`/api/log?run=${run}&offset=${offset}`).then(r => r.json());
+    const j = await fetch(`/api/log?run=${run}&offset=${offset}&file=${file}`).then(r => r.json());
     if (j.data) {
       const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
       pre.textContent += j.data;
@@ -550,7 +552,14 @@ function onRootClick(e) {
   if (e.target.classList.contains('btn-log')) {
     const run = e.target.dataset.run;
     const pre = e.target.closest('.card').querySelector(`.console[data-run="${run}"]`);
-    if (pre) { toggleLog(run, pre); e.target.textContent = pre.classList.contains('open') ? 'Hide log' : 'Show log'; }
+    if (pre) {
+      if (pre.dataset.file && pre.dataset.file !== 'train.log') {  // was tailing eval_best.log
+        if (pre.classList.contains('open')) toggleLog(run, pre);   // close stale tail first
+        pre.dataset.file = 'train.log';
+      }
+      toggleLog(run, pre);
+      e.target.textContent = pre.classList.contains('open') ? 'Hide log' : 'Show log';
+    }
     return;
   }
   if (e.target.classList.contains('btn-params')) {
@@ -592,6 +601,26 @@ function onRootClick(e) {
       .then(r => r.json())
       .then(j => { msg.textContent = j.ok ? `eval running (pid ${j.pid}); inspector unlocks when done` : ('error: ' + (j.error || '')); msg.className = 'ctl-msg ' + (j.ok ? 'ok' : 'err'); })
       .catch(err => { msg.textContent = 'error: ' + err.message; msg.className = 'ctl-msg err'; });
+    return;
+  }
+  if (e.target.classList.contains('btn-evalbest')) {
+    const run = e.target.dataset.run, btn = e.target;
+    const pre = btn.closest('.card').querySelector(`.console[data-run="${run}"]`);
+    btn.disabled = true; btn.textContent = 'ranking ckpts…';
+    fetch('/api/eval_best', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify({ run, n_maps: 32 }) })
+      .then(r => r.json())
+      .then(j => {
+        btn.disabled = false; btn.textContent = 'Find best ckpt';
+        if (!j.ok) { alert('error: ' + (j.error || 'launch failed')); return; }
+        // Tail eval_best.log in the card console so the ranking table streams live.
+        if (pre) {
+          pre.dataset.file = 'eval_best.log';
+          if (!pre.classList.contains('open')) toggleLog(run, pre);
+          else { pre.textContent = ''; pre.dataset.offset = '0'; }
+        }
+      })
+      .catch(err => { btn.disabled = false; btn.textContent = 'Find best ckpt'; alert('error: ' + err.message); });
     return;
   }
   if (e.target.classList.contains('name-text') && !e.target.classList.contains('locked')) {

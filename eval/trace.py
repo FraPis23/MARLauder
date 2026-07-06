@@ -83,7 +83,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
 
     # Node input-feature names (for the selected-node panel; these are raw obs values, not any
     # attribution). Order matches node_feat channels 0..5.
-    F_NAMES = ["x_rel", "y_rel", "utility", "age", "teammate_pot", "guidepost"]
+    F_NAMES = ["x_rel", "y_rel", "utility", "age", "teammate_pot", "guidepost",
+               "radar_util", "radar_teammate"]
 
     M = n_agents
     tdir = Path(out_root) / "traces" / tag
@@ -190,6 +191,9 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "util": _r(nf[a, n, 2], 4), "age": _r(nf[a, n, 3], 3),
                 "team": _r(nf[a, n, 4], 3), "gp": _r(nf[a, n, 5], 1),
                 "bf": _r(gd[a, n] / nr, 2),
+                # RADAR boundary-summary channels (nonzero only on geodesic horizon nodes):
+                # bu = out-of-window utility mass, bt = out-of-window teammate direction.
+                "bu": _r(nf[a, n, 6], 3), "bt": _r(nf[a, n, 7], 3),
                 # utility seed components: boundary-pixel ribbon × revealable volume.
                 "ub": _r(ub[a, n], 3), "uv": _r(uv[a, n], 3),
             } for n in vidx.tolist()]
