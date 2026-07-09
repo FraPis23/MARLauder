@@ -20,7 +20,7 @@ step(action[N, M]):
     1. Move agents (linear interp + collision clamp).
     2. LiDAR scan (per-agent).
     3. Communication check + map fusion + last_known_pos update.
-    4. Graph rebuild per agent + guidepost.
+    4. Graph rebuild per agent + radar boundary summary.
     5. Team reward = Δ(union of FREE across M agents) / total_free.
 
 reset(indices): reload map, reset all per-agent state.
@@ -53,29 +53,8 @@ class EnvCfg:
     n_rays: int = 720
     utility_range_px: int = 30
     visit_age_window: int = 16               # feat[3] recency horizon (steps): walked node ramps 0→1 freshness
-    # Analytic global-target selection (deterministic). score = util/(1+β·d_curr/NR)·(1+λ·w·rdv).
-    target_beta: float = 1.0                 # β: distance discount (per NR node-unit)
-    target_lambda: float = 1.0               # λ: rendezvous pull strength (0 = pure exploration)
-    rdv_offer_frac: float = 0.15             # offer saturates (w→1) at this fraction of map cells gained since sync
-    target_keep_margin: float = 0.2          # commit: keep last target unless a new one beats it by >this fraction
-    # Separation / ownership term (analytic target): down-weight frontiers a teammate is closer to,
-    # so agents spread to different regions (division of labor). own_gate = σ(k·(adv−m)), adv =
-    # (d_team_min − d_curr)/NR in hops; sep_mult = 1 − w·(1−own_gate). w=0 → off (today's behavior).
-    target_sep_weight: float = 0.5           # strength ∈[0,1]; 0 disables
-    target_sep_from_offer: bool = False      # if True: sep_w = (1−w_offer) per-env (separate when I have
-                                             # nothing fresh to give; converge when I do). Overrides the
-                                             # fixed target_sep_weight scalar. M>1 only.
-    target_sep_k: float = 2.0                # sigmoid sharpness (per hop)
-    target_sep_margin: float = 0.0           # hops a teammate must be closer before I yield
-    analytic_target: bool = True             # env owns the deterministic global target (always True since the StrategicHead was removed; kept as a guard for the bookkeeping branches)
-    # Which env-owned target rule to use when analytic_target=True:
-    #   "analytic" — nearest-richest frontier scored by util/(1+β·d)·rendezvous·separation (default).
-    #   "nearest"  — the closest reachable frontier by BF path distance (greedy-nearest, no scoring,
-    #                no rendezvous/separation). The guidepost just points at the nearest unexplored
-    #                boundary. Ignored when analytic_target=False (learned StrategicHead).
-    target_kind: str = "analytic"
-    # Bellman-Ford caps for the guidepost / BF distance fields (0 = auto from canvas size). Raise
-    # guidepost_iters if a very long maze geodesic still truncates (auto = N_max already covers it).
+    # Bellman-Ford iteration caps for the from-curr BF distance field (feeds the radar channels) and
+    # its path buffer (0 = auto from canvas size; auto = N_max already covers any maze geodesic).
     guidepost_iters: int = 0
     guidepost_path_max: int = 0
     num_sim_steps: int = 5
@@ -113,8 +92,6 @@ class EnvCfg:
     step_penalty_coef: float = 0.015   # axial-step cost in reward units (diagonal = ·√2)
     completion_bonus: float = 10.0     # reward given at the terminal step when explored >= threshold
     n_hops: int = 6                     # ego-centric encoder window radius (window_side = 2·n_hops + 3); GAT n_layers tied to this
-    # Phase D — per-agent reward shaping (lattice-level set ops, baselined at last comm).
-    scan_reward_weight: float = 1.0         # α_scan: cells I LiDAR-scanned this step
     # v2 reward — privileged novel-scan credit (IR2-style r_f): pay only cells the agent
     # scanned that are NEW to the TEAM UNION map. Follower scanning a leader's wake earns 0
     # → removes the chase/free-ride incentive at the source. Training-only privileged signal
@@ -124,15 +101,15 @@ class EnvCfg:
     # Dense-term normalization: ~one sensor disk worth of lattice nodes per productive step.
     # The old /N_max (≈1200) crushed dense terms to O(0.001) vs completion bonus 10.
     scan_norm_nodes: float = 50.0
-    team_reward_weight: float = 0.0         # β: REMOVED from reward (double-counted novel cells already
-    #                                         paid via novel_scan → reintroduced free-ride). Kept as
-    #                                         a dead knob for back-compat; not summed into the reward.
-    # ζ_give/ζ_recv/η_lap are now in scan_norm units (set-op normalized by scan_norm, not N_max) →
-    # rescaled ~24× down from the old /N_max defaults (1.5/0.5/3.0) to preserve the train/easy
-    # magnitude, now map-size independent.
-    give_bonus_coef: float = 0.06           # ζ_give: NEW cells I bring to teammate at rendezvous
-    recv_bonus_coef: float = 0.02           # ζ_recv: NEW cells I get from teammate at rendezvous
-    overlap_penalty_coef: float = 0.12      # η_lap: cells we BOTH scanned independently since last comm
+    # ---- Dense RENDEZVOUS term (IR2 r_s spirit). Rewards NET geodesic approach toward the teammate
+    # I owe fresh map, gated by that surplus ∆M. NO separation term (privileged novel_scan already
+    # zeroes redundant co-scanning → agents spread without a proximity penalty → no "fear the only
+    # path"). Telescoping toward the teammate's FIXED last-known pos between comms: oscillation
+    # cancels, and at comm ∆M→0 kills the gate so the lkp-jump is never paid → no flip/hover farming.
+    rdv_dense_weight: float = 0.10          # w: strength of g·(φ_prev−φ_now). 0 disables. M>1 only.
+    rdv_offer_frac: float = 0.15            # gate saturates (g→1) when the map gained since last sync
+    #                                         reaches this fraction of the OWN map size AT that sync
+    #                                         (relative growth, floored by scan_norm_nodes). Also the ∆M obs norm.
     revisit_penalty_coef: float = 0.10      # γ: penalty per step on a node visited in last W steps.
                                             # Raised 0.05→0.10 (2×): a tight 2-node ping-pong (age=2,
                                             # graduated ≈0.75 → 0.075/step) now costs ≈1.5× a novel step,
@@ -140,23 +117,20 @@ class EnvCfg:
                                             # Ceiling ~0.15; >0.2 over-corrects (punishes legit backtrack
                                             # out of a dead-end room + the old both-agents ping-pong bug).
     revisit_window: int = 8                 # W: lookback window for revisit detection
-    # RADAR (feat[6/7]) travel-cost discount per hop beyond the ego-window horizon. Lower = more
+    # RADAR (feat[5/6]) travel-cost discount per hop beyond the ego-window horizon. Lower = more
     # myopic (only just-beyond mass matters); higher = far mass carries further. See build_radar.
+    # Stall diagnosis 2026-07-09 (traces m240/m160): at 0.92 a frontier 45 hops beyond the horizon
+    # contributes 0.92^45/8 ≈ 0.4%/node — mute → agents stall next to geodesic-far frontiers.
+    # 0.97 + norm 3 lifts the same node to ~8%. Defaults stay at the OLD values for ckpt
+    # back-compat (from_ckpt_dict fills absent keys from here); new runs pass the CLI flags.
     radar_gamma: float = 0.92
-    # Ablation: zero the guidepost channel (node_feat[5]) so the policy sees no analytic route —
-    # tests whether the radar out-of-window channels subsume the guidepost.
-    disable_guidepost: bool = False
+    # RADAR b_util normalization divisor (build_radar util_norm). Lower = less squashing → far
+    # frontier mass survives; b_util still clamped to [0,1].
+    radar_util_norm: float = 8.0
     # Stall penalty — heavy cost for standing still (no net displacement this step). Catches
     # collision-revert holds AND invalid/curr-node picks. Pressures agents to reroute /
     # separate instead of deadlocking. δ_stall ≫ revisit so standing still is "heavily penalized".
     stall_penalty_coef: float = 0.1         # δ_stall
-    # G.4.b — per-step proximity penalty when teammate is too close (anti-chase).
-    # ELIMINATED (default 0.0): this raw-distance reflex was the limit-cycle driver — it
-    # over-corrected into ping-pong and punished BOTH agents converging on the last frontier
-    # (deadlock). novel_scan already pays 0 for scanning team-known cells, so the anti-chase
-    # incentive is present without it. Kept as a flag for ablation.
-    proximity_penalty_coef: float = 0.0     # ε_prox: reward subtracted per step when close
-    proximity_penalty_radius_px: float = -1.0   # <=0 = sensor_range_px
     # A2 — bypass distance / LOS check in comm: every step every agent communicates.
     force_full_comm: bool = False
     # Debug — persistent teammate-position awareness (positions only, not maps).
@@ -242,13 +216,6 @@ class Explorer:
         self.curr_idx_global = torch.zeros((self.N, self.M),           dtype=torch.long,    device=self.dev)
         # last known position: agent i's knowledge of agent j's position
         self.last_known_pos = torch.zeros((self.N, self.M, self.M, 2), dtype=torch.float32, device=self.dev)
-        # B1-redo: per-agent guidepost cache for warm-start BF from target.
-        # _target_prev[N, M]: previous step's target node per agent. -1 = no cache.
-        # _dist_prev[N, M, N_max]: previous step's BF dist (rooted at target). +inf = cold.
-        self._target_prev = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
-        self._dist_prev   = torch.full(
-            (self.N, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
-        )
         # Step of last comm event between agents a and j (per env). Used by Phase A v2
         # strategic head as the cand_max_comm_gap feature (uncertainty over teammate pos).
         # Reset to t=0 at episode start (since _reset_envs writes actual start positions
@@ -260,21 +227,6 @@ class Explorer:
         # key wins (advances); higher key yields (holds). Re-drawn each reset → no systematic
         # role bias. Decentralized: derivable from a shared per-episode seed at deploy.
         self._collision_key = torch.rand((self.N, self.M), device=self.dev)
-        # Objective second-guessing — previous step's strategic target (global node idx).
-        # -1 = none yet (episode start). Reset on episode done. Tracks the committed analytic
-        # target node per agent (drives the progress-reward telescoping + commitment bookkeeping).
-        self._prev_target_node = torch.full((self.N, self.M), -1, dtype=torch.long, device=self.dev)
-        # Consecutive steps the SAME analytic target node has been committed. Reset to 0 when the
-        # committed node changes; reset to 0 on episode done.
-        self._steps_on_option = torch.zeros((self.N, self.M), dtype=torch.long, device=self.dev)
-        # Phase 1b — True for an agent on the step a map fusion delivered it NEW cells. The
-        # strategic target is already correct after fusion (re-scored on the fused map); the
-        # observed failure is TACTICAL — stale GRU navigation momentum carries the agent into
-        # the teammate's just-received (now-explored) region instead of following its target.
-        # This flag marks "world changed, re-plan from here"; wiring (GRU-hidden refresh vs
-        # path-bias boost vs obs feature) is decided AFTER instrumentation. Gated on cells
-        # ACTUALLY received (not mere comm range) so already-synced neighbors don't trigger.
-        self._comm_event = torch.zeros((self.N, self.M), dtype=torch.bool, device=self.dev)
         # Signal-strength comm: per-episode shadowing noise (X_g free, K obstacle), [N] on GPU.
         # Resampled at every env reset (domain randomization à la IR2). Allocated here, filled below.
         self._ss_xg = torch.zeros(self.N, dtype=torch.float32, device=self.dev)
@@ -293,6 +245,12 @@ class Explorer:
         self._dist_team_prev = torch.full(
             (self.N, self.M, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
         )
+        # Static teammate table: _others_idx[a] = the M-1 indices j != a. Drives the batched
+        # Pass-1 radar teammate_src + teammate BF (agents folded into the batch dim).
+        self._others_idx = torch.tensor(
+            [[j for j in range(self.M) if j != a] for a in range(self.M)],
+            dtype=torch.long, device=self.dev,
+        ).view(self.M, max(0, self.M - 1))
         # Rendezvous: agent i's explored-cell count at its last sync with agent j. offer_ij =
         # (i's explored now − this) = fresh map i holds that j hasn't received. Updated comm-gated.
         self._own_expl_at_comm = torch.zeros((self.N, self.M, self.M), dtype=torch.float32, device=self.dev)
@@ -309,11 +267,11 @@ class Explorer:
         # critic_global build; init here so reset()'s first _refresh_obs reads valid tensors.
         self._prev_expl_frac = torch.zeros((self.N,), dtype=torch.float32, device=self.dev)
         self._idle_now = torch.zeros((self.N, self.M), dtype=torch.bool, device=self.dev)
-        # Per-pair last-meeting node-level FREE mask (union snapshot at last comm event).
-        # [N, M, M, N_max] bool ≈ 154 KB at default (N=32, M=2, N_max≈1200).
-        self.last_meeting_node_mask = torch.zeros(
-            (self.N, self.M, self.M, self.N_max), dtype=torch.bool, device=self.dev,
-        )
+        # Rendezvous term: previous step's φ (geodesic curr→owed-teammate /diam) per agent, for the
+        # telescoping reward. +inf = cold (first post-reset step → that step's rdv masked to 0).
+        self._rdv_phi_prev = torch.full((self.N, self.M), float("inf"), dtype=torch.float32, device=self.dev)
+        self._rdv_gate = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        self._geo_curr_team = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         # Precompute lattice→pixel flat index for fast node-level FREE extraction.
         nx = self.graph.node_xy[:, 0].long().clamp(0, self.W - 1)
         ny = self.graph.node_xy[:, 1].long().clamp(0, self.H - 1)
@@ -376,11 +334,6 @@ class Explorer:
         occ_post_flat = self.world.occupancy_torch.view(self.N, self.M, -1)
         free_node_post = occ_post_flat[:, :, self._node_flat_idx] == _FREE                # [N, M, N_max]
 
-        # Phase 1b — map-exchange event: a node became FREE for agent i via FUSION (not its own
-        # scan) this step → it received teammate map data. Marks "world changed, re-plan from here"
-        # for the strategic/tactical re-planning signal (wiring decided after instrumentation).
-        self._comm_event = (free_node_post & ~free_node_pre).any(dim=-1)                  # [N, M]
-
         # team_delta (pixel-level, for completion check + cooperative term).
         union_free = (self.world.occupancy_torch == _FREE).any(dim=1).view(self.N, -1).float().sum(-1)
         explored_rate = (union_free / self.free_total.clamp(min=1.0)).clamp(0, 1)
@@ -418,11 +371,6 @@ class Explorer:
         self.union_node_mask = union_now
         self.own_node_mask_prev = free_node_post
 
-        # Per-pair contribution / reception / overlap, baselined at last meeting.
-        give_bonus, recv_bonus, overlap_pen = self._setop_rewards(
-            comm_mask, free_node_pre, free_node_post,
-        )
-
         # revisit_pen: chosen node revisited within last W steps by same agent.
         # Graduated by recency: penalty = (W − age)/W ∈ (0, 1] so tighter loops hurt more.
         W_rev = max(1, int(self.cfg.revisit_window))
@@ -431,9 +379,6 @@ class Explorer:
         age = (t_now_per_m - prev_visit_for_chosen).clamp(min=0)                            # [N, M]
         is_recent_revisit = (prev_visit_for_chosen >= 0) & (age < W_rev)
         revisit_pen = is_recent_revisit.float() * ((W_rev - age).clamp(min=0).float() / W_rev)
-
-        # G.4.b — per-step proximity penalty (anti-chase) when a visible teammate is too close.
-        proximity_pen = self._proximity_penalty(comm_mask)
 
         # Stall penalty — no net displacement this step (collision-revert hold or
         # invalid/curr-node pick). step_disp also feeds the coverage-efficiency metric.
@@ -462,43 +407,30 @@ class Explorer:
         ).squeeze(-1)                                                                 # [N, M] bool
         step_penalty = step_cost * (move_len / NR) * chosen_valid_sp.float()         # [N, M]
         a_novel = self.cfg.novel_scan_weight
-        z_give  = self.cfg.give_bonus_coef
-        z_recv  = self.cfg.recv_bonus_coef
-        eta_lap = self.cfg.overlap_penalty_coef
         gamma   = self.cfg.revisit_penalty_coef
-        eps_prox = self.cfg.proximity_penalty_coef
         delta_stall = self.cfg.stall_penalty_coef
         reward = (a_novel * novel_scan
-                  + z_give * give_bonus
-                  + z_recv * recv_bonus
-                  - eta_lap * overlap_pen
                   - gamma   * revisit_pen
-                  - eps_prox * proximity_pen
                   - delta_stall * stall_pen
                   + terminated_now.float().unsqueeze(-1) * self.cfg.completion_bonus
                   - step_penalty)
+        # NOTE: the dense RENDEZVOUS term (rdv_dense) is added AFTER _refresh_obs below, because it
+        # needs the fresh geodesic-to-teammate field + surplus gate that _refresh_obs computes.
 
         # ---- Telemetry: per-step means of each reward COMPONENT (signed contribution) ----
-        # For W&B + tuning. Means over [N, M]. Cheap; detached scalars.
+        # For W&B + tuning. Means over [N, M]. Cheap; detached scalars. (rdv added post-refresh.)
         reward_terms = {
             "novel":         (a_novel * novel_scan).mean(),
             "scan_self_diag": scan_self_delta.mean(),     # diagnostic only, not in reward
-            "give":          (z_give * give_bonus).mean(),
-            "recv":          (z_recv * recv_bonus).mean(),
-            "overlap":       (-eta_lap * overlap_pen).mean(),
             "revisit":       (-gamma * revisit_pen).mean(),
-            "proximity":     (-eps_prox * proximity_pen).mean(),
             "stall":         (-delta_stall * stall_pen).mean(),
             "step":          (-step_penalty).mean(),
         }
         # Per-agent signed reward components [N, M] for the step-through inspector (eval/trace only).
         if self.store_render_global:
             self._dbg_reward = {
-                "total":         reward.detach(),
+                "total":         reward.detach(),   # rdv folded in after _refresh_obs
                 "novel":         (a_novel * novel_scan).detach(),
-                "give":          (z_give * give_bonus).detach(),
-                "recv":          (z_recv * recv_bonus).detach(),
-                "overlap":       (-eta_lap * overlap_pen).detach(),
                 "revisit":       (-gamma * revisit_pen).detach(),
                 "stall":         (-delta_stall * stall_pen).detach(),
             }
@@ -510,6 +442,25 @@ class Explorer:
         )
 
         self._refresh_obs(comm_mask)
+
+        # ---- Dense RENDEZVOUS reward (needs the post-refresh geodesic-to-teammate + surplus gate).
+        # rdv = w · g · (φ_prev − φ_now): reward NET geodesic approach toward the owed teammate,
+        # gated by surplus g. φ_prev held from the previous step (per env/agent); +inf on the first
+        # post-reset step → masked to 0. Telescoping toward the FIXED lkp between comms → oscillation
+        # cancels; at comm g→0 kills the lkp-jump credit → farm-safe.
+        rdv_w = float(self.cfg.rdv_dense_weight)
+        if self.M > 1 and rdv_w > 0.0:
+            phi_now = self._geo_curr_team                                    # [N, M] ∈[0,1]
+            valid_prev = torch.isfinite(self._rdv_phi_prev)                  # [N, M]
+            delta_phi = torch.where(valid_prev, self._rdv_phi_prev - phi_now,
+                                    torch.zeros_like(phi_now))
+            rdv_dense = rdv_w * self._rdv_gate * delta_phi                   # [N, M]
+            reward = reward + rdv_dense
+            self._rdv_phi_prev = phi_now
+            reward_terms["rdv"] = rdv_dense.mean()
+            if self.store_render_global and self._dbg_reward is not None:
+                self._dbg_reward["rdv"] = rdv_dense.detach()
+                self._dbg_reward["total"] = reward.detach()
 
         truncated  = self.t >= self.cfg.max_episode_steps
         terminated = explored_rate >= self.cfg.done_explored_thresh
@@ -603,73 +554,6 @@ class Explorer:
             self.pos = sub_pos
             self.world.set_positions(self.pos)
             self.world.scan()
-
-    def _setop_rewards(
-        self, comm_mask: torch.Tensor, free_node_pre: torch.Tensor, free_node_post: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-pair rendezvous set-op terms, baselined at last meeting. Returns
-        (give_bonus, recv_bonus, overlap_pen), each [N, M]. Updates last_meeting_node_mask
-        for pairs that communicated this step (post-fusion union becomes the new baseline)."""
-        N_max = self.N_max
-        # Normalize by scan_norm (≈ one sensor-disk of nodes), SAME unit as novel_scan/team —
-        # so give/recv/overlap are comparable to the per-step terms AND map-size INDEPENDENT.
-        # (Was /N_max → ~24× smaller on train/easy AND scaling with map size; the coefs were
-        # silently compensating. Coefs were re-scaled accordingly in EnvCfg.)
-        denom = float(max(1.0, self.cfg.scan_norm_nodes))
-        give_bonus  = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
-        recv_bonus  = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
-        overlap_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
-        if self.M > 1:
-            for i in range(self.M):
-                for j in range(self.M):
-                    if i == j:
-                        continue
-                    comm_ij = comm_mask[:, i, j]                                           # [N]
-                    if not comm_ij.any():
-                        continue
-                    baseline = self.last_meeting_node_mask[:, i, j]                        # [N, N_max]
-                    M_i = free_node_pre[:, i]
-                    M_j = free_node_pre[:, j]
-                    my_new = M_i & ~baseline                                               # cells I scanned since
-                    j_new  = M_j & ~baseline
-                    contribution_to_j = (my_new & ~M_j).float().sum(-1)                    # NEW I bring
-                    reception_from_j  = (j_new  & ~M_i).float().sum(-1)                    # NEW j brings
-                    new_overlap_ij    = (my_new & j_new).float().sum(-1)                   # both scanned same
-                    comm_f = comm_ij.float()
-                    give_bonus[:, i]  = give_bonus[:, i]  + (contribution_to_j / denom) * comm_f
-                    recv_bonus[:, i]  = recv_bonus[:, i]  + (reception_from_j  / denom) * comm_f
-                    overlap_pen[:, i] = overlap_pen[:, i] + (new_overlap_ij    / denom) * comm_f
-
-            # Update last_meeting_node_mask for pairs that just communicated.
-            # Post-fusion union is the new baseline. After max-magnitude fusion both agents
-            # have same map → use free_node_post[:, i] as canonical union snapshot.
-            for i in range(self.M):
-                for j in range(self.M):
-                    if i == j:
-                        continue
-                    mask_ij = comm_mask[:, i, j].view(self.N, 1).expand(self.N, N_max)
-                    self.last_meeting_node_mask[:, i, j] = torch.where(
-                        mask_ij, free_node_post[:, i], self.last_meeting_node_mask[:, i, j]
-                    )
-        return give_bonus, recv_bonus, overlap_pen
-
-    def _proximity_penalty(self, comm_mask: torch.Tensor) -> torch.Tensor:
-        """G.4.b — per-step proximity penalty [N, M] when a VISIBLE teammate is within
-        sensor_range (anti-chase). Gated by comm_mask → only counts in-comm teammates.
-        Decentralized. Zero unless proximity_penalty_coef > 0."""
-        proximity_pen = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
-        if self.M > 1 and self.cfg.proximity_penalty_coef > 0:
-            prox_r = self.cfg.proximity_penalty_radius_px
-            if prox_r <= 0:
-                prox_r = self.cfg.sensor_range_px
-            for i in range(self.M):
-                for j in range(self.M):
-                    if i == j:
-                        continue
-                    d = (self.pos[:, i] - self.pos[:, j]).norm(dim=-1)              # [N]
-                    too_close = (d < prox_r).float() * comm_mask[:, i, j].float()    # [N]
-                    proximity_pen[:, i] = proximity_pen[:, i] + too_close
-        return proximity_pen
 
     def _compute_metrics(
         self, free_node_pre, comm_mask, team_delta, step_disp,
@@ -954,9 +838,8 @@ class Explorer:
     def reload_map(self, env_idx: int, map_idx: int) -> None:
         """G.1 — load specific map into env slot `env_idx` and do a FULL reset.
 
-        Used by eval scripts so all stale state (BF cache, comm timers, reward baselines,
-        last_meeting_node_mask, etc.) is cleared. Previously eval scripts only reset a
-        subset → corrupted BF warm-start + strategic features.
+        Used by eval scripts so all stale state (BF cache, comm timers, rendezvous φ cache,
+        etc.) is cleared. Previously eval scripts only reset a subset → corrupted BF warm-start.
         """
         gt_new, starts_new, fc_new = sample_batch(
             self.split, 1, indices=np.array([map_idx]),
@@ -976,16 +859,12 @@ class Explorer:
         self.starts[idx_t]                            = starts_new
         self.visited_step[idx_t]                      = -1
         self.t[idx_t]                                 = 0
-        self._target_prev[idx_t]                      = -1
-        self._dist_prev[idx_t]                        = float("inf")
         self._curr_prev[idx_t]                        = -1
         self._dist_curr_prev[idx_t]                   = float("inf")
         self.t_last_comm[idx_t]                       = 0
+        self._own_expl_at_comm[idx_t]                 = 0.0   # baseline reset → first comm re-snaps it
         self.last_action[idx_t]                       = -1
         self._collision_key[idx_t]                    = torch.rand((1, self.M), device=self.dev)
-        self._prev_target_node[idx_t]                 = -1
-        self._steps_on_option[idx_t]                  = 0
-        self._comm_event[idx_t]                       = False
         self._resample_ss_noise(idx_t)
         # Place agents using new map's start.
         row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
@@ -1004,9 +883,7 @@ class Explorer:
         self.own_node_mask_prev[idx_t] = free_node
         self.union_node_mask[idx_t]    = free_node.any(dim=1)
         self.novel_cells_ep[idx_t]     = 0.0
-        union_node = free_node.any(dim=1, keepdim=False)
-        self.last_meeting_node_mask[idx_t] = union_node.view(1, 1, 1, self.N_max).expand(
-            -1, self.M, self.M, -1).contiguous()
+        self._rdv_phi_prev[idx_t]      = float("inf")
         self._refresh_obs()
 
     def _reset_envs(self, idx: list[int]) -> None:
@@ -1026,9 +903,6 @@ class Explorer:
         self.starts[idx_t]                            = starts_new
         self.visited_step[idx_t]                      = -1
         self.t[idx_t]                                 = 0
-        # Reset guidepost cache: cold-start BF on next obs refresh.
-        self._target_prev[idx_t]                      = -1
-        self._dist_prev[idx_t]                        = float("inf")
         # Reset BF-from-curr cache.
         self._curr_prev[idx_t]                        = -1
         self._dist_curr_prev[idx_t]                   = float("inf")
@@ -1038,12 +912,10 @@ class Explorer:
         # Reset comm-gap timer: at reset, last_known_pos is set to actual start positions
         # (see loop below), so all pairs are "freshly in comm" at t=0.
         self.t_last_comm[idx_t]                       = 0
+        self._own_expl_at_comm[idx_t]                 = 0.0   # baseline reset → first comm re-snaps it
         self.last_action[idx_t]                       = -1
-        # Re-draw collision priority + clear objective-commitment memory.
+        # Re-draw collision priority.
         self._collision_key[idx_t]                    = torch.rand((n, self.M), device=self.dev)
-        self._prev_target_node[idx_t]                 = -1
-        self._steps_on_option[idx_t]                  = 0
-        self._comm_event[idx_t]                       = False
         self._resample_ss_noise(idx_t)
 
         for j_env, e in enumerate(idx):
@@ -1088,265 +960,130 @@ class Explorer:
         self.own_node_mask_prev[idx_t] = free_node_reset
         self.union_node_mask[idx_t]    = free_node_reset.any(dim=1)
         self.novel_cells_ep[idx_t]     = 0.0
-        # Baseline per pair = node-level UNION of all agents' initial scans.
-        # Treats reset as a "virtual rendezvous" where everyone knows what's been scanned.
-        union_node_reset = free_node_reset.any(dim=1, keepdim=False)                        # [n, N_max]
-        self.last_meeting_node_mask[idx_t] = union_node_reset.view(n, 1, 1, self.N_max).expand(
-            -1, self.M, self.M, -1).contiguous()
+        self._rdv_phi_prev[idx_t]      = float("inf")
         self._refresh_obs()
 
     # ---------------------------------------------------------------------- #
-    # obs helpers (per-agent; called inside the Pass-1 loop of _refresh_obs)  #
+    # obs helpers (batched over N·M; called from Pass 1 of _refresh_obs)      #
     # ---------------------------------------------------------------------- #
-    def _bf_from_teammates(self, info: dict, a: int) -> None:
-        """H.3 — BF FROM each teammate's last-known position, in agent a's own map.
+    def _bf_from_teammates(self, info: dict) -> None:
+        """H.3 — BF FROM each teammate's last-known position, in the observing agent's own map.
 
-        Per teammate j != a: lkp_node = floor(lkp[a, j] / NR), then BF rooted there over the
-        OPTIMISTIC (UNKNOWN-passable) graph — the teammate usually sits in this agent's
-        unexplored region, where the FREE graph would return +inf and silence the
-        coordination channel. Warm-started on an unchanged teammate node. Writes
-        info["bf_dist_team"][N, M, N_max], self-slot left at +inf (unused).
+        `info` is the Pass-1 BATCHED build: leading dim B = N·M, batch element b = env b//M,
+        agent a = b % M. lkp_node = floor(lkp[a, j] / NR), then BF rooted there over the
+        OPTIMISTIC (UNKNOWN-passable) graph — the teammate usually sits in the observer's
+        unexplored region, where the FREE graph would return +inf and silence the coordination
+        channel. One BF call per teammate SLOT r (M-1 total) covers the whole batch; each call
+        is warm-started on an unchanged teammate node from the per-(a, j) cache. Writes
+        info["bf_dist_team"][B, M, N_max], self-slot left at +inf (unused).
         """
+        B = self.N * self.M
         LH, LW = self.graph.LH, self.graph.LW
         NR = float(self.cfg.nr)
-        lkp_a = self.last_known_pos[:, a]                                          # [N, M, 2]
-        lj_t = (lkp_a[..., 0] / NR).long().clamp(0, LW - 1)
-        li_t = (lkp_a[..., 1] / NR).long().clamp(0, LH - 1)
-        team_node_a = li_t * LW + lj_t                                              # [N, M]
-        bf_dist_team_per_j = torch.full(
-            (self.N, self.M, self.N_max), float("inf"),
+        lkp = self.last_known_pos.reshape(B, self.M, 2)                             # [B, M, 2]
+        lj_t = (lkp[..., 0] / NR).long().clamp(0, LW - 1)
+        li_t = (lkp[..., 1] / NR).long().clamp(0, LH - 1)
+        team_node = li_t * LW + lj_t                                                # [B, M]
+        # Views into the caches (contiguous → reshape shares storage; in-place writes persist).
+        team_node_prev = self._team_node_prev.reshape(B, self.M)
+        dist_team_prev = self._dist_team_prev.reshape(B, self.M, self.N_max)
+        bf_dist_team = torch.full(
+            (B, self.M, self.N_max), float("inf"),
             dtype=torch.float32, device=self.dev,
         )
-        for j in range(self.M):
-            if j == a:
-                continue
-            target_j = team_node_a[:, j]                                            # [N]
-            same_j = (target_j == self._team_node_prev[:, a, j]).unsqueeze(-1)
+        b_arange = torch.arange(B, device=self.dev)
+        for r in range(self.M - 1):
+            # Teammate index per batch element — depends only on a = b % M ([N,M]→B is n-major).
+            j_flat = self._others_idx[:, r].repeat(self.N)                          # [B]
+            target_j = team_node[b_arange, j_flat]                                  # [B]
+            same_j = (target_j == team_node_prev[b_arange, j_flat]).unsqueeze(-1)
+            prev_j = dist_team_prev[b_arange, j_flat]                               # [B, N_max]
             team_dist_init = torch.where(
                 same_j.expand(-1, self.N_max),
-                self._dist_team_prev[:, a, j],
-                torch.full_like(self._dist_team_prev[:, a, j], float("inf")),
+                prev_j,
+                torch.full_like(prev_j, float("inf")),
             )
             dist_j, _ = self.graph.bf_from_target(
                 info, target=target_j, dist_init=team_dist_init,
                 edge_valid=info.get("edge_valid_optim"),   # None-safe; optimistic graph
             )
-            self._team_node_prev[:, a, j] = target_j
-            self._dist_team_prev[:, a, j] = dist_j
-            bf_dist_team_per_j[:, j] = dist_j
-        info["bf_dist_team"] = bf_dist_team_per_j                                   # [N, M, N_max]
+            team_node_prev[b_arange, j_flat] = target_j
+            dist_team_prev[b_arange, j_flat] = dist_j
+            bf_dist_team[b_arange, j_flat] = dist_j
+        info["bf_dist_team"] = bf_dist_team                                         # [B, M, N_max]
 
     def _refresh_obs(self, comm_mask: torch.Tensor | None = None) -> None:
         """Build per-agent obs from current per-agent occupancy + positions.
 
         Phase C: encoder consumes ego-centric subgraph windows, not the full lattice.
-        Pass 1: build global graph + analytic target + guidepost per agent.
+        Pass 1: build global graph + BF-from-curr + radar (feat[5]/feat[6]) per agent.
         Pass 2: cross-agent feat[4] (teammate-proximity potential) — writes to global node_feat.
         Pass 3: extract local (2·n_hops + 3)² window per agent; this is what the model sees.
         """
-        # ---- Pass 1: build global infos + warm-started target-rooted BF ----
-        infos: list[dict] = []
-        pref_targets: list[torch.Tensor] = []     # per-agent PRE-deconfliction analytic target
-        dteam_list: list = []                      # per-agent rendezvous anchor (re-select arg)
-        w_list: list = []                          # per-agent offer weight (re-select arg)
-        dteam_min_list: list = []                  # per-agent NEAREST-teammate BF dist (separation arg)
-        for a in range(self.M):
-            occ_a      = self.world.occupancy_torch[:, a, :, :]
-            frontier_a = compute_frontier(occ_a)
-            info = self.graph.build(
-                occupancy=occ_a,
-                frontier=frontier_a,
-                robot_xy=self.pos[:, a, :],
-                visited_step=self.visited_step[:, a, :],
-                current_step=int(self.t.max().item()),
-            )
-            # ---- BF FROM curr (target-INDEPENDENT) → path length to every node. Moved BEFORE
-            # target selection so the analytic selector can score frontiers by true reach cost.
-            curr_same = (info["curr_idx"] == self._curr_prev[:, a]).unsqueeze(-1)
-            curr_dist_init = torch.where(
-                curr_same.expand(-1, self.N_max),
-                self._dist_curr_prev[:, a, :],
-                torch.full_like(self._dist_curr_prev[:, a, :], float("inf")),
-            )
-            bf_dist_from_curr, bf_parent_from_curr = self.graph.bf_from_target(
-                info, target=info["curr_idx"], dist_init=curr_dist_init,
-            )
-            self._curr_prev[:, a]      = info["curr_idx"]
-            self._dist_curr_prev[:, a] = bf_dist_from_curr
-            info["bf_dist_from_curr"]  = bf_dist_from_curr
-            info["bf_parent_from_curr"] = bf_parent_from_curr   # [N, N_max] predecessor on path from curr
-            # ---- RADAR (feat[6] b_util, feat[7] b_teammate): compress the world BEYOND the ego
-            # window onto the geodesic receptive-horizon nodes so the feed-forward policy gets a
-            # heading toward far exploration mass / teammates (anti-loop without recurrence). Uses
-            # the FREE-graph BF just computed. teammate_src = each OTHER agent's last-known node.
-            if self.M > 1:
-                others = [j for j in range(self.M) if j != a]
-                lkp = self.last_known_pos[:, a, others, :]                          # [N, M-1, 2]
-                lx = (lkp[..., 0] / float(self.graph.NR)).long().clamp(0, self.graph.LW - 1)
-                ly = (lkp[..., 1] / float(self.graph.NR)).long().clamp(0, self.graph.LH - 1)
-                teammate_src = ly * self.graph.LW + lx                              # [N, M-1]
-            else:
-                teammate_src = None
-            b_util, b_team = self.graph.build_radar(
-                info, teammate_src=teammate_src, gamma_r=float(self.cfg.radar_gamma),
-            )
-            info["node_feat"][..., 6] = b_util
-            info["node_feat"][..., 7] = b_team
-            # H.3 — BF from each teammate's last-known position → info["bf_dist_team"].
-            if self.M > 1:
-                self._bf_from_teammates(info, a)
-            # ---- Analytic GLOBAL TARGET (deterministic) — nearest-richest frontier, with a
-            # rendezvous pull toward the teammate I owe the most fresh map. offer≈0 → pure
-            # exploration; offer high → drift the chosen frontier toward that teammate so we
-            # converge for a map exchange (self-limiting: fusion on contact resets offer→0).
-            d_team_star = None
-            w_offer = None
-            d_team_min = None
-            # Rendezvous / separation anchors feed ONLY select_target_analytic. In "nearest" the
-            # selector ignores them → skip the whole offer/d_team computation there. bf_dist_team
-            # (built above) is kept regardless: it still feeds feat[4] team_pot in Pass 2.
-            if self.M > 1 and self.cfg.target_kind != "nearest":
-                # offer_j = explored cells I gained since I last synced with j (j lacks them).
-                own_expl_now = (occ_a != _UNKNOWN).view(self.N, -1).sum(-1).float()         # [N]
-                offer_j = (own_expl_now.unsqueeze(1) - self._own_expl_at_comm[:, a, :]).clamp(min=0.0)  # [N, M]
-                offer_j[:, a] = -1.0                                                        # mask self slot
-                j_star = offer_j.argmax(dim=1)                                              # [N] teammate owed most
-                offer_star = offer_j.gather(1, j_star.unsqueeze(1)).squeeze(1).clamp(min=0.0)  # [N]
-                offer_scale = max(1.0, self.cfg.rdv_offer_frac * float(self.H * self.W))
-                w_offer = (offer_star / offer_scale).clamp(0.0, 1.0)
-                d_team_star = info["bf_dist_team"].gather(
-                    1, j_star.view(self.N, 1, 1).expand(-1, 1, self.N_max)
-                ).squeeze(1)                                                               # [N, N_max]
-                # NEAREST teammate BF reach per node (self slot = +inf in Pass 1) — ownership signal.
-                d_team_min = info["bf_dist_team"].min(dim=1).values                        # [N, N_max]
-            # Preferred analytic target (PRE-deconfliction). Guidepost + commitment bookkeeping
-            # are DEFERRED until after the intra-step target deconfliction below, so they reflect
-            # the FINAL target (a teammate may out-rank this one and force a re-pick).
-            sep_w_a = (1.0 - w_offer) if (self.cfg.target_sep_from_offer and w_offer is not None) \
-                      else float(self.cfg.target_sep_weight)
-            if self.cfg.target_kind == "nearest":
-                # Greedy-nearest frontier by BF distance — no scoring / rendezvous / separation.
-                pref_target = self.graph.select_target_nearest_bf(
-                    info["util_raw"], info["node_valid"], bf_dist_from_curr,
-                    prev_target=self._prev_target_node[:, a], curr_idx=info["curr_idx"],
-                    keep_margin=float(self.cfg.target_keep_margin),
-                )
-            else:
-                pref_target = self.graph.select_target_analytic(
-                    info["util_raw"], info["node_valid"], bf_dist_from_curr,
-                    d_team=d_team_star, w=w_offer,
-                    beta=float(self.cfg.target_beta), lam=float(self.cfg.target_lambda),
-                    prev_target=self._prev_target_node[:, a], curr_idx=info["curr_idx"],
-                    keep_margin=float(self.cfg.target_keep_margin),
-                    d_team_min=d_team_min, sep_w=sep_w_a,
-                    sep_k=float(self.cfg.target_sep_k), sep_m=float(self.cfg.target_sep_margin),
-                )
-            pref_targets.append(pref_target)
-            dteam_list.append(d_team_star)
-            w_list.append(w_offer)
-            dteam_min_list.append(d_team_min)
-            infos.append(info)
-
-        # ---- Intra-step target deconfliction (arrival-time priority, lower-index tiebreak) ----
-        # Two agents that picked the SAME global target deadlock (both route to one node, collide,
-        # mutual-revert, never re-scan → frontier persists → re-pick same target forever). Resolve
-        # HERE, intra-step (so no 1-step-stale claim): the agent with the smaller BF reach cost to
-        # the contested node keeps it (arrives first); ties broken by lower index. The loser drops
-        # that node and re-selects a different frontier — UNLESS it has no other frontier (then both
-        # commit, never back down). Analytic mode only (env owns the target).
-        final_targets = [t.clone() for t in pref_targets]
-        if self.M > 1 and self.cfg.analytic_target:
-            exclude = [torch.zeros((self.N, self.N_max), dtype=torch.bool, device=self.dev)
-                       for _ in range(self.M)]
-
-            def _arrival(a: int, g: torch.Tensor) -> torch.Tensor:
-                # BF reach cost agent a → node g (+inf if unreachable). [N]
-                return infos[a]["bf_dist_from_curr"].gather(
-                    1, g.clamp(min=0).unsqueeze(1)).squeeze(1)
-
-            for _pass in range(self.M):           # bounded; cascades settle within M passes
-                for a in range(self.M):
-                    for b in range(self.M):
-                        if a == b:
-                            continue
-                        ta, tb = final_targets[a], final_targets[b]
-                        same = (ta == tb) & (ta >= 0)
-                        ca, cb = _arrival(a, ta), _arrival(b, tb)
-                        # a yields to b: b strictly closer, or equal cost and b lower index.
-                        a_yields = same & ((cb < ca) | ((cb == ca) & (b < a)))
-                        add = torch.zeros_like(exclude[a])
-                        add.scatter_(1, ta.clamp(min=0).unsqueeze(1), True)
-                        trial = exclude[a] | (add & a_yields.unsqueeze(1))
-                        sep_w_a = (1.0 - w_list[a]) if (self.cfg.target_sep_from_offer and w_list[a] is not None) \
-                                  else float(self.cfg.target_sep_weight)
-                        if self.cfg.target_kind == "nearest":
-                            re_t = self.graph.select_target_nearest_bf(
-                                infos[a]["util_raw"], infos[a]["node_valid"],
-                                infos[a]["bf_dist_from_curr"],
-                                prev_target=self._prev_target_node[:, a], curr_idx=infos[a]["curr_idx"],
-                                keep_margin=float(self.cfg.target_keep_margin), exclude=trial,
-                            )
-                        else:
-                            re_t = self.graph.select_target_analytic(
-                                infos[a]["util_raw"], infos[a]["node_valid"],
-                                infos[a]["bf_dist_from_curr"],
-                                d_team=dteam_list[a], w=w_list[a],
-                                beta=float(self.cfg.target_beta), lam=float(self.cfg.target_lambda),
-                                prev_target=self._prev_target_node[:, a], curr_idx=infos[a]["curr_idx"],
-                                keep_margin=float(self.cfg.target_keep_margin), exclude=trial,
-                                d_team_min=dteam_min_list[a], sep_w=sep_w_a,
-                                sep_k=float(self.cfg.target_sep_k), sep_m=float(self.cfg.target_sep_margin),
-                            )
-                        # Single-frontier guard: only yield if the re-pick is a REAL other frontier
-                        # (not the curr-node fallback) — else both commit, never back down.
-                        do_yield = a_yields & (re_t != infos[a]["curr_idx"])
-                        exclude[a] = exclude[a] | (add & do_yield.unsqueeze(1))
-                        final_targets[a] = torch.where(do_yield, re_t, final_targets[a])
-
-        # ---- Guidepost + commitment bookkeeping on the FINAL (deconflicted) target ----
-        for a in range(self.M):
-            info = infos[a]
-            new_target = final_targets[a]
-            target_same = (new_target == self._target_prev[:, a]).unsqueeze(-1)            # [N, 1]
-            dist_init = torch.where(
-                target_same.expand(-1, self.N_max),
-                self._dist_prev[:, a, :],
-                torch.full_like(self._dist_prev[:, a, :], float("inf")),
-            )
-            self.graph.build_guidepost_v2(info, target=new_target, dist_init=dist_init)
-            self._target_prev[:, a] = new_target
-            self._dist_prev[:, a, :] = info["guidepost_dist"]
-            # Analytic mode: env owns the committed target → advance commitment-step tracking.
-            if self.cfg.analytic_target:
-                same_tgt = (new_target == self._prev_target_node[:, a])
-                self._steps_on_option[:, a] = torch.where(
-                    same_tgt, self._steps_on_option[:, a] + 1,
-                    torch.zeros_like(self._steps_on_option[:, a]),
-                )
-                self._prev_target_node[:, a] = new_target
+        # ---- Pass 1 (BATCHED over N·M): build + warm-started BF-from-curr (feeds the radar) ----
+        # Every GraphLattice op is batch-agnostic on its leading dim, so the M agents are folded
+        # into the batch (B = N·M, b = env·M + agent): build/BF/radar/window each run ONCE
+        # instead of M times — identical math, 1/M the kernel launches.
+        B = self.N * self.M
+        occ_b = self.world.occupancy_torch.reshape(B, self.H, self.W)
+        frontier_b = compute_frontier(occ_b)
+        info = self.graph.build(
+            occupancy=occ_b,
+            frontier=frontier_b,
+            robot_xy=self.pos.reshape(B, 2),
+            visited_step=self.visited_step.reshape(B, self.N_max),
+            current_step=int(self.t.max().item()),
+        )
+        # ---- BF FROM curr (target-INDEPENDENT) → path length to every node.
+        curr_prev = self._curr_prev.reshape(B)
+        dist_curr_prev = self._dist_curr_prev.reshape(B, self.N_max)
+        curr_same = (info["curr_idx"] == curr_prev).unsqueeze(-1)
+        curr_dist_init = torch.where(
+            curr_same.expand(-1, self.N_max),
+            dist_curr_prev,
+            torch.full_like(dist_curr_prev, float("inf")),
+        )
+        bf_dist_from_curr, bf_parent_from_curr = self.graph.bf_from_target(
+            info, target=info["curr_idx"], dist_init=curr_dist_init,
+        )
+        self._curr_prev.copy_(info["curr_idx"].view(self.N, self.M))
+        self._dist_curr_prev.copy_(bf_dist_from_curr.view(self.N, self.M, self.N_max))
+        info["bf_dist_from_curr"]  = bf_dist_from_curr
+        info["bf_parent_from_curr"] = bf_parent_from_curr   # [B, N_max] predecessor on path from curr
+        # ---- RADAR (feat[5] b_util, feat[6] b_teammate): compress the world BEYOND the ego
+        # window onto the geodesic receptive-horizon nodes so the feed-forward policy gets a
+        # heading toward far exploration mass / teammates (anti-loop without recurrence). Uses
+        # the FREE-graph BF just computed. teammate_src = each OTHER agent's last-known node.
+        if self.M > 1:
+            ar = torch.arange(self.M, device=self.dev).view(self.M, 1)
+            lkp = self.last_known_pos[:, ar, self._others_idx, :]               # [N, M, M-1, 2]
+            lx = (lkp[..., 0] / float(self.graph.NR)).long().clamp(0, self.graph.LW - 1)
+            ly = (lkp[..., 1] / float(self.graph.NR)).long().clamp(0, self.graph.LH - 1)
+            teammate_src = (ly * self.graph.LW + lx).reshape(B, self.M - 1)     # [B, M-1]
+        else:
+            teammate_src = None
+        b_util, b_team = self.graph.build_radar(
+            info, teammate_src=teammate_src, gamma_r=float(self.cfg.radar_gamma),
+            util_norm=float(self.cfg.radar_util_norm),
+        )
+        info["node_feat"][..., 5] = b_util
+        info["node_feat"][..., 6] = b_team
+        # H.3 — BF from each teammate's last-known position → info["bf_dist_team"] [B, M, N_max].
+        if self.M > 1:
+            self._bf_from_teammates(info)
 
         # ---- Pass 2: cross-agent feat[4] = teammate-proximity POTENTIAL on GLOBAL node_feat ----
-        # The old feat lit a SINGLE one-hot node nearest the teammate's last-known position.
-        # Once agents split (the whole point of the task) the teammate sits outside the agent's
-        # (2·n_hops+3)² ego window, so after window extraction feat[5] ≡ 0 — dead by construction,
-        # and a one-hot carries near-zero gradient even when alive. Replace with a DENSE field:
-        # exp(-d / scale) of the BF geodesic distance from the teammate's lkp to each node
-        # (info["bf_dist_team"], built in Pass 1 over the optimistic FREE∪UNKNOWN graph so it
-        # stays finite when the teammate is in unexplored space). Always informative inside the
-        # window, gradient-rich, wall-aware, and pointing toward the teammate.
+        # DENSE field exp(-d / scale) of the BF geodesic distance from the teammate's last-known
+        # position to each node (info["bf_dist_team"], built in Pass 1 over the optimistic
+        # FREE∪UNKNOWN graph so it stays finite when the teammate is in unexplored space).
+        # Gradient-rich, wall-aware, and pointing toward the teammate.
         if self.M > 1:
             scale_px = max(1.0, 4.0 * float(self.cfg.nr))
-            for a in range(self.M):
-                # min over teammates (self slot left at +inf in Pass 1) → nearest teammate.
-                d_min = infos[a]["bf_dist_team"].min(dim=1).values            # [N, N_max]
-                pot = torch.exp(-d_min / scale_px)                            # +inf → 0
-                pot = torch.nan_to_num(pot, nan=0.0, posinf=0.0, neginf=0.0)
-                infos[a]["node_feat"][..., 4] = pot * infos[a]["node_valid"].float()
-
-        # Guidepost ablation: blank the guidepost channel so the model sees no analytic route.
-        if self.cfg.disable_guidepost:
-            for a in range(self.M):
-                infos[a]["node_feat"][..., 5] = 0.0
+            # min over teammates (self slot left at +inf in Pass 1) → nearest teammate.
+            d_min = info["bf_dist_team"].min(dim=1).values                    # [B, N_max]
+            pot = torch.exp(-d_min / scale_px)                                # +inf → 0
+            pot = torch.nan_to_num(pot, nan=0.0, posinf=0.0, neginf=0.0)
+            info["node_feat"][..., 4] = pot * info["node_valid"].float()
 
         # ---- Render-global stash (eval/debug only) — full-graph utility/validity for the GIF,
         # since obs ships only the ego window. Gated so training pays nothing. ----
@@ -1359,18 +1096,16 @@ class Explorer:
                 "node_xy":    self.graph.node_xy,                                              # [N_max, 2] static
                 "edge_idx":   self.graph.edge_idx_static,                                      # [N_max, K] static
                 "window_idx_table": self.graph.window_idx_table,                               # [N_max, W²] global idx (-1 pad)
-                "utility":    torch.stack([infos[a]["utility"]    for a in range(self.M)], 1),  # [N, M, N_max]
+                "utility":    info["utility"].view(self.N, self.M, self.N_max),                # [N, M, N_max]
                 # Utility decomposition (boundary-pixel ribbon vs revealable-volume) per node.
-                "util_boundary": torch.stack([infos[a]["util_boundary"] for a in range(self.M)], 1),  # [N, M, N_max]
-                "util_volume":   torch.stack([infos[a]["util_volume"]   for a in range(self.M)], 1),  # [N, M, N_max]
-                "node_valid": torch.stack([infos[a]["node_valid"] for a in range(self.M)], 1),  # [N, M, N_max]
-                "edge_valid": torch.stack([infos[a]["edge_valid"] for a in range(self.M)], 1),  # [N, M, N_max, K]
-                "curr_idx":   torch.stack([infos[a]["curr_idx"]   for a in range(self.M)], 1),  # [N, M] GLOBAL node
-                # Full global node features (0 x_rel,1 y_rel,2 utility,3 age,4 team_pot,5 guidepost)
-                # + the analytic global target — for the step-through decision inspector.
-                "node_feat":  torch.stack([infos[a]["node_feat"]  for a in range(self.M)], 1),  # [N, M, N_max, F]
-                "target":     self._prev_target_node.clone(),                                   # [N, M] GLOBAL target node
-                "guidepost_dist": torch.stack([infos[a]["guidepost_dist"] for a in range(self.M)], 1),  # [N, M, N_max]
+                "util_boundary": info["util_boundary"].view(self.N, self.M, self.N_max),       # [N, M, N_max]
+                "util_volume":   info["util_volume"].view(self.N, self.M, self.N_max),         # [N, M, N_max]
+                "node_valid": info["node_valid"].view(self.N, self.M, self.N_max),             # [N, M, N_max]
+                "edge_valid": info["edge_valid"].view(self.N, self.M, self.N_max, -1),         # [N, M, N_max, K]
+                "curr_idx":   info["curr_idx"].view(self.N, self.M),                           # [N, M] GLOBAL node
+                # Full global node features (0 x_rel,1 y_rel,2 utility,3 age,4 team_pot,
+                # 5 radar-util,6 radar-teammate) — for the step-through decision inspector.
+                "node_feat":  info["node_feat"].view(self.N, self.M, self.N_max, -1),          # [N, M, N_max, F]
                 # Inspector: teammate visibility. pos = ground-truth xy; last_known_pos[i,j] =
                 # i's belief of j (fresh when comm, else stale estimate); comm_mask[i,j] = i&j
                 # exchanging this step (→ belief == truth). Lets the viewer draw known vs guessed.
@@ -1379,70 +1114,21 @@ class Explorer:
                 "comm_mask":      cm_stash.clone(),                                              # [N, M, M] bool
             }
 
-        # ---- Pass 3: extract per-agent local window ----
-        node_xy_list = []
-        node_valid_list = []
-        node_feat_list = []
-        edge_idx_list = []
-        edge_valid_list = []
-        curr_idx_list = []
-        curr_nbr_list = []
-        curr_nbr_valid_list = []
-        utility_list = []
-        curr_nbr_global_list = []
-        local_to_global_list = []
-        guidepost_target_list = []
-        guidepost_target_xy_list = []
-        guidepost_path_xy_list = []
-        guidepost_path_valid_list = []
-        guidepost_nbr_bias_list = []
-        guidepost_next_hop_list = []
-        # G.3.b — BF parent from curr, for render-time path walk to strategic target.
-        bf_parent_list = []
-        curr_idx_global_list = []
-
-        for a in range(self.M):
-            info = infos[a]
-            local = self.graph.extract_local_window(info)
-            node_xy_list.append(local["node_xy_local"])
-            node_valid_list.append(local["node_valid_local"])
-            node_feat_list.append(local["node_feat_local"])
-            edge_idx_list.append(local["edge_idx_local"])
-            edge_valid_list.append(local["edge_valid_local"])
-            curr_idx_list.append(local["curr_idx_local"])
-            curr_nbr_list.append(local["curr_nbr_local"])
-            curr_nbr_valid_list.append(local["curr_nbr_valid_local"])
-            utility_list.append(local["utility_local"])
-            curr_nbr_global_list.append(local["curr_nbr_global"])
-            local_to_global_list.append(local["local_to_global"])
-            guidepost_target_list.append(info["guidepost_target"])
-            guidepost_target_xy_list.append(info["guidepost_target_xy"])
-            guidepost_path_xy_list.append(info["guidepost_path_xy"])
-            guidepost_path_valid_list.append(info["guidepost_path_valid"])
-            guidepost_nbr_bias_list.append(info["guidepost_nbr_bias"])
-            guidepost_next_hop_list.append(info["guidepost_next_hop"])
-            bf_parent_list.append(info["bf_parent_from_curr"])
-            curr_idx_global_list.append(info["curr_idx"])
-
-        node_xy              = torch.stack(node_xy_list, dim=1)
-        node_valid           = torch.stack(node_valid_list, dim=1)
-        node_feat            = torch.stack(node_feat_list, dim=1)
-        edge_idx             = torch.stack(edge_idx_list, dim=1)
-        edge_valid           = torch.stack(edge_valid_list, dim=1)
-        curr_idx             = torch.stack(curr_idx_list, dim=1)
-        curr_nbr             = torch.stack(curr_nbr_list, dim=1)
-        curr_nbr_valid       = torch.stack(curr_nbr_valid_list, dim=1)
-        utility              = torch.stack(utility_list, dim=1)
-        curr_nbr_global      = torch.stack(curr_nbr_global_list, dim=1)
-        local_to_global      = torch.stack(local_to_global_list, dim=1)
-        guidepost_target     = torch.stack(guidepost_target_list, dim=1)
-        guidepost_target_xy  = torch.stack(guidepost_target_xy_list, dim=1)
-        guidepost_path_xy    = torch.stack(guidepost_path_xy_list, dim=1)
-        guidepost_path_valid = torch.stack(guidepost_path_valid_list, dim=1)
-        guidepost_nbr_bias   = torch.stack(guidepost_nbr_bias_list, dim=1)
-        guidepost_next_hop   = torch.stack(guidepost_next_hop_list, dim=1)
-        bf_parent_from_curr  = torch.stack(bf_parent_list, dim=1)         # [N, M, N_max]
-        curr_idx_global      = torch.stack(curr_idx_global_list, dim=1)   # [N, M]
+        # ---- Pass 3: extract local windows — ONE batched call, unfold [B, ...] → [N, M, ...] ----
+        local = self.graph.extract_local_window(info)
+        W2 = self.graph.window_size
+        node_xy              = local["node_xy_local"].view(self.N, self.M, W2, 2)
+        node_valid           = local["node_valid_local"].view(self.N, self.M, W2)
+        node_feat            = local["node_feat_local"].view(self.N, self.M, W2, -1)
+        edge_idx             = local["edge_idx_local"].view(self.N, self.M, W2, -1)
+        edge_valid           = local["edge_valid_local"].view(self.N, self.M, W2, -1)
+        curr_idx             = local["curr_idx_local"].view(self.N, self.M)
+        curr_nbr             = local["curr_nbr_local"].view(self.N, self.M, -1)
+        curr_nbr_valid       = local["curr_nbr_valid_local"].view(self.N, self.M, -1)
+        utility              = local["utility_local"].view(self.N, self.M, W2)
+        curr_nbr_global      = local["curr_nbr_global"].view(self.N, self.M, -1)
+        local_to_global      = local["local_to_global"].view(self.N, self.M, W2)
+        curr_idx_global      = info["curr_idx"].view(self.N, self.M)   # [N, M]
 
         self.curr_idx = curr_idx
         self.curr_idx_global = curr_idx_global   # [N, M] real lattice node — invalid-action fallback
@@ -1451,11 +1137,14 @@ class Explorer:
                 self.M, dtype=torch.bool, device=self.dev
             ).view(1, self.M, self.M).expand(self.N, -1, -1)
 
-        # ---- CTDE critic-only global state [N, 8] (value head only; actors never see it) ----
-        #   [explored_frac, t/T, geo_pair, coverage_rate, redundancy, tgt_dist, idle_frac, imbalance]
-        # All ∈[0,1]. First three fix non-stationarity + agent geometry; the five extras (O2) feed
-        # the value head the team-coordination signal the actors can't observe — notably redundancy,
-        # which lets the critic explain the privileged novel_scan's ~union drops (lower adv variance).
+        # ---- CTDE critic-only global state [N, 7] (value head only; actors never see it) ----
+        #   [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance]
+        # All ∈[0,1]. The pooled per-agent embeddings the critic also gets are EGO-RELATIVE, so they
+        # carry per-agent exploration CONTENT but not the team geometry — the RELATIONAL geometry
+        # lives here as geo_pair (nearest-teammate GEODESIC distance /diam, translation-invariant).
+        # No absolute team position: V(s) must generalize across maps. The rest feed the value head
+        # team-coordination signal the actors can't observe — notably redundancy, which explains the
+        # privileged novel_scan's ~union drops (lower adv variance).
         diam = float((self.graph.LH + self.graph.LW) * self.cfg.nr)
         T_max = float(max(1, self.cfg.max_episode_steps))
         union_free = (self.world.occupancy_torch == _FREE).any(dim=1).view(self.N, -1).sum(-1).float()
@@ -1463,17 +1152,17 @@ class Explorer:
         t_frac = (self.t.float() / T_max).clamp(0.0, 1.0)                                            # [N]
         # geo_pair: nearest-teammate geodesic, mean over agents, /diam. REUSES Pass-1 bf_dist_team.
         if self.M > 1:
-            geo_per_agent = []
-            for a in range(self.M):
-                bt = infos[a]["bf_dist_team"]                                                        # [N, M, N_max]
-                ca = infos[a]["curr_idx"]                                                            # [N]
-                d_at = bt.gather(2, ca.view(self.N, 1, 1).expand(-1, self.M, 1)).squeeze(-1)         # [N, M] teammate j → a's node
-                geo_per_agent.append(d_at.min(dim=1).values)                                         # [N] nearest teammate
-            geo = torch.stack(geo_per_agent, dim=1)                                                  # [N, M]
+            bt = info["bf_dist_team"].view(self.N, self.M, self.M, self.N_max)                       # [N, a, j, N_max]
+            ca = info["curr_idx"].view(self.N, self.M)                                               # [N, a]
+            d_at = bt.gather(3, ca.view(self.N, self.M, 1, 1).expand(-1, -1, self.M, 1)).squeeze(-1) # [N, a, j] teammate j → a's node
+            geo = d_at.min(dim=2).values                                                             # [N, M] nearest teammate
             geo = torch.where(torch.isfinite(geo), geo, torch.full_like(geo, diam))
             geo_pair = (geo.mean(dim=1) / max(1.0, diam)).clamp(0.0, 1.0)                            # [N]
+            # φ per agent = geodesic curr→nearest-teammate /diam. Drives the rendezvous term below.
+            self._geo_curr_team = (geo / max(1.0, diam)).clamp(0.0, 1.0)                             # [N, M]
         else:
             geo_pair = torch.zeros(self.N, device=self.dev)
+            self._geo_curr_team = torch.zeros((self.N, self.M), device=self.dev)
         # coverage_rate: union-explored growth THIS step, scaled to "fraction-of-map per episode"
         # units (Δ·T), clamped [0,5]→[0,1]. Distinguishes "still progressing" from "stalled late".
         # On a per-env reset explored drops → Δ<0 → clamp(min=0) reads 0 (no spurious spike).
@@ -1484,11 +1173,6 @@ class Explorer:
             redundancy = (((own_free_a.sum(1) - union_free) / union_free.clamp(min=1.0)) / (self.M - 1)).clamp(0.0, 1.0)
         else:
             redundancy = torch.zeros(self.N, device=self.dev)
-        # tgt_dist: BF distance from each agent's node to its committed analytic target, mean, /diam.
-        # Descriptive only (critic input, not reward) → no "follow the selector" forcing.
-        d_tgt = self._dist_prev.gather(2, self.curr_idx_global.clamp(min=0).unsqueeze(-1)).squeeze(-1)  # [N, M]
-        d_tgt = torch.where(torch.isfinite(d_tgt), d_tgt, torch.full_like(d_tgt, diam))
-        tgt_dist = (d_tgt.mean(dim=1) / max(1.0, diam)).clamp(0.0, 1.0)                              # [N]
         # idle_frac: fraction of agents that scanned no team-new cells this step (simple idle).
         idle_frac = self._idle_now.float().mean(dim=1)                                              # [N]
         # imbalance: contribution skew, normalized so 1 = one agent did everything, 0 = even split.
@@ -1498,14 +1182,40 @@ class Explorer:
             imbalance = ((share.max(dim=1).values - 1.0 / self.M) / (1.0 - 1.0 / self.M)).clamp(0.0, 1.0)
         else:
             imbalance = torch.zeros(self.N, device=self.dev)
+        # ---- RENDEZVOUS RAW OBS + gate (per-agent scalars, execution-decentralized). Given to the
+        # actor as agent_scalars = [∆M_norm, staleness_norm] so the policy can DECIDE when to
+        # rendezvous; the SAME ∆M gate scales the dense reward. ∆M_a = surplus (cells I mapped that
+        # the teammate I owe most lacks) since our last sync, normalized by the map I HAD at that sync
+        # (relative growth, not a fraction of the whole canvas); staleness = steps since that sync.
+        if self.M > 1:
+            offer = (own_expl_a.unsqueeze(2) - self._own_expl_at_comm).clamp(min=0.0)                # [N, M, M]
+            eye = torch.eye(self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M)
+            offer = offer.masked_fill(eye, -1.0)                                                     # mask self slot
+            j_star = offer.argmax(dim=2)                                                             # [N, M] teammate owed most
+            offer_max = offer.gather(2, j_star.unsqueeze(2)).squeeze(2).clamp(min=0.0)               # [N, M]
+            # Gate on RELATIVE growth: surplus / (frac · own map size AT THE LAST SYNC with j_star),
+            # not a fixed fraction of the whole canvas. g→1 when I have grown my known map by
+            # rdv_offer_frac SINCE we last met — i.e. I now hold a meaningful fraction of NEW content
+            # that teammate j_star lacks, so meeting is worth it. Floored by scan_norm_nodes (≈ one
+            # sensor disk) so an early / near-empty baseline can't blow the ratio up.
+            baseline = self._own_expl_at_comm.gather(2, j_star.unsqueeze(2)).squeeze(2)              # [N, M]
+            scale = (float(self.cfg.rdv_offer_frac) * baseline).clamp(min=float(self.cfg.scan_norm_nodes))
+            g = (offer_max / scale).clamp(0.0, 1.0)                                                  # [N, M] surplus gate
+            last_comm = self.t_last_comm.gather(2, j_star.unsqueeze(2)).squeeze(2).float()           # [N, M]
+            staleness = ((self.t.view(self.N, 1).float() - last_comm).clamp(min=0.0) / T_max).clamp(0.0, 1.0)
+            self._rdv_gate = g
+            agent_scalars = torch.stack([g, staleness], dim=-1)                                      # [N, M, 2]
+        else:
+            self._rdv_gate = torch.zeros((self.N, self.M), device=self.dev)
+            agent_scalars = torch.zeros((self.N, self.M, 2), device=self.dev)
         critic_global = torch.stack(
-            [explored_frac, t_frac, geo_pair, cov_rate, redundancy, tgt_dist, idle_frac, imbalance],
+            [explored_frac, t_frac, geo_pair, cov_rate, redundancy, idle_frac, imbalance],
             dim=-1,
-        )                                                                                            # [N, 8]
+        )                                                                                            # [N, 7]
         self._prev_expl_frac = explored_frac.detach()
 
         self._last_obs = {
-            "critic_global":        critic_global,      # CTDE value-only [N, 8]
+            "critic_global":        critic_global,      # CTDE value-only [N, 7]
             "node_xy":              node_xy,            # LOCAL [N, M, W², 2]
             "node_valid":           node_valid,         # LOCAL [N, M, W²]
             "node_feat":            node_feat,          # LOCAL [N, M, W², F]
@@ -1518,20 +1228,14 @@ class Explorer:
             "utility":              utility,            # LOCAL [N, M, W²]
             "curr_nbr_global":      curr_nbr_global,    # GLOBAL [N, M, K] — for env.step action decode
             "local_to_global":      local_to_global,    # [N, M, W²] global flat idx (or -1) per local slot
-            "guidepost_target":     guidepost_target,
-            "guidepost_target_xy":  guidepost_target_xy,    # GLOBAL world coords [N, M, 2]
-            "guidepost_path_xy":    guidepost_path_xy,
-            "guidepost_path_valid": guidepost_path_valid,
-            "guidepost_nbr_bias":   guidepost_nbr_bias,
-            "guidepost_next_hop":   guidepost_next_hop,
-            "bf_parent_from_curr":  bf_parent_from_curr,    # G.3.b — [N, M, N_max] for render path
-            "curr_idx_global":      curr_idx_global,        # G.3.b — [N, M] global flat idx for walk anchor
+            "curr_idx_global":      curr_idx_global,        # [N, M] global flat idx — invalid-action fallback
             "pos":                  self.pos.clone(),
             "comm_mask":            comm_mask,
             "last_known_pos":       self.last_known_pos.clone(),
             # Previous action one-hot per agent.
             "prev_action":          self._prev_action_onehot(),    # [N, M, K=8] float
-            "comm_event":           self._comm_event.clone(),          # [N, M] received teammate map cells this step
+            # Rendezvous raw obs: [∆M surplus-gate, staleness] per agent (actor input).
+            "agent_scalars":        agent_scalars,                 # [N, M, 2] float
         }
 
     def _prev_action_onehot(self) -> torch.Tensor:

@@ -9,16 +9,15 @@ Obs schema (from env.explorer.Explorer):
     curr_nbr         [N, M, K]
     curr_nbr_valid   [N, M, K]
     action_mask      [N, M, K]
-    guidepost_nbr_bias [N, M, K]   next-hop direction toward the analytic global target
     prev_action      [N, M, K]
 
 Actor: shared GATEncoder, gather curr_emb + nbr_embs per (env, agent), GRUCell,
-PointerHead. The high-level target is chosen analytically by the env (graph_lattice);
-the actor is fed its first-hop direction (guidepost_nbr_bias) and does local control.
+PointerHead. No analytic target / guidepost: the actor steers purely from the ego-window
+GAT features (local utility + the radar beyond-window channels feat[5]/feat[6]).
 Decentralized: each agent sees only its own graph.
 
-Critic (CTDE): shared GATEncoder; gather curr_emb for each agent, concat across
-M, MLP → GRUCell → scalar V(s)  [N].
+Critic (CTDE): shared GATEncoder; gather curr_emb for each agent, POOL across M
+(mean ⊕ max, count-invariant) ⊕ critic_global, MLP → GRUCell → scalar V(s)  [N].
 """
 from __future__ import annotations
 
@@ -31,21 +30,24 @@ from torch.distributions import Categorical
 from models.gat import GATEncoder
 from models.init_utils import apply_orthogonal, orthogonal_
 
-F_IN = 8   # 0 x_rel, 1 y_rel, 2 utility, 3 age, 4 teammate, 5 guidepost, 6 radar-util, 7 radar-teammate
+F_IN = 7   # 0 x_rel, 1 y_rel, 2 utility, 3 age, 4 teammate_pot, 5 radar-util, 6 radar-teammate
 K = 8
 # CTDE critic-only global state (value head, never seen by actors → no execution leak):
-#   [explored_frac, t/max_steps, geo_pair, coverage_rate, redundancy, tgt_dist, idle_frac, imbalance].
-#   1-3 fix non-stationarity + agent geometry; 4-8 (O2) add the team-coordination signal the actors
-#   can't observe — redundancy in particular lets the critic explain the privileged novel_scan's
-#   ~union drops → lower advantage variance. All ∈[0,1]. Built env-side in explorer._refresh_obs.
-CRITIC_GLOBAL_DIM = 8
+#   [explored_frac, t/max_steps, geo_pair, coverage_rate, redundancy, idle_frac, imbalance].
+# The pooled per-agent embeddings (mean⊕max, see _critic_in) are EGO-RELATIVE, so aggregating them
+# keeps per-agent exploration CONTENT but not the team geometry — the RELATIONAL geometry the value
+# head needs lives here as geo_pair (nearest-teammate GEODESIC distance /diam, translation-invariant,
+# links the agents' positions: converging vs splitting). No absolute team position: V(s) for
+# exploration must generalize across maps, and absolute coords would just let the critic overfit the
+# training-map layouts. redundancy in particular lets the critic explain the privileged novel_scan's
+# ~union drops → lower advantage variance. All ∈[0,1]. Built env-side in _refresh_obs.
+CRITIC_GLOBAL_DIM = 7
 
 
 class PointerHead(nn.Module):
-    """Pointer over K=8 neighbors. The coordination signal reaches the actor via the
-    analytic guidepost next-hop direction (concatenated into the GRU input), NOT via an
-    additive logit bias.
-    """
+    """Pointer over K=8 neighbors: logit_k = (q·k_k)/sqrt(d)·τ. Beyond-window steering reaches
+    the neighbor embeddings through the GAT radar channels (feat[5]/feat[6]); there is no analytic
+    guidepost bias."""
     def __init__(self, d: int) -> None:
         super().__init__()
         self.q = nn.Linear(d, d)
@@ -82,7 +84,7 @@ class PointerHead(nn.Module):
 
 class MarlActorCritic(nn.Module):
     def __init__(self, n_agents: int = 1, d: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 strategic_gate_eps: float = 0.0, use_gru: bool = True) -> None:
+                 use_gru: bool = True) -> None:
         super().__init__()
         self.M = n_agents
         self.d = d
@@ -91,30 +93,23 @@ class MarlActorCritic(nn.Module):
         # memory across steps. The GRUCell modules are still built (so their params exist for
         # checkpoint compatibility) but never called. Set at construction from cfg.use_gru.
         self.use_gru = bool(use_gru)
-        # Inspector hook: when True, act() stashes the pointer-attention logits + the (purely
-        # visual) guidepost first-hop direction into self._dbg_logits. The guidepost is NOT
-        # added to the logits; the model must learn to follow it via node_feat[5] / the actor-
-        # input direction. Off in training → zero cost.
+        # Inspector hook: when True, act() stashes the pointer-attention logits into self._dbg_logits.
+        # Off in training → zero cost.
         self.store_logit_components = False
         self._dbg_logits: dict | None = None
-        # High-level guidepost GATE. The analytic global target is meant to be HIGH-LEVEL: a
-        # distant frontier consulted only when the local ego window is exhausted. When
-        # strategic_gate_eps > 0, the guidepost next-hop direction in the actor input is zeroed
-        # per-agent on any step where max utility inside the ego window ≥ eps — i.e. while the
-        # local GAT still sees nearby gain the actor climbs it greedily, and the analytic target
-        # only steers the actor once no local utility remains. eps == 0 disables the gate (the
-        # guidepost always influences). Mutable attribute so the driver/sweep can set it.
-        self.strategic_gate_eps = float(strategic_gate_eps)
         self.encoder = GATEncoder(in_dim=F_IN, d=d, n_heads=n_heads, n_layers=n_layers)
-        # Actor input = (curr_emb || prev_action[K]) → d. The analytic-target next-hop one-hot
-        # was REMOVED: it handed the planner's decision to the actor in action space, inviting it
-        # to just copy the guidepost. The route still reaches the actor as context via node_feat[5]
-        # (guidepost path ribbon) + node_feat[2] (utility), processed by the GAT.
-        self.actor_pre = nn.Linear(d + K, d)
+        # Actor input = (curr_emb || prev_action[K] || agent_scalars[2]) → d. agent_scalars =
+        # [∆M surplus-gate, staleness] (env-computed, execution-decentralized) let the policy DECIDE
+        # when to rendezvous. Beyond-window spatial context still reaches the actor through the
+        # GAT-processed node features (utility feat[2] + radar feat[5]/feat[6]).
+        self.n_agent_scalars = 2
+        self.actor_pre = nn.Linear(d + K + self.n_agent_scalars, d)
         self.gru_actor = nn.GRUCell(d, d)
         self.pointer = PointerHead(d)
-        # Critic head (CTDE)
-        self.critic_pre = nn.Sequential(nn.Linear(n_agents * d + CRITIC_GLOBAL_DIM, d), nn.GELU())
+        # Critic head (CTDE). Input = pooled team summary (mean ⊕ max over agents = 2·d, see
+        # _critic_in) ⊕ CTDE global vector. The 2·d width is independent of n_agents → the critic
+        # is count-invariant (unlocks IR2-style variable M without reshaping this weight).
+        self.critic_pre = nn.Sequential(nn.Linear(2 * d + CRITIC_GLOBAL_DIM, d), nn.GELU())
         self.gru_critic = nn.GRUCell(d, d)
         self.critic_head = nn.Sequential(nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, 1))
 
@@ -155,34 +150,41 @@ class MarlActorCritic(nn.Module):
         return h, curr_emb, nbr_embs
 
     def _critic_in(self, curr_emb_per_agent: torch.Tensor, critic_global: torch.Tensor | None) -> torch.Tensor:
-        """Concat joint agent embeddings [N, M·d] with the CTDE global vector [N, CRITIC_GLOBAL_DIM]
-        (zeros if absent — back-compat / M=1)."""
-        N = curr_emb_per_agent.shape[0]
-        joint = curr_emb_per_agent.reshape(N, self.M * self.d)
-        if critic_global is None:
-            critic_global = joint.new_zeros(N, CRITIC_GLOBAL_DIM)
-        return torch.cat([joint, critic_global], dim=-1)
+        """Pool the per-agent embeddings [N, M, d] into a COUNT-INVARIANT team summary, then concat
+        the CTDE global vector [N, CRITIC_GLOBAL_DIM] (zeros if absent — back-compat).
 
-    def _strategic_gate(self, obs: dict, B: int) -> torch.Tensor | None:
-        """High-level gate: 1 where the ego window has NO local utility (→ follow the analytic
-        guidepost), 0 where local gain remains (→ pure local GAT). Returns [B, 1] float, or None
-        when disabled (strategic_gate_eps <= 0). Deterministic from obs, so act/evaluate agree.
+        Problem #1 fix. The old input concatenated the M embeddings → [N, M·d]. That is MAPPO's "CL"
+        (concatenate-local) state — the worst-performing critic input in the MAPPO paper (Fig 3,
+        "ineffective particularly in maps with many agents"): it bakes M into critic_pre's weight
+        shape (blocks variable agent count / warm-start across M) and forces the value head to learn
+        a permutation-SENSITIVE map of M redundant slots → noisy V → noisy advantages.
+
+        Replace with symmetric pooling: mean ⊕ max over agents.
+          mean_i = (1/M) Σ_a h_a     — the mean-field team state (MAPPO's recommended global term)
+          max_i  = max_a h_a         — the "is ANY agent in state X" signal mean averages away
+        Both are permutation-invariant and M-invariant (fixed 2·d width for any M), so the same
+        critic serves any agent count. Unlike attention pooling there is NO softmax gate to get stuck
+        in the uniform dead-zone we had to repair in the GAT/pointer heads — mean/max always pass
+        gradient — so it learns from step 0 while sitting exactly on the proven mean-field baseline.
+        (Attention-residual pooling is a later option; with M=2 it buys almost nothing.)
         """
-        if self.strategic_gate_eps <= 0.0:
-            return None
-        # feat[2] = utility on the windowed node_feat the model actually sees.
-        util = self._flatten_nm(obs["node_feat"])[..., 2]          # [B, N_max_window]
-        local_max = util.max(dim=-1).values                        # [B]
-        return (local_max < self.strategic_gate_eps).float().unsqueeze(-1)   # [B, 1]
+        N = curr_emb_per_agent.shape[0]
+        mean_h = curr_emb_per_agent.mean(dim=1)                     # [N, d]
+        max_h = curr_emb_per_agent.max(dim=1).values               # [N, d]
+        pooled = torch.cat([mean_h, max_h], dim=-1)                # [N, 2·d]
+        if critic_global is None:
+            critic_global = pooled.new_zeros(N, CRITIC_GLOBAL_DIM)
+        return torch.cat([pooled, critic_global], dim=-1)          # [N, 2·d + G]
 
     # ---------------- actor ----------------
     def _actor_in(
         self,
         curr_emb: torch.Tensor,             # [B, d]
         prev_action: torch.Tensor,          # [B, K] one-hot
+        agent_scalars: torch.Tensor,        # [B, 2] [∆M-gate, staleness]
     ) -> torch.Tensor:
-        """Build the actor GRU input: curr_emb || prev_action."""
-        return self.actor_pre(torch.cat([curr_emb, prev_action], dim=-1))
+        """Build the actor GRU input: curr_emb || prev_action || agent_scalars."""
+        return self.actor_pre(torch.cat([curr_emb, prev_action, agent_scalars], dim=-1))
 
     def _step_actor(self, actor_in: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
         """Recurrent actor step, or feed-forward passthrough when use_gru is False (ablation)."""
@@ -202,7 +204,8 @@ class MarlActorCritic(nn.Module):
         N, M = obs["curr_idx"].shape
         B = N * M
         h_all, curr_emb, nbr_embs = self._encode(obs)
-        actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K))
+        actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K),
+                                   obs["agent_scalars"].reshape(B, self.n_agent_scalars))
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self._step_actor(actor_in, h_act_in)              # [B, d]
         pointer_logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
@@ -258,7 +261,8 @@ class MarlActorCritic(nn.Module):
         N, M = obs["curr_idx"].shape
         B = N * M
         _, curr_emb, nbr_embs = self._encode(obs)
-        actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K))
+        actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K),
+                                   obs["agent_scalars"].reshape(B, self.n_agent_scalars))
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self._step_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
@@ -327,13 +331,15 @@ class MarlActorCritic(nn.Module):
         hidden_actor: torch.Tensor,    # [N, M, d]
         hidden_critic: torch.Tensor,   # [N, d]
         prev_action: torch.Tensor,     # [N, M, K=8] one-hot
+        agent_scalars: torch.Tensor,   # [N, M, 2] [∆M-gate, staleness]
         critic_global: torch.Tensor | None = None,       # [N, CRITIC_GLOBAL_DIM] CTDE value-only state
     ) -> dict:
         """One PPO-evaluate step given pre-encoded curr/nbr embeddings."""
         N, M, _ = curr_emb.shape
         B = N * M
         curr_emb_flat = curr_emb.reshape(B, self.d)
-        actor_in = self._actor_in(curr_emb_flat, prev_action.reshape(B, K))
+        actor_in = self._actor_in(curr_emb_flat, prev_action.reshape(B, K),
+                                  agent_scalars.reshape(B, self.n_agent_scalars))
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self._step_actor(actor_in, h_act_in)
         logits = self.pointer(h_act_out, nbr_embs.reshape(B, K, self.d),

@@ -44,18 +44,16 @@
   .stack{display:flex;flex-direction:column;gap:6px}
   .pill{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:12px}
   .pill .t{color:var(--mut);font-size:11px}
-  .gone{opacity:.4;text-decoration:line-through;border-style:dashed!important}
   .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px;vertical-align:middle}
-  .tag.cut{background:#3d1d1d;color:#ff7b72;border:1px solid #ff7b72}
-  .tag.keep{background:#13311c;color:#3fb950;border:1px solid #238636}
-  footer{color:var(--mut);font-size:11px;padding:16px 24px;border-top:1px solid var(--line)}
+  .tag.new{background:#13311c;color:#3fb950;border:1px solid #238636}
   code{color:#79c0ff}
+  footer{color:var(--mut);font-size:11px;padding:16px 24px;border-top:1px solid var(--line)}
 </style>
 </head>
 <body>
 <header>
-  <h1>MARLauder — Architettura (v0.6, target analitico)</h1>
-  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO · GAT ego-centrico · planner BF analitico</div>
+  <h1>MARLauder — Architettura (v0.8, policy appresa)</h1>
+  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO · GAT ego-centrico · nessun target analitico: la rete guida da sola dalle feature del grafo + 2 scalari di rendezvous</div>
 </header>
 
 <div class="legend">
@@ -63,54 +61,52 @@
   <span class="lg"><span class="dot" style="background:var(--net)"></span>Rete (MarlActorCritic)</span>
   <span class="lg"><span class="dot" style="background:var(--train)"></span>Training (MAPPO)</span>
   <span class="lg"><span class="dot" style="background:var(--bus)"></span>Bus dati (interfaccia)</span>
-  <span class="lg"><span class="tag cut">CUT</span> rimosso con StrategicHead</span>
-  <span class="lg"><span class="tag keep">KEEP</span> resta</span>
 </div>
 
 <div class="wrap">
 
   <!-- ENV PIPELINE -->
   <div class="lane">
-    <div class="laneTitle">① Env — pipeline percezione → planning (per step, tutta su GPU)</div>
+    <div class="laneTitle">① Env — pipeline percezione → grafo (per step, tutta su GPU, agenti in batch B=N·M)</div>
     <div class="row">
       <div class="box env"><b>WarpWorld</b><span class="io">in: pos [N,M,2]
 out: occupancy [N,M,H,W]
-LiDAR 720 raggi · log-odds · fuse_maps()</span></div>
+LiDAR 720 raggi · sensore 80px
+comm signal-strength · fuse_maps()</span></div>
       <span class="arrow">→</span>
       <div class="box env"><b>Frontier</b><span class="io">in: occupancy
 out: frontier [N,H,W]
 conv2d (FREE adiac. UNKNOWN)</span></div>
       <span class="arrow">→</span>
-      <div class="box env"><b>GraphLattice.build</b><span class="io">out: node_feat[6], edge_idx[8],
-node_valid, utility
+      <div class="box env"><b>GraphLattice.build</b><span class="io">out: node_feat[7], edge_idx[8],
+node_valid, utility (info-gain)
 lattice 8-vicini · reachability</span></div>
     </div>
     <div class="down">↓</div>
     <div class="row">
       <div class="box env"><b>Bellman-Ford</b><span class="io">bf_from_curr → dist/parent
-bf_from_teammate (optim graph)
+bf_from_teammate (grafo optim)
 wall-aware, warm-started</span></div>
       <span class="arrow">→</span>
-      <div class="box env"><b>select_target_analytic</b><span class="io">out: target_node [N]
-util/(1+β·d)·rdv·separation
-guidepost + next-hop dir</span></div>
+      <div class="box env"><b>build_radar <span class="tag new">RADAR</span></b><span class="io">massa oltre-finestra → nodi gateway
+feat[5] b_util · feat[6] b_teammate
+sostituisce il guidepost analitico</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>feat[4] teammate_pot</b><span class="io">potenziale BF verso il compagno
+in-window · cross-agent · M&gt;1</span></div>
       <span class="arrow">→</span>
       <div class="box env"><b>extract_local_window</b><span class="io">ritaglio ego (2·n_hops+3)²
 = ciò che la rete vede</span></div>
-      <span class="arrow">→</span>
-      <div class="box env gone"><b>extract_topk_candidates <span class="tag cut">CUT</span></b><span class="io">K=16 frontiere + cand_feat[9]
-+ cand_bf_first_hop
-solo per StrategicHead</span></div>
     </div>
   </div>
 
-  <div class="down">↓ &nbsp; Explorer assembla obs</div>
+  <div class="down">↓ &nbsp; Explorer assembla obs + critic_global[7] + agent_scalars[2]</div>
 
   <!-- OBS BUS -->
   <div class="bus">
     <b>BUS #1 — obs dict [N, M, …]</b> (env → modello)
-    <div class="io">node_feat[6] · edge_idx · node_valid · curr_idx · curr_nbr · action_mask · guidepost_nbr_bias(next-hop) · prev_action · pos · critic_global[4]
-<span style="color:#ff7b72">CUT: cand_feat · cand_valid · cand_xy · cand_bf_first_hop · cand_idx · committed_node · committed_steps</span></div>
+    <div class="io">node_feat[7] (0 x_rel · 1 y_rel · 2 utility · 3 age · 4 teammate_pot · 5 radar-util · 6 radar-teammate)
+edge_idx · node_valid · curr_idx · curr_nbr · action_mask · prev_action[8] · <span style="color:#3fb950">agent_scalars[2] = (∆M-gate, staleness)</span> · critic_global[7]</div>
   </div>
 
   <div class="down">↓</div>
@@ -119,11 +115,12 @@ solo per StrategicHead</span></div>
   <div class="lane">
     <div class="laneTitle">② Rete — encoder condiviso</div>
     <div class="row">
-      <div class="box net"><b>GATEncoder <span class="tag keep">KEEP</span></b><span class="io">in: node_feat,edge_idx,edge_valid,node_valid
-MaskedGAT × n_layers
-Residual+LayerNorm+GELU
-out: h [B,N_max,d] → gather:
-curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
+      <div class="box net"><b>GATEncoder</b><span class="io">in: node_feat,edge_idx,edge_valid,node_valid
+MaskedGAT × n_layers · self-loop
+A1 temperatura per-testa · A2 bias-feature per-testa
+gruppi: H0[2,5] explore · H1[4,6] rendezvous
+        H2[3] recency · H3[5,6] far-field
+out: curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
     </div>
   </div>
 
@@ -134,31 +131,29 @@ curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
     <div class="col actor">
       <h3>③a ACTOR — decentralizzato (vede solo il proprio grafo)</h3>
       <div class="stack">
-        <div class="pill gone">StrategicHead <span class="tag cut">CUT</span><div class="t">MHA su K candidati · Gumbel-ST · commitment (switch_margin, max_steps_on_option) · strategic_emb</div></div>
+        <div class="pill">actor_pre (Linear)<div class="t">in: curr_emb ‖ prev_action[8] ‖ agent_scalars[2] → d</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">strategic_gate <span class="tag keep">KEEP</span><div class="t">se utility locale &gt; eps → azzera next-hop dir (climb locale)</div></div>
-        <div class="pill">actor_pre (Linear) <span class="tag keep">KEEP</span><div class="t">in: curr_emb ‖ next_hop_dir[8] ‖ prev_action[8] → d
-<span style="color:#ff7b72">(era: + strategic_emb)</span></div></div>
+        <div class="pill"><b>GRUCell (actor)</b><div class="t">memoria per-agente · stato [N,M,d] · <b>OFF di default</b> (feed-forward); abilita con <code>--gru</code></div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill"><b>GRUCell (actor)</b> <span class="tag keep">KEEP</span><div class="t">memoria per-agente · stato [N,M,d]</div></div>
+        <div class="pill">PointerHead<div class="t">logit_k = (q·k_k)/√d · τ · keys=nbr_embs[8] · mask=action_mask → logits[8]</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">PointerHead <span class="tag keep">KEEP</span><div class="t">query=h · keys=nbr_embs[8] · mask=action_mask → logits[8]</div></div>
-        <div class="down" style="margin:0">↓</div>
-        <div class="pill"><b>Categorical → action [N,M]</b><div class="t">1 di 8 vicini</div></div>
+        <div class="pill"><b>Categorical → action [N,M]</b><div class="t">1 di 8 vicini · maschera finita + guardia NaN</div></div>
       </div>
-      <div class="note">Output: action, logp, entropy, hidden_actor. <span style="color:#ff7b72">CUT: target_choice, target_logits, target_argmax</span></div>
+      <div class="note">Output: action, logp, entropy, hidden_actor. Il rendezvous entra qui via agent_scalars (urgenza) + feat[4]/[6] nei nbr_embs (direzione).</div>
     </div>
 
     <div class="col critic">
       <h3>③b CRITIC — CTDE (vede tutti gli agenti, solo in training)</h3>
       <div class="stack">
-        <div class="pill">critic_pre (Linear+GELU) <span class="tag keep">KEEP</span><div class="t">in: concat_M(curr_emb) ‖ critic_global[4] → d</div></div>
+        <div class="pill">pooling mean⊕max su M<div class="t">2·d · count-invariant (stessi pesi per qualsiasi M)</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill"><b>GRUCell (critic)</b> <span class="tag keep">KEEP</span><div class="t">memoria valore congiunto · stato [N,d]</div></div>
+        <div class="pill">critic_pre (Linear+GELU)<div class="t">in: pool(2·d) ‖ critic_global[7] → d</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">critic_head (MLP) <span class="tag keep">KEEP</span><div class="t">→ V(s) [N] scalare condiviso</div></div>
+        <div class="pill"><b>GRUCell (critic)</b><div class="t">memoria valore congiunto · stato [N,d]</div></div>
+        <div class="down" style="margin:0">↓</div>
+        <div class="pill">critic_head (MLP)<div class="t">→ V(s) [N] scalare condiviso</div></div>
       </div>
-      <div class="note">critic_global[4] = [explored_frac, t/T, geo_pair_dist, in_comm]. Buttato al deploy → nessun leak.</div>
+      <div class="note">critic_global[7] = [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance]. Buttato al deploy → nessun leak. redundancy spiega i cali del novel_scan → varianza vantaggio più bassa.</div>
     </div>
   </div>
 
@@ -179,32 +174,35 @@ spazio normalizzato</span></div>
       <span class="arrow">→</span>
       <div class="box train"><b>ppo_update</b><span class="io">encode_chunk (encoder 1×/chunk)
 evaluate_step_from_enc (TBPTT)
-clip + Huber V + entropy · AMP
-<span style="color:#ff7b72">CUT: _diversity_loss, div_coef</span></span></div>
+clip + Huber V + entropy · bf16 AMP</span></div>
     </div>
     <div class="note" style="text-align:center">∇ → aggiorna pesi del modello (loop: collect_rollout → ppo_update × n_iters)</div>
   </div>
 
   <!-- REWARD -->
   <div class="lane">
-    <div class="laneTitle">Reward (per-agente, in env.step)</div>
+    <div class="laneTitle">Reward (per-agente, in env.step · unità map-independent, scan_norm≈1 disco sensore)</div>
     <div class="row">
-      <div class="box env"><b>KEEP</b><span class="io">novel_scan (privilegiato) · team_delta
-give/recv (rendezvous) · progress (PBRS BF)
-overlap · revisit · stall · completion · step_pen</span></div>
-      <div class="box env gone"><b>CUT (learned-head-only)</b><span class="io">target_switch_pen (B+D branch-flip)
-yield_bonus (J.2)
-_objective_switch_and_yield()</span></div>
+      <div class="box env"><b>Esplorazione</b><span class="io">+ α·novel_scan (privilegiato: solo celle
+  nuove all'UNIONE del team → separarsi paga)
+− γ·revisit · − δ·stall
++ completion (≥99%) · − step_penalty</span></div>
+      <span class="arrow">+</span>
+      <div class="box env"><b>Rendezvous denso <span class="tag new">RDV</span></b><span class="io">+ w·g·(φ_prev − φ_now)
+avvicinamento geodesico al compagno owed
+gate g = crescita RELATIVA della mia mappa
+  dall'ultimo sync (∆M / mappa-a-quel-sync)
+stesso g → agent_scalars (la policy decide)</span></div>
     </div>
+    <div class="note" style="text-align:center">Nessuna penalità di separazione/prossimità: il novel_scan privilegiato disperde già gli agenti (design constraint: mai "paura dell'unico corridoio").</div>
   </div>
 
 </div>
 
 <footer>
-  Tre disaccoppiamenti: (1) il planner BF analitico decide il target, la rete fa solo controllo locale (interfaccia = next-hop dir + utility in node_feat);
-  (2) encoder condiviso, due teste (actor decentralizzato / critic centralizzato);
+  Principi: (1) <b>policy appresa, non pianificata</b> — nessun target analitico né guidepost; la rete guida dalle feature del grafo (utility locale feat[2] + radar oltre-finestra feat[5]/[6]) e da 2 scalari di rendezvous;
+  (2) encoder condiviso, due teste (actor decentralizzato / critic centralizzato CTDE count-invariant);
   (3) <code>act()</code> (rollout, sampling) ≟ <code>evaluate_step_from_enc()</code> (update, replay) — stesso calcolo, due regimi.
-  &nbsp;·&nbsp; <span style="color:#ff7b72">CUT</span> = elementi vivi solo per la StrategicHead.
 </footer>
 </body>
 </html>

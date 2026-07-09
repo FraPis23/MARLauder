@@ -1,0 +1,291 @@
+############ PHASE 1: EASY  (128-step episodes, 2M steps) ############
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4080 Laptop GPU" (12 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.14.0
+Module env.world_warp e132c61 load on device 'cuda:0' took 0.54 ms  (cached)
+[train] iters=244  steps/iter=8192  total≈1,998,848
+[it    1/244] ep_end= 35.8%(ended= 32)  pg=-0.0026  v=5.4663  ent=1.658  kl=+0.0133  clip=28.9%  redun=0.87 stall=1% pair=0.13 sps=166(166avg)
+[it    2/244] ep_end= 36.8%(ended= 32)  pg=-0.0058  v=2.3541  ent=1.642  kl=+0.0080  clip=19.0%  redun=0.86 stall=1% pair=0.17 sps=163(165avg)
+[it    3/244] ep_end= 43.7%(ended= 32)  pg=-0.0027  v=1.1384  ent=1.651  kl=+0.0078  clip=14.5%  redun=0.72 stall=0% pair=0.19 sps=161(163avg)
+[it    4/244] ep_end= 48.7%(ended= 32)  pg=-0.0028  v=0.9462  ent=1.653  kl=+0.0057  clip=12.6%  redun=0.70 stall=0% pair=0.21 sps=160(162avg)
+[it    5/244] ep_end= 52.5%(ended= 32)  pg=-0.0028  v=1.2466  ent=1.648  kl=+0.0053  clip=14.2%  redun=0.61 stall=0% pair=0.24 sps=160(162avg)
+[it    6/244] ep_end= 61.8%(ended= 32)  pg=-0.0047  v=0.5718  ent=1.674  kl=+0.0048  clip=13.9%  redun=0.61 stall=0% pair=0.26 sps=158(161avg)
+[it    7/244] ep_end= 62.2%(ended= 36)  pg=-0.0009  v=1.5279  ent=1.640  kl=+0.0070  clip=15.8%  redun=0.62 stall=0% pair=0.24 sps=158(161avg)
+[it    8/244] ep_end= 67.3%(ended= 36)  pg=-0.0021  v=1.2894  ent=1.635  kl=+0.0075  clip=13.7%  redun=0.60 stall=1% pair=0.24 sps=158(160avg)
+[it    9/244] ep_end= 84.3%(ended= 45)  pg=-0.0035  v=1.8225  ent=1.586  kl=+0.0063  clip=12.1%  redun=0.52 stall=0% pair=0.28 sps=154(160avg)
+[it   10/244] ep_end= 76.1%(ended= 41)  pg=-0.0016  v=0.9321  ent=1.549  kl=+0.0050  clip=11.6%  redun=0.43 stall=0% pair=0.31 sps=150(159avg)
+[trace] auto_it0010  steps=128  explored=0.4723  → runs/radar097_easy_20260709_053422/traces/auto_it0010
+[inspector] auto trace captured (it=10) → inspector unlocked
+[evalsuite it=  10] score=+0.128±0.363  auc=0.672  imbN=0.496  fair=0.788  conc=0.23  idle=0.82  ov=0.36  duty=0.16  succ=0.28  s90=167
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_best.pt
+[best] new best eval/score=+0.128 at it=10 → ckpt_best.pt
+[it   11/244] ep_end= 81.7%(ended= 41)  pg=-0.0003  v=0.8943  ent=1.561  kl=+0.0062  clip=12.8%  redun=0.45 stall=0% pair=0.29 sps=151(158avg)
+[it   12/244] ep_end= 78.6%(ended= 44)  pg=-0.0018  v=0.9143  ent=1.489  kl=+0.0045  clip=7.7%  redun=0.38 stall=0% pair=0.33 sps=148(157avg)
+[it   13/244] ep_end= 76.4%(ended= 41)  pg=-0.0007  v=0.6093  ent=1.494  kl=+0.0063  clip=11.7%  redun=0.33 stall=0% pair=0.34 sps=147(156avg)
+[it   14/244] ep_end= 81.1%(ended= 48)  pg=+0.0005  v=0.9001  ent=1.466  kl=+0.0050  clip=12.4%  redun=0.37 stall=0% pair=0.31 sps=148(156avg)
+[it   15/244] ep_end= 84.7%(ended= 48)  pg=-0.0008  v=0.8169  ent=1.449  kl=+0.0063  clip=10.4%  redun=0.38 stall=0% pair=0.33 sps=148(155avg)
+[it   16/244] ep_end= 85.4%(ended= 47)  pg=-0.0027  v=0.7133  ent=1.392  kl=+0.0060  clip=11.4%  redun=0.33 stall=0% pair=0.33 sps=148(155avg)
+[it   17/244] ep_end= 89.2%(ended= 56)  pg=+0.0006  v=0.8029  ent=1.367  kl=+0.0087  clip=12.1%  redun=0.35 stall=0% pair=0.29 sps=147(154avg)
+[it   18/244] ep_end= 84.3%(ended= 47)  pg=+0.0006  v=0.5360  ent=1.361  kl=+0.0075  clip=10.9%  redun=0.30 stall=0% pair=0.33 sps=148(154avg)
+[it   19/244] ep_end= 88.7%(ended= 50)  pg=-0.0002  v=0.6252  ent=1.290  kl=+0.0089  clip=10.9%  redun=0.37 stall=0% pair=0.33 sps=145(153avg)
+[it   20/244] ep_end= 90.1%(ended= 55)  pg=+0.0005  v=0.6616  ent=1.318  kl=+0.0078  clip=12.4%  redun=0.35 stall=0% pair=0.33 sps=145(153avg)
+[evalsuite it=  20] score=+0.235±0.374  auc=0.728  imbN=0.481  fair=0.791  conc=0.35  idle=0.73  ov=0.28  duty=0.11  succ=0.47  s90=144
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_best.pt
+[best] new best eval/score=+0.235 at it=20 → ckpt_best.pt
+[it   21/244] ep_end= 92.5%(ended= 56)  pg=+0.0023  v=0.5980  ent=1.245  kl=+0.0092  clip=14.9%  redun=0.36 stall=0% pair=0.31 sps=149(153avg)
+[it   22/244] ep_end= 90.2%(ended= 46)  pg=-0.0011  v=0.4176  ent=1.248  kl=+0.0082  clip=12.3%  redun=0.30 stall=0% pair=0.34 sps=147(152avg)
+[it   23/244] ep_end= 95.6%(ended= 73)  pg=-0.0030  v=0.5152  ent=1.197  kl=+0.0050  clip=9.3%  redun=0.33 stall=0% pair=0.32 sps=147(152avg)
+[it   24/244] ep_end= 90.1%(ended= 53)  pg=-0.0007  v=0.2975  ent=1.235  kl=+0.0066  clip=10.4%  redun=0.31 stall=0% pair=0.32 sps=148(152avg)
+[it   25/244] ep_end= 91.4%(ended= 62)  pg=-0.0012  v=0.3833  ent=1.206  kl=+0.0075  clip=10.4%  redun=0.35 stall=0% pair=0.32 sps=148(152avg)
+[it   26/244] ep_end= 89.3%(ended= 47)  pg=+0.0004  v=0.2506  ent=1.193  kl=+0.0098  clip=13.2%  redun=0.36 stall=0% pair=0.32 sps=147(152avg)
+[it   27/244] ep_end= 91.9%(ended= 56)  pg=+0.0023  v=0.2877  ent=1.183  kl=+0.0108  clip=11.2%  redun=0.30 stall=0% pair=0.32 sps=147(151avg)
+[it   28/244] ep_end= 93.1%(ended= 62)  pg=+0.0002  v=0.1997  ent=1.131  kl=+0.0100  clip=12.4%  redun=0.37 stall=0% pair=0.31 sps=146(151avg)
+[it   29/244] ep_end= 90.7%(ended= 54)  pg=+0.0028  v=0.1352  ent=1.180  kl=+0.0114  clip=10.3%  redun=0.40 stall=0% pair=0.29 sps=145(151avg)
+[it   30/244] ep_end= 89.5%(ended= 46)  pg=-0.0007  v=0.1881  ent=1.199  kl=+0.0106  clip=10.5%  redun=0.38 stall=0% pair=0.30 sps=146(151avg)
+[evalsuite it=  30] score=+0.233±0.341  auc=0.748  imbN=0.491  fair=0.788  conc=0.39  idle=0.71  ov=0.37  duty=0.18  succ=0.56  s90=140
+[it   31/244] ep_end= 89.9%(ended= 58)  pg=-0.0019  v=0.1708  ent=1.164  kl=+0.0065  clip=7.8%  redun=0.34 stall=0% pair=0.31 sps=148(151avg)
+[it   32/244] ep_end= 93.4%(ended= 66)  pg=+0.0016  v=0.1934  ent=1.147  kl=+0.0116  clip=10.2%  redun=0.43 stall=0% pair=0.30 sps=147(151avg)
+[it   33/244] ep_end= 87.9%(ended= 53)  pg=-0.0012  v=0.1662  ent=1.175  kl=+0.0075  clip=7.8%  redun=0.40 stall=0% pair=0.28 sps=146(150avg)
+[it   34/244] ep_end= 92.2%(ended= 62)  pg=-0.0016  v=0.1806  ent=1.102  kl=+0.0076  clip=10.1%  redun=0.41 stall=0% pair=0.30 sps=146(150avg)
+[it   35/244] ep_end= 92.2%(ended= 59)  pg=-0.0006  v=0.1492  ent=1.098  kl=+0.0106  clip=9.5%  redun=0.38 stall=0% pair=0.30 sps=145(150avg)
+[it   36/244] ep_end= 92.1%(ended= 51)  pg=-0.0019  v=0.1627  ent=1.099  kl=+0.0101  clip=9.8%  redun=0.36 stall=0% pair=0.33 sps=147(150avg)
+[it   37/244] ep_end= 94.4%(ended= 62)  pg=+0.0024  v=0.0990  ent=1.062  kl=+0.0224  clip=10.2%  redun=0.36 stall=0% pair=0.32 sps=146(150avg)
+[it   38/244] ep_end= 92.4%(ended= 51)  pg=+0.0015  v=0.1291  ent=1.054  kl=+0.0142  clip=9.4%  redun=0.43 stall=0% pair=0.31 sps=145(150avg)
+[it   39/244] ep_end= 91.7%(ended= 58)  pg=+0.0016  v=0.1137  ent=1.061  kl=+0.0140  clip=9.9%  redun=0.38 stall=0% pair=0.32 sps=146(150avg)
+[it   40/244] ep_end= 94.1%(ended= 62)  pg=+0.0019  v=0.1947  ent=0.992  kl=+0.0236  clip=11.6%  redun=0.42 stall=0% pair=0.29 sps=145(150avg)
+[evalsuite it=  40] score=+0.055±0.469  auc=0.593  imbN=0.400  fair=0.839  conc=0.30  idle=0.79  ov=0.56  duty=0.43  succ=0.44  s90=157
+[it   41/244] ep_end= 95.9%(ended= 56)  pg=+0.0001  v=0.1776  ent=1.046  kl=+0.0143  clip=10.1%  redun=0.36 stall=0% pair=0.30 sps=146(149avg)
+[it   42/244] ep_end= 93.7%(ended= 52)  pg=-0.0020  v=0.0914  ent=1.061  kl=+0.0113  clip=9.0%  redun=0.42 stall=0% pair=0.30 sps=144(149avg)
+[it   43/244] ep_end= 94.7%(ended= 69)  pg=-0.0007  v=0.0935  ent=1.014  kl=+0.0126  clip=9.2%  redun=0.45 stall=0% pair=0.30 sps=145(149avg)
+[it   44/244] ep_end= 96.4%(ended= 63)  pg=-0.0017  v=0.1329  ent=0.952  kl=+0.0084  clip=8.6%  redun=0.45 stall=0% pair=0.31 sps=145(149avg)
+[it   45/244] ep_end= 94.3%(ended= 57)  pg=-0.0021  v=0.1373  ent=0.995  kl=+0.0130  clip=8.1%  redun=0.39 stall=0% pair=0.30 sps=146(149avg)
+[it   46/244] ep_end= 94.4%(ended= 65)  pg=-0.0003  v=0.1713  ent=1.018  kl=+0.0151  clip=9.9%  redun=0.41 stall=0% pair=0.28 sps=147(149avg)
+[it   47/244] ep_end= 95.6%(ended= 55)  pg=-0.0011  v=0.1328  ent=0.956  kl=+0.0128  clip=8.9%  redun=0.41 stall=0% pair=0.31 sps=145(149avg)
+[it   48/244] ep_end= 96.9%(ended= 69)  pg=+0.0050  v=0.2088  ent=0.961  kl=+0.0258  clip=13.6%  redun=0.40 stall=0% pair=0.30 sps=142(149avg)
+[it   49/244] ep_end= 93.9%(ended= 57)  pg=-0.0002  v=0.1236  ent=1.003  kl=+0.0136  clip=10.0%  redun=0.42 stall=0% pair=0.29 sps=146(149avg)
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_020.pt
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_020_m0.gif  map=2486  final_explored=70.3%  frames=128
+[trace] ckpt_020_m0  steps=128  explored=0.7033  → runs/radar097_easy_20260709_053422/traces/ckpt_020_m0
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_020_m1.gif  map=1393  final_explored=80.8%  frames=128
+[trace] ckpt_020_m1  steps=128  explored=0.8084  → runs/radar097_easy_20260709_053422/traces/ckpt_020_m1
+[it   50/244] ep_end= 93.3%(ended= 46)  pg=-0.0000  v=0.1229  ent=1.005  kl=+0.0189  clip=9.0%  redun=0.43 stall=0% pair=0.31 sps=150(149avg)
+[evalsuite it=  50] score=+0.154±0.387  auc=0.676  imbN=0.531  fair=0.760  conc=0.25  idle=0.81  ov=0.21  duty=0.08  succ=0.34  s90=160
+[it   51/244] ep_end= 96.1%(ended= 58)  pg=-0.0001  v=0.1117  ent=1.017  kl=+0.0119  clip=12.5%  redun=0.38 stall=0% pair=0.31 sps=148(149avg)
+[it   52/244] ep_end= 97.1%(ended= 64)  pg=+0.0023  v=0.0879  ent=0.976  kl=+0.0194  clip=12.3%  redun=0.35 stall=0% pair=0.32 sps=146(149avg)
+[it   53/244] ep_end= 96.4%(ended= 78)  pg=+0.0034  v=0.0757  ent=0.920  kl=+0.0233  clip=15.1%  redun=0.48 stall=0% pair=0.30 sps=146(149avg)
+[it   54/244] ep_end= 97.1%(ended= 64)  pg=-0.0015  v=0.0846  ent=0.989  kl=+0.0084  clip=8.4%  redun=0.38 stall=0% pair=0.32 sps=146(149avg)
+[it   55/244] ep_end= 95.3%(ended= 51)  pg=-0.0012  v=0.1050  ent=0.968  kl=+0.0164  clip=9.9%  redun=0.37 stall=0% pair=0.32 sps=146(149avg)
+[it   56/244] ep_end= 96.8%(ended= 63)  pg=-0.0008  v=0.1205  ent=0.969  kl=+0.0164  clip=10.8%  redun=0.44 stall=0% pair=0.29 sps=144(148avg)
+[it   57/244] ep_end= 95.2%(ended= 63)  pg=-0.0019  v=0.0952  ent=0.960  kl=+0.0115  clip=8.6%  redun=0.36 stall=0% pair=0.31 sps=146(148avg)
+[it   58/244] ep_end= 97.1%(ended= 68)  pg=+0.0001  v=0.0921  ent=0.927  kl=+0.0180  clip=11.0%  redun=0.42 stall=0% pair=0.30 sps=145(148avg)
+[it   59/244] ep_end= 97.6%(ended= 56)  pg=-0.0022  v=0.0905  ent=0.886  kl=+0.0330  clip=9.5%  redun=0.50 stall=0% pair=0.30 sps=147(148avg)
+[it   60/244] ep_end= 96.7%(ended= 63)  pg=-0.0015  v=0.0904  ent=0.923  kl=+0.0158  clip=8.7%  redun=0.47 stall=0% pair=0.29 sps=146(148avg)
+[evalsuite it=  60] score=+0.283±0.307  auc=0.763  imbN=0.446  fair=0.811  conc=0.39  idle=0.71  ov=0.32  duty=0.14  succ=0.59  s90=134
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_best.pt
+[best] new best eval/score=+0.283 at it=60 → ckpt_best.pt
+[it   61/244] ep_end= 96.9%(ended= 61)  pg=-0.0025  v=0.0694  ent=0.916  kl=+0.0139  clip=9.0%  redun=0.46 stall=0% pair=0.31 sps=145(148avg)
+[it   62/244] ep_end= 98.3%(ended= 66)  pg=-0.0013  v=0.0924  ent=0.901  kl=+0.0207  clip=10.3%  redun=0.50 stall=0% pair=0.30 sps=145(148avg)
+[it   63/244] ep_end= 96.1%(ended= 53)  pg=-0.0014  v=0.0719  ent=0.931  kl=+0.0108  clip=9.4%  redun=0.52 stall=0% pair=0.27 sps=144(148avg)
+[it   64/244] ep_end= 95.9%(ended= 56)  pg=-0.0000  v=0.0722  ent=0.966  kl=+0.0159  clip=9.8%  redun=0.38 stall=0% pair=0.31 sps=148(148avg)
+[it   65/244] ep_end= 96.8%(ended= 75)  pg=+0.0205  v=0.0917  ent=0.944  kl=+0.1219  clip=19.7%  redun=0.50 stall=0% pair=0.29 sps=142(148avg)
+[it   66/244] ep_end= 96.7%(ended= 60)  pg=-0.0013  v=0.0658  ent=0.960  kl=+0.0101  clip=9.0%  redun=0.39 stall=0% pair=0.32 sps=143(148avg)
+[it   67/244] ep_end= 96.5%(ended= 57)  pg=-0.0016  v=0.0683  ent=0.961  kl=+0.0074  clip=7.7%  redun=0.45 stall=0% pair=0.28 sps=143(148avg)
+[it   68/244] ep_end= 96.1%(ended= 69)  pg=-0.0013  v=0.0612  ent=0.938  kl=+0.0074  clip=7.5%  redun=0.49 stall=0% pair=0.29 sps=142(148avg)
+[it   69/244] ep_end= 96.2%(ended= 64)  pg=+0.0009  v=0.0658  ent=0.970  kl=+0.0201  clip=9.4%  redun=0.48 stall=0% pair=0.28 sps=144(148avg)
+[it   70/244] ep_end= 95.8%(ended= 67)  pg=+0.0010  v=0.0595  ent=0.983  kl=+0.0147  clip=11.6%  redun=0.41 stall=0% pair=0.30 sps=144(148avg)
+[evalsuite it=  70] score=+0.165±0.405  auc=0.676  imbN=0.429  fair=0.822  conc=0.40  idle=0.71  ov=0.47  duty=0.30  succ=0.53  s90=144
+[it   71/244] ep_end= 96.9%(ended= 65)  pg=-0.0004  v=0.0734  ent=0.916  kl=+0.0112  clip=10.3%  redun=0.39 stall=0% pair=0.31 sps=146(148avg)
+[it   72/244] ep_end= 97.6%(ended= 55)  pg=-0.0010  v=0.0755  ent=0.958  kl=+0.0115  clip=9.7%  redun=0.37 stall=0% pair=0.32 sps=148(148avg)
+[it   73/244] ep_end= 95.0%(ended= 66)  pg=+0.0039  v=0.0677  ent=0.967  kl=+0.0384  clip=12.6%  redun=0.46 stall=0% pair=0.30 sps=146(148avg)
+[it   74/244] ep_end= 96.7%(ended= 59)  pg=-0.0007  v=0.0826  ent=0.920  kl=+0.0170  clip=8.3%  redun=0.42 stall=0% pair=0.31 sps=145(148avg)
+[it   75/244] ep_end= 98.6%(ended= 58)  pg=-0.0013  v=0.0652  ent=0.858  kl=+0.0200  clip=10.0%  redun=0.42 stall=0% pair=0.32 sps=143(148avg)
+[it   76/244] ep_end= 97.5%(ended= 56)  pg=-0.0013  v=0.0741  ent=0.860  kl=+0.0187  clip=11.1%  redun=0.49 stall=0% pair=0.30 sps=144(147avg)
+[it   77/244] ep_end= 97.7%(ended= 68)  pg=+0.0108  v=0.0910  ent=0.841  kl=+0.0528  clip=14.1%  redun=0.51 stall=0% pair=0.31 sps=143(147avg)
+[it   78/244] ep_end= 98.9%(ended= 62)  pg=-0.0015  v=0.0782  ent=0.849  kl=+0.0122  clip=8.5%  redun=0.45 stall=0% pair=0.31 sps=145(147avg)
+[it   79/244] ep_end= 95.5%(ended= 56)  pg=-0.0030  v=0.0629  ent=0.912  kl=+0.0071  clip=7.4%  redun=0.43 stall=0% pair=0.31 sps=144(147avg)
+[it   80/244] ep_end= 98.0%(ended= 68)  pg=+0.0007  v=0.0784  ent=0.855  kl=+0.0191  clip=9.3%  redun=0.44 stall=0% pair=0.32 sps=145(147avg)
+[evalsuite it=  80] score=+0.194±0.377  auc=0.683  imbN=0.418  fair=0.836  conc=0.36  idle=0.73  ov=0.40  duty=0.12  succ=0.47  s90=149
+[it   81/244] ep_end= 96.3%(ended= 65)  pg=+0.0185  v=0.0754  ent=0.885  kl=+0.2600  clip=19.1%  redun=0.45 stall=0% pair=0.30 sps=149(147avg)
+[it   82/244] ep_end= 97.8%(ended= 51)  pg=-0.0031  v=0.0909  ent=0.873  kl=+0.0102  clip=6.7%  redun=0.42 stall=0% pair=0.32 sps=147(147avg)
+[it   83/244] ep_end= 96.7%(ended= 50)  pg=-0.0017  v=0.0764  ent=0.938  kl=+0.0086  clip=6.9%  redun=0.51 stall=0% pair=0.30 sps=143(147avg)
+[it   84/244] ep_end= 96.3%(ended= 65)  pg=-0.0025  v=0.0712  ent=0.854  kl=+0.0065  clip=6.0%  redun=0.45 stall=0% pair=0.30 sps=144(147avg)
+[it   85/244] ep_end= 97.7%(ended= 63)  pg=-0.0015  v=0.0794  ent=0.871  kl=+0.0110  clip=7.5%  redun=0.40 stall=0% pair=0.31 sps=144(147avg)
+[it   86/244] ep_end= 96.3%(ended= 59)  pg=-0.0017  v=0.0511  ent=0.943  kl=+0.0119  clip=6.3%  redun=0.43 stall=0% pair=0.30 sps=146(147avg)
+[it   87/244] ep_end= 96.4%(ended= 52)  pg=-0.0019  v=0.0699  ent=0.929  kl=+0.0109  clip=6.7%  redun=0.43 stall=0% pair=0.31 sps=144(147avg)
+[it   88/244] ep_end= 95.5%(ended= 63)  pg=-0.0014  v=0.0511  ent=0.944  kl=+0.0131  clip=8.5%  redun=0.43 stall=0% pair=0.30 sps=144(147avg)
+[it   89/244] ep_end= 97.7%(ended= 62)  pg=+0.0007  v=0.0741  ent=0.868  kl=+0.0227  clip=9.2%  redun=0.43 stall=0% pair=0.30 sps=145(147avg)
+[it   90/244] ep_end= 98.7%(ended= 65)  pg=-0.0015  v=0.0829  ent=0.928  kl=+0.0121  clip=8.2%  redun=0.40 stall=0% pair=0.30 sps=147(147avg)
+[evalsuite it=  90] score=+0.286±0.353  auc=0.732  imbN=0.370  fair=0.858  conc=0.41  idle=0.68  ov=0.37  duty=0.14  succ=0.47  s90=137
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_best.pt
+[best] new best eval/score=+0.286 at it=90 → ckpt_best.pt
+[it   91/244] ep_end= 96.3%(ended= 69)  pg=-0.0017  v=0.0808  ent=0.896  kl=+0.0188  clip=8.2%  redun=0.43 stall=0% pair=0.31 sps=148(147avg)
+[it   92/244] ep_end= 97.9%(ended= 62)  pg=-0.0025  v=0.0790  ent=0.875  kl=+0.0093  clip=7.1%  redun=0.43 stall=0% pair=0.31 sps=146(147avg)
+[it   93/244] ep_end= 96.5%(ended= 55)  pg=-0.0031  v=0.0538  ent=0.956  kl=+0.0069  clip=7.0%  redun=0.45 stall=0% pair=0.30 sps=145(147avg)
+[it   94/244] ep_end= 97.1%(ended= 54)  pg=-0.0029  v=0.0589  ent=0.901  kl=+0.0071  clip=7.1%  redun=0.43 stall=0% pair=0.30 sps=142(147avg)
+[it   95/244] ep_end= 97.2%(ended= 59)  pg=-0.0020  v=0.0696  ent=0.883  kl=+0.0113  clip=8.4%  redun=0.49 stall=0% pair=0.29 sps=144(147avg)
+[it   96/244] ep_end= 96.7%(ended= 57)  pg=-0.0015  v=0.0655  ent=0.889  kl=+0.0109  clip=9.6%  redun=0.47 stall=0% pair=0.29 sps=143(147avg)
+[it   97/244] ep_end= 97.5%(ended= 52)  pg=-0.0019  v=0.0912  ent=0.854  kl=+0.0151  clip=8.5%  redun=0.45 stall=0% pair=0.29 sps=145(147avg)
+[it   98/244] ep_end= 98.3%(ended= 65)  pg=-0.0014  v=0.0821  ent=0.828  kl=+0.0098  clip=7.8%  redun=0.49 stall=0% pair=0.29 sps=145(147avg)
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_040.pt
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_040_m0.gif  map=8080  final_explored=69.8%  frames=128
+[trace] ckpt_040_m0  steps=128  explored=0.698  → runs/radar097_easy_20260709_053422/traces/ckpt_040_m0
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_040_m1.gif  map=3798  final_explored=99.3%  frames=50
+[trace] ckpt_040_m1  steps=54  explored=0.9968  → runs/radar097_easy_20260709_053422/traces/ckpt_040_m1
+[it   99/244] ep_end= 97.3%(ended= 70)  pg=-0.0021  v=0.0630  ent=0.844  kl=+0.0142  clip=8.5%  redun=0.44 stall=0% pair=0.29 sps=149(147avg)
+[it  100/244] ep_end= 98.4%(ended= 57)  pg=+0.0020  v=0.0761  ent=0.824  kl=+0.0306  clip=10.8%  redun=0.50 stall=0% pair=0.30 sps=147(147avg)
+[evalsuite it= 100] score=+0.275±0.294  auc=0.738  imbN=0.407  fair=0.832  conc=0.39  idle=0.71  ov=0.33  duty=0.15  succ=0.50  s90=143
+[it  101/244] ep_end= 96.7%(ended= 68)  pg=+0.0027  v=0.0621  ent=0.886  kl=+0.0418  clip=12.1%  redun=0.58 stall=0% pair=0.28 sps=147(147avg)
+[it  102/244] ep_end= 96.8%(ended= 56)  pg=-0.0019  v=0.0659  ent=0.869  kl=+0.0077  clip=8.3%  redun=0.43 stall=0% pair=0.32 sps=147(147avg)
+[it  103/244] ep_end= 98.3%(ended= 62)  pg=-0.0012  v=0.0656  ent=0.871  kl=+0.0177  clip=9.6%  redun=0.46 stall=0% pair=0.30 sps=147(147avg)
+[it  104/244] ep_end= 97.6%(ended= 60)  pg=-0.0021  v=0.0703  ent=0.895  kl=+0.0151  clip=9.1%  redun=0.44 stall=0% pair=0.30 sps=146(147avg)
+[it  105/244] ep_end= 97.9%(ended= 65)  pg=-0.0019  v=0.0649  ent=0.882  kl=+0.0227  clip=11.0%  redun=0.47 stall=0% pair=0.30 sps=145(147avg)
+[it  106/244] ep_end= 98.0%(ended= 63)  pg=-0.0011  v=0.0830  ent=0.862  kl=+0.0323  clip=10.3%  redun=0.49 stall=0% pair=0.29 sps=141(147avg)
+[it  107/244] ep_end= 97.5%(ended= 65)  pg=-0.0021  v=0.0782  ent=0.850  kl=+0.0162  clip=8.8%  redun=0.45 stall=0% pair=0.30 sps=143(147avg)
+[it  108/244] ep_end= 98.0%(ended= 59)  pg=-0.0020  v=0.0695  ent=0.880  kl=+0.0145  clip=9.1%  redun=0.47 stall=0% pair=0.31 sps=144(147avg)
+[it  109/244] ep_end= 96.9%(ended= 62)  pg=-0.0015  v=0.0601  ent=0.898  kl=+0.0188  clip=8.7%  redun=0.49 stall=0% pair=0.28 sps=143(147avg)
+[it  110/244] ep_end= 96.4%(ended= 64)  pg=-0.0025  v=0.0649  ent=0.869  kl=+0.0133  clip=8.2%  redun=0.47 stall=0% pair=0.30 sps=147(147avg)
+[evalsuite it= 110] score=+0.228±0.364  auc=0.738  imbN=0.498  fair=0.781  conc=0.39  idle=0.70  ov=0.34  duty=0.17  succ=0.50  s90=134
+[it  111/244] ep_end= 96.0%(ended= 55)  pg=-0.0018  v=0.0594  ent=0.933  kl=+0.0120  clip=9.7%  redun=0.52 stall=0% pair=0.29 sps=147(147avg)
+[it  112/244] ep_end= 97.1%(ended= 75)  pg=-0.0010  v=0.0485  ent=0.887  kl=+0.0173  clip=10.2%  redun=0.43 stall=0% pair=0.28 sps=146(147avg)
+[it  113/244] ep_end= 96.4%(ended= 59)  pg=-0.0013  v=0.0694  ent=0.889  kl=+0.0238  clip=10.5%  redun=0.43 stall=0% pair=0.32 sps=146(147avg)
+[it  114/244] ep_end= 97.5%(ended= 66)  pg=-0.0018  v=0.0584  ent=0.877  kl=+0.0156  clip=9.7%  redun=0.42 stall=0% pair=0.30 sps=144(147avg)
+[it  115/244] ep_end= 96.7%(ended= 54)  pg=+0.0073  v=0.0606  ent=0.923  kl=+0.0487  clip=15.1%  redun=0.50 stall=0% pair=0.29 sps=145(147avg)
+[it  116/244] ep_end= 95.6%(ended= 57)  pg=+0.0013  v=0.0772  ent=0.911  kl=+0.0182  clip=11.0%  redun=0.47 stall=0% pair=0.31 sps=145(147avg)
+[it  117/244] ep_end= 97.8%(ended= 64)  pg=+0.0188  v=0.1007  ent=0.931  kl=+0.1102  clip=21.5%  redun=0.43 stall=0% pair=0.31 sps=145(147avg)
+[it  118/244] ep_end= 96.7%(ended= 49)  pg=-0.0026  v=0.0576  ent=0.976  kl=+0.0093  clip=8.1%  redun=0.41 stall=0% pair=0.32 sps=146(147avg)
+[it  119/244] ep_end= 96.2%(ended= 67)  pg=-0.0016  v=0.0583  ent=0.970  kl=+0.0069  clip=6.6%  redun=0.39 stall=0% pair=0.32 sps=144(147avg)
+[it  120/244] ep_end= 97.3%(ended= 65)  pg=-0.0006  v=0.0481  ent=0.925  kl=+0.0133  clip=8.3%  redun=0.38 stall=0% pair=0.32 sps=145(147avg)
+[evalsuite it= 120] score=+0.256±0.287  auc=0.766  imbN=0.491  fair=0.791  conc=0.36  idle=0.73  ov=0.33  duty=0.14  succ=0.59  s90=130
+[it  121/244] ep_end= 96.3%(ended= 61)  pg=-0.0027  v=0.0534  ent=0.932  kl=+0.0063  clip=6.2%  redun=0.37 stall=0% pair=0.30 sps=148(147avg)
+[it  122/244] ep_end= 96.1%(ended= 62)  pg=-0.0008  v=0.0515  ent=0.956  kl=+0.0105  clip=9.1%  redun=0.43 stall=0% pair=0.31 sps=145(147avg)
+[it  123/244] ep_end= 98.1%(ended= 61)  pg=-0.0023  v=0.0531  ent=0.900  kl=+0.0114  clip=7.7%  redun=0.34 stall=0% pair=0.31 sps=145(147avg)
+[it  124/244] ep_end= 97.5%(ended= 75)  pg=-0.0016  v=0.0772  ent=0.905  kl=+0.0164  clip=9.2%  redun=0.43 stall=0% pair=0.29 sps=145(147avg)
+[it  125/244] ep_end= 98.5%(ended= 66)  pg=-0.0019  v=0.0516  ent=0.938  kl=+0.0137  clip=8.5%  redun=0.49 stall=0% pair=0.29 sps=143(147avg)
+[it  126/244] ep_end= 96.6%(ended= 64)  pg=-0.0029  v=0.0666  ent=0.929  kl=+0.0144  clip=8.3%  redun=0.45 stall=0% pair=0.30 sps=145(147avg)
+[it  127/244] ep_end= 96.9%(ended= 69)  pg=-0.0027  v=0.0800  ent=0.928  kl=+0.0103  clip=9.0%  redun=0.47 stall=0% pair=0.30 sps=145(147avg)
+[it  128/244] ep_end= 96.8%(ended= 58)  pg=-0.0010  v=0.0819  ent=0.892  kl=+0.0177  clip=8.2%  redun=0.42 stall=0% pair=0.31 sps=145(147avg)
+[it  129/244] ep_end= 96.9%(ended= 65)  pg=-0.0017  v=0.0681  ent=0.916  kl=+0.0249  clip=8.5%  redun=0.45 stall=0% pair=0.31 sps=147(147avg)
+[it  130/244] ep_end= 96.6%(ended= 63)  pg=-0.0020  v=0.0861  ent=0.921  kl=+0.0157  clip=8.6%  redun=0.41 stall=0% pair=0.33 sps=148(147avg)
+[evalsuite it= 130] score=+0.238±0.356  auc=0.722  imbN=0.431  fair=0.825  conc=0.38  idle=0.70  ov=0.37  duty=0.20  succ=0.56  s90=145
+[it  131/244] ep_end= 96.4%(ended= 56)  pg=-0.0021  v=0.0623  ent=0.964  kl=+0.0222  clip=9.9%  redun=0.45 stall=0% pair=0.31 sps=148(147avg)
+[it  132/244] ep_end= 95.6%(ended= 60)  pg=+0.0006  v=0.0744  ent=0.946  kl=+0.0435  clip=11.9%  redun=0.47 stall=0% pair=0.31 sps=146(147avg)
+[it  133/244] ep_end= 95.7%(ended= 60)  pg=-0.0026  v=0.0797  ent=0.991  kl=+0.0138  clip=10.3%  redun=0.39 stall=0% pair=0.31 sps=146(147avg)
+[it  134/244] ep_end= 97.4%(ended= 57)  pg=-0.0006  v=0.0809  ent=0.945  kl=+0.0222  clip=11.3%  redun=0.38 stall=0% pair=0.33 sps=147(147avg)
+[it  135/244] ep_end= 97.4%(ended= 62)  pg=-0.0029  v=0.0937  ent=0.956  kl=+0.0210  clip=10.6%  redun=0.39 stall=0% pair=0.32 sps=145(147avg)
+[it  136/244] ep_end= 96.5%(ended= 55)  pg=-0.0023  v=0.0760  ent=0.938  kl=+0.0211  clip=10.7%  redun=0.43 stall=0% pair=0.32 sps=143(146avg)
+[it  137/244] ep_end= 97.6%(ended= 56)  pg=-0.0010  v=0.0807  ent=0.944  kl=+0.0343  clip=12.1%  redun=0.46 stall=0% pair=0.30 sps=144(146avg)
+[it  138/244] ep_end= 95.6%(ended= 57)  pg=-0.0015  v=0.0545  ent=0.923  kl=+0.0178  clip=10.2%  redun=0.43 stall=0% pair=0.31 sps=146(146avg)
+[it  139/244] ep_end= 97.8%(ended= 62)  pg=-0.0003  v=0.0916  ent=0.900  kl=+0.0212  clip=12.7%  redun=0.45 stall=0% pair=0.29 sps=144(146avg)
+[it  140/244] ep_end= 96.6%(ended= 67)  pg=-0.0016  v=0.0858  ent=0.968  kl=+0.0175  clip=11.7%  redun=0.43 stall=0% pair=0.30 sps=143(146avg)
+[evalsuite it= 140] score=+0.203±0.351  auc=0.726  imbN=0.483  fair=0.789  conc=0.36  idle=0.72  ov=0.40  duty=0.18  succ=0.59  s90=138
+[it  141/244] ep_end= 96.8%(ended= 57)  pg=-0.0024  v=0.0715  ent=0.967  kl=+0.0183  clip=10.9%  redun=0.43 stall=0% pair=0.31 sps=150(146avg)
+[it  142/244] ep_end= 94.7%(ended= 57)  pg=-0.0013  v=0.0779  ent=1.052  kl=+0.0124  clip=12.0%  redun=0.37 stall=0% pair=0.33 sps=149(146avg)
+[it  143/244] ep_end= 95.8%(ended= 67)  pg=-0.0021  v=0.0829  ent=0.979  kl=+0.0203  clip=12.3%  redun=0.40 stall=0% pair=0.31 sps=148(146avg)
+[it  144/244] ep_end= 96.3%(ended= 54)  pg=+0.0024  v=0.0590  ent=1.001  kl=+0.0288  clip=14.7%  redun=0.40 stall=0% pair=0.32 sps=146(146avg)
+[it  145/244] ep_end= 96.9%(ended= 61)  pg=-0.0034  v=0.0513  ent=0.970  kl=+0.0112  clip=9.4%  redun=0.45 stall=0% pair=0.32 sps=146(146avg)
+[it  146/244] ep_end= 97.7%(ended= 56)  pg=-0.0033  v=0.0647  ent=0.979  kl=+0.0118  clip=9.4%  redun=0.37 stall=0% pair=0.32 sps=146(146avg)
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_060.pt
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_060_m0.gif  map=4557  final_explored=38.2%  frames=128
+[trace] ckpt_060_m0  steps=128  explored=0.3819  → runs/radar097_easy_20260709_053422/traces/ckpt_060_m0
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_060_m1.gif  map=7970  final_explored=99.0%  frames=33
+[trace] ckpt_060_m1  steps=31  explored=0.9948  → runs/radar097_easy_20260709_053422/traces/ckpt_060_m1
+[it  147/244] ep_end= 97.4%(ended= 67)  pg=-0.0018  v=0.1113  ent=1.002  kl=+0.0183  clip=13.3%  redun=0.43 stall=0% pair=0.32 sps=151(146avg)
+[it  148/244] ep_end= 96.4%(ended= 62)  pg=-0.0034  v=0.0674  ent=0.988  kl=+0.0119  clip=10.4%  redun=0.42 stall=0% pair=0.33 sps=149(147avg)
+[it  149/244] ep_end= 96.2%(ended= 59)  pg=-0.0009  v=0.0522  ent=1.017  kl=+0.0196  clip=15.3%  redun=0.37 stall=0% pair=0.33 sps=148(147avg)
+[it  150/244] ep_end= 96.6%(ended= 58)  pg=-0.0010  v=0.0519  ent=0.940  kl=+0.0199  clip=11.8%  redun=0.39 stall=0% pair=0.32 sps=147(147avg)
+[evalsuite it= 150] score=+0.083±0.423  auc=0.647  imbN=0.537  fair=0.762  conc=0.25  idle=0.81  ov=0.37  duty=0.25  succ=0.50  s90=155
+[it  151/244] ep_end= 98.2%(ended= 86)  pg=+0.0009  v=0.0674  ent=0.904  kl=+0.0227  clip=15.3%  redun=0.44 stall=0% pair=0.31 sps=147(147avg)
+[it  152/244] ep_end= 97.5%(ended= 56)  pg=-0.0029  v=0.0794  ent=1.004  kl=+0.0117  clip=13.6%  redun=0.34 stall=0% pair=0.32 sps=150(147avg)
+[it  153/244] ep_end= 94.6%(ended= 55)  pg=-0.0022  v=0.0768  ent=0.982  kl=+0.0129  clip=11.7%  redun=0.41 stall=0% pair=0.30 sps=147(147avg)
+[it  154/244] ep_end= 94.4%(ended= 55)  pg=-0.0044  v=0.0509  ent=0.991  kl=+0.0116  clip=11.5%  redun=0.45 stall=0% pair=0.31 sps=149(147avg)
+[it  155/244] ep_end= 96.0%(ended= 60)  pg=-0.0019  v=0.0657  ent=0.986  kl=+0.0175  clip=12.4%  redun=0.37 stall=0% pair=0.33 sps=147(147avg)
+[it  156/244] ep_end= 95.8%(ended= 71)  pg=-0.0032  v=0.0426  ent=0.986  kl=+0.0182  clip=12.4%  redun=0.44 stall=0% pair=0.31 sps=149(147avg)
+[it  157/244] ep_end= 97.8%(ended= 65)  pg=-0.0037  v=0.0579  ent=0.962  kl=+0.0158  clip=12.6%  redun=0.42 stall=0% pair=0.30 sps=147(147avg)
+[it  158/244] ep_end= 95.5%(ended= 56)  pg=+0.0379  v=0.0706  ent=1.065  kl=+0.1497  clip=34.1%  redun=0.43 stall=0% pair=0.30 sps=148(147avg)
+[it  159/244] ep_end= 97.5%(ended= 60)  pg=-0.0042  v=0.0565  ent=1.020  kl=+0.0090  clip=8.8%  redun=0.31 stall=0% pair=0.34 sps=147(147avg)
+[it  160/244] ep_end= 96.4%(ended= 47)  pg=-0.0021  v=0.0769  ent=1.030  kl=+0.0100  clip=8.8%  redun=0.37 stall=0% pair=0.33 sps=150(147avg)
+[evalsuite it= 160] score=+0.305±0.373  auc=0.754  imbN=0.377  fair=0.851  conc=0.50  idle=0.62  ov=0.42  duty=0.26  succ=0.62  s90=128
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_best.pt
+[best] new best eval/score=+0.305 at it=160 → ckpt_best.pt
+[it  161/244] ep_end= 96.9%(ended= 62)  pg=-0.0030  v=0.0837  ent=1.009  kl=+0.0123  clip=8.5%  redun=0.37 stall=0% pair=0.31 sps=150(147avg)
+[it  162/244] ep_end= 96.6%(ended= 60)  pg=-0.0033  v=0.0786  ent=1.018  kl=+0.0088  clip=8.6%  redun=0.37 stall=0% pair=0.31 sps=149(147avg)
+[it  163/244] ep_end= 97.7%(ended= 61)  pg=-0.0005  v=0.0704  ent=0.955  kl=+0.0172  clip=10.1%  redun=0.41 stall=0% pair=0.31 sps=148(147avg)
+[it  164/244] ep_end= 98.0%(ended= 60)  pg=-0.0039  v=0.0674  ent=0.954  kl=+0.0088  clip=7.7%  redun=0.41 stall=0% pair=0.32 sps=146(147avg)
+[it  165/244] ep_end= 97.2%(ended= 53)  pg=-0.0015  v=0.0605  ent=0.971  kl=+0.0102  clip=10.0%  redun=0.39 stall=0% pair=0.32 sps=147(147avg)
+[it  166/244] ep_end= 97.8%(ended= 66)  pg=-0.0033  v=0.0688  ent=0.929  kl=+0.0116  clip=9.4%  redun=0.48 stall=0% pair=0.29 sps=147(147avg)
+[it  167/244] ep_end= 97.1%(ended= 55)  pg=-0.0044  v=0.0460  ent=0.919  kl=+0.0115  clip=9.2%  redun=0.51 stall=0% pair=0.29 sps=148(147avg)
+[it  168/244] ep_end= 98.4%(ended= 69)  pg=-0.0028  v=0.0419  ent=0.933  kl=+0.0157  clip=11.3%  redun=0.46 stall=0% pair=0.30 sps=148(147avg)
+[it  169/244] ep_end= 97.0%(ended= 51)  pg=+0.0008  v=0.0697  ent=0.909  kl=+0.0200  clip=11.2%  redun=0.45 stall=0% pair=0.31 sps=148(147avg)
+[it  170/244] ep_end= 97.2%(ended= 63)  pg=-0.0034  v=0.0579  ent=0.933  kl=+0.0101  clip=9.4%  redun=0.49 stall=0% pair=0.28 sps=149(147avg)
+[evalsuite it= 170] score=+0.228±0.359  auc=0.713  imbN=0.441  fair=0.814  conc=0.37  idle=0.71  ov=0.35  duty=0.17  succ=0.59  s90=138
+[it  171/244] ep_end= 98.1%(ended= 69)  pg=-0.0017  v=0.0640  ent=0.886  kl=+0.0156  clip=11.7%  redun=0.53 stall=0% pair=0.28 sps=148(147avg)
+[it  172/244] ep_end= 97.7%(ended= 58)  pg=+0.0034  v=0.0604  ent=0.926  kl=+0.0223  clip=13.6%  redun=0.44 stall=0% pair=0.30 sps=147(147avg)
+[it  173/244] ep_end= 97.3%(ended= 55)  pg=-0.0042  v=0.0528  ent=0.950  kl=+0.0101  clip=9.9%  redun=0.43 stall=0% pair=0.31 sps=149(147avg)
+[it  174/244] ep_end= 96.3%(ended= 62)  pg=-0.0034  v=0.0496  ent=0.963  kl=+0.0129  clip=11.2%  redun=0.43 stall=0% pair=0.31 sps=146(147avg)
+[it  175/244] ep_end= 97.6%(ended= 53)  pg=-0.0042  v=0.0537  ent=0.881  kl=+0.0085  clip=8.0%  redun=0.40 stall=0% pair=0.33 sps=149(147avg)
+[it  176/244] ep_end= 99.0%(ended= 75)  pg=-0.0026  v=0.0587  ent=0.906  kl=+0.0093  clip=9.4%  redun=0.40 stall=0% pair=0.31 sps=147(147avg)
+[it  177/244] ep_end= 98.7%(ended= 70)  pg=-0.0028  v=0.0503  ent=0.884  kl=+0.0152  clip=11.1%  redun=0.45 stall=0% pair=0.29 sps=146(147avg)
+[it  178/244] ep_end= 96.9%(ended= 64)  pg=-0.0006  v=0.0734  ent=0.928  kl=+0.0129  clip=12.1%  redun=0.48 stall=0% pair=0.30 sps=148(147avg)
+[it  179/244] ep_end= 97.4%(ended= 57)  pg=-0.0042  v=0.0685  ent=0.912  kl=+0.0087  clip=10.2%  redun=0.42 stall=0% pair=0.30 sps=147(147avg)
+[it  180/244] ep_end= 97.8%(ended= 56)  pg=-0.0034  v=0.0683  ent=0.928  kl=+0.0108  clip=11.9%  redun=0.45 stall=0% pair=0.29 sps=147(147avg)
+[evalsuite it= 180] score=+0.199±0.367  auc=0.707  imbN=0.478  fair=0.792  conc=0.32  idle=0.76  ov=0.31  duty=0.16  succ=0.47  s90=146
+[it  181/244] ep_end= 95.4%(ended= 56)  pg=-0.0024  v=0.0566  ent=0.940  kl=+0.0151  clip=12.8%  redun=0.50 stall=0% pair=0.28 sps=153(147avg)
+[it  182/244] ep_end= 96.7%(ended= 62)  pg=+0.0005  v=0.0531  ent=0.919  kl=+0.0230  clip=12.0%  redun=0.42 stall=0% pair=0.30 sps=153(147avg)
+[it  183/244] ep_end= 95.4%(ended= 57)  pg=-0.0010  v=0.0495  ent=0.988  kl=+0.0107  clip=11.2%  redun=0.49 stall=0% pair=0.27 sps=151(147avg)
+[it  184/244] ep_end= 97.3%(ended= 65)  pg=-0.0041  v=0.0555  ent=0.922  kl=+0.0119  clip=11.0%  redun=0.46 stall=0% pair=0.29 sps=151(147avg)
+[it  185/244] ep_end= 96.4%(ended= 54)  pg=+0.0010  v=0.0496  ent=0.975  kl=+0.0285  clip=16.0%  redun=0.46 stall=0% pair=0.30 sps=151(147avg)
+[it  186/244] ep_end= 96.1%(ended= 67)  pg=-0.0038  v=0.0598  ent=0.943  kl=+0.0120  clip=10.5%  redun=0.41 stall=0% pair=0.30 sps=151(147avg)
+[it  187/244] ep_end= 98.0%(ended= 55)  pg=-0.0024  v=0.0446  ent=0.876  kl=+0.0170  clip=8.8%  redun=0.46 stall=0% pair=0.29 sps=152(147avg)
+[it  188/244] ep_end= 96.1%(ended= 57)  pg=+0.0032  v=0.0548  ent=0.903  kl=+0.0372  clip=11.8%  redun=0.50 stall=0% pair=0.29 sps=151(147avg)
+[it  189/244] ep_end= 97.1%(ended= 78)  pg=+0.0017  v=0.0599  ent=0.837  kl=+0.0241  clip=11.6%  redun=0.51 stall=0% pair=0.28 sps=151(147avg)
+[it  190/244] ep_end= 98.1%(ended= 59)  pg=-0.0011  v=0.0581  ent=0.866  kl=+0.0232  clip=10.2%  redun=0.46 stall=0% pair=0.30 sps=154(147avg)
+[evalsuite it= 190] score=+0.222±0.354  auc=0.715  imbN=0.397  fair=0.841  conc=0.38  idle=0.72  ov=0.46  duty=0.20  succ=0.50  s90=152
+[it  191/244] ep_end= 97.8%(ended= 60)  pg=-0.0017  v=0.0515  ent=0.893  kl=+0.0143  clip=10.0%  redun=0.43 stall=0% pair=0.32 sps=148(147avg)
+[it  192/244] ep_end= 97.9%(ended= 71)  pg=-0.0024  v=0.0576  ent=0.869  kl=+0.0179  clip=10.4%  redun=0.48 stall=0% pair=0.28 sps=148(147avg)
+[it  193/244] ep_end= 96.8%(ended= 64)  pg=-0.0015  v=0.0549  ent=0.895  kl=+0.0166  clip=11.2%  redun=0.47 stall=0% pair=0.28 sps=145(147avg)
+[it  194/244] ep_end= 97.4%(ended= 55)  pg=-0.0021  v=0.0687  ent=0.875  kl=+0.0136  clip=10.7%  redun=0.40 stall=0% pair=0.32 sps=147(147avg)
+[it  195/244] ep_end= 98.3%(ended= 58)  pg=+0.0026  v=0.0608  ent=0.870  kl=+0.0280  clip=14.0%  redun=0.46 stall=0% pair=0.29 sps=147(147avg)
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_080.pt
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_080_m0.gif  map=3825  final_explored=99.2%  frames=26
+[trace] ckpt_080_m0  steps=61  explored=0.9976  → runs/radar097_easy_20260709_053422/traces/ckpt_080_m0
+[eval] runs/radar097_easy_20260709_053422/eval_ckpt_080_m1.gif  map=8793  final_explored=39.5%  frames=128
+[trace] ckpt_080_m1  steps=128  explored=0.395  → runs/radar097_easy_20260709_053422/traces/ckpt_080_m1
+[it  196/244] ep_end= 97.5%(ended= 66)  pg=+0.0019  v=0.0519  ent=0.876  kl=+0.0193  clip=14.3%  redun=0.52 stall=0% pair=0.29 sps=149(147avg)
+[it  197/244] ep_end= 96.7%(ended= 62)  pg=+0.0017  v=0.0700  ent=0.903  kl=+0.0226  clip=11.3%  redun=0.49 stall=0% pair=0.29 sps=145(147avg)
+[it  198/244] ep_end= 97.5%(ended= 70)  pg=+0.0019  v=0.0607  ent=0.905  kl=+0.0274  clip=12.3%  redun=0.44 stall=0% pair=0.29 sps=139(147avg)
+[it  199/244] ep_end= 97.8%(ended= 61)  pg=-0.0039  v=0.0630  ent=0.911  kl=+0.0152  clip=11.1%  redun=0.44 stall=0% pair=0.29 sps=146(147avg)
+[it  200/244] ep_end= 97.3%(ended= 67)  pg=-0.0028  v=0.0480  ent=0.901  kl=+0.0163  clip=10.5%  redun=0.48 stall=0% pair=0.28 sps=146(147avg)
+[evalsuite it= 200] score=+0.103±0.369  auc=0.572  imbN=0.354  fair=0.866  conc=0.32  idle=0.78  ov=0.38  duty=0.17  succ=0.44  s90=168
+[it  201/244] ep_end= 96.8%(ended= 64)  pg=+0.0026  v=0.0511  ent=0.961  kl=+0.0324  clip=14.1%  redun=0.45 stall=0% pair=0.28 sps=149(147avg)
+[it  202/244] ep_end= 94.7%(ended= 57)  pg=-0.0008  v=0.0593  ent=0.926  kl=+0.0245  clip=13.3%  redun=0.47 stall=0% pair=0.28 sps=148(147avg)
+[it  203/244] ep_end= 97.0%(ended= 70)  pg=+0.0068  v=0.0548  ent=0.888  kl=+0.0484  clip=15.2%  redun=0.51 stall=0% pair=0.30 sps=147(147avg)
+[it  204/244] ep_end= 96.9%(ended= 60)  pg=-0.0034  v=0.0563  ent=0.917  kl=+0.0125  clip=9.8%  redun=0.41 stall=0% pair=0.31 sps=147(147avg)
+[it  205/244] ep_end= 97.7%(ended= 67)  pg=-0.0046  v=0.0510  ent=0.882  kl=+0.0115  clip=9.3%  redun=0.44 stall=0% pair=0.30 sps=148(147avg)
+[it  206/244] ep_end= 97.6%(ended= 60)  pg=-0.0030  v=0.0488  ent=0.880  kl=+0.0155  clip=10.6%  redun=0.46 stall=0% pair=0.30 sps=146(147avg)
+[it  207/244] ep_end= 98.8%(ended= 69)  pg=+0.0077  v=0.0467  ent=0.813  kl=+0.0482  clip=14.7%  redun=0.47 stall=0% pair=0.29 sps=148(147avg)
+[it  208/244] ep_end= 98.3%(ended= 60)  pg=-0.0043  v=0.0568  ent=0.889  kl=+0.0155  clip=8.5%  redun=0.38 stall=0% pair=0.33 sps=146(147avg)
+[it  209/244] ep_end= 98.1%(ended= 63)  pg=-0.0039  v=0.0532  ent=0.879  kl=+0.0141  clip=10.2%  redun=0.48 stall=0% pair=0.30 sps=147(147avg)
+[it  210/244] ep_end= 96.5%(ended= 48)  pg=-0.0011  v=0.0626  ent=0.836  kl=+0.0175  clip=10.0%  redun=0.49 stall=0% pair=0.32 sps=147(147avg)
+[evalsuite it= 210] score=+0.317±0.298  auc=0.756  imbN=0.311  fair=0.885  conc=0.46  idle=0.65  ov=0.48  duty=0.28  succ=0.66  s90=131
+[ckpt] runs/radar097_easy_20260709_053422/ckpt_best.pt
+[best] new best eval/score=+0.317 at it=210 → ckpt_best.pt
+[it  211/244] ep_end= 97.9%(ended= 67)  pg=-0.0027  v=0.0515  ent=0.889  kl=+0.0146  clip=11.0%  redun=0.40 stall=0% pair=0.29 sps=149(147avg)
+[it  212/244] ep_end= 98.6%(ended= 67)  pg=+0.0035  v=0.0699  ent=0.892  kl=+0.0285  clip=14.1%  redun=0.48 stall=0% pair=0.30 sps=147(147avg)
+[it  213/244] ep_end= 97.6%(ended= 75)  pg=+0.0007  v=0.0560  ent=0.894  kl=+0.0163  clip=11.6%  redun=0.50 stall=0% pair=0.27 sps=146(147avg)
+[it  214/244] ep_end= 96.2%(ended= 59)  pg=-0.0018  v=0.0483  ent=0.915  kl=+0.0160  clip=9.3%  redun=0.43 stall=0% pair=0.30 sps=147(147avg)
+[it  215/244] ep_end= 98.0%(ended= 63)  pg=+0.0005  v=0.0624  ent=0.886  kl=+0.0224  clip=11.5%  redun=0.43 stall=0% pair=0.31 sps=148(147avg)
+[it  216/244] ep_end= 98.1%(ended= 69)  pg=-0.0017  v=0.0569  ent=0.873  kl=+0.0237  clip=11.6%  redun=0.48 stall=0% pair=0.29 sps=147(147avg)
+[it  217/244] ep_end= 97.4%(ended= 57)  pg=-0.0003  v=0.0609  ent=0.904  kl=+0.0188  clip=12.2%  redun=0.47 stall=0% pair=0.29 sps=145(147avg)
+[it  218/244] ep_end= 98.1%(ended= 63)  pg=-0.0021  v=0.0518  ent=0.886  kl=+0.0157  clip=11.2%  redun=0.45 stall=0% pair=0.30 sps=146(147avg)
+[it  219/244] ep_end= 97.9%(ended= 59)  pg=+0.0004  v=0.0565  ent=0.930  kl=+0.0181  clip=12.3%  redun=0.46 stall=0% pair=0.30 sps=148(147avg)
+[it  220/244] ep_end= 98.3%(ended= 68)  pg=-0.0032  v=0.0636  ent=0.924  kl=+0.0107  clip=11.7%  redun=0.46 stall=0% pair=0.31 sps=146(147avg)
+[evalsuite it= 220] score=+0.296±0.306  auc=0.755  imbN=0.371  fair=0.856  conc=0.44  idle=0.68  ov=0.42  duty=0.19  succ=0.62  s90=130
+[it  221/244] ep_end= 95.1%(ended= 57)  pg=-0.0044  v=0.0430  ent=0.930  kl=+0.0162  clip=11.1%  redun=0.52 stall=0% pair=0.29 sps=150(147avg)
+[it  222/244] ep_end= 96.9%(ended= 54)  pg=-0.0003  v=0.0507  ent=0.937  kl=+0.0143  clip=12.4%  redun=0.47 stall=0% pair=0.31 sps=148(147avg)
+[it  223/244] ep_end= 97.4%(ended= 60)  pg=-0.0049  v=0.0681  ent=0.949  kl=+0.0141  clip=11.6%  redun=0.47 stall=0% pair=0.28 sps=148(147avg)
+[it  224/244] ep_end= 97.3%(ended= 63)  pg=-0.0009  v=0.0610  ent=0.972  kl=+0.0137  clip=15.0%  redun=0.42 stall=0% pair=0.31 sps=149(147avg)
+[it  225/244] ep_end= 97.8%(ended= 61)  pg=+0.0009  v=0.0490  ent=0.900  kl=+0.0224  clip=14.4%  redun=0.46 stall=0% pair=0.31 sps=150(147avg)

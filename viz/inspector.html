@@ -37,7 +37,6 @@
   .cell .fill{position:absolute;left:0;width:100%;z-index:0}
   .cell .zero{position:absolute;left:0;top:50%;width:100%;height:1px;background:#5b677e;opacity:.7;z-index:0}
   .cell .val{position:relative;z-index:1;text-shadow:0 1px 3px #000,0 0 2px #000}
-  .cell .gpf{position:absolute;top:2px;right:4px;z-index:1;font-size:11px;color:#fff;text-shadow:0 0 3px #000}
   .cell.mid{background:#11151d;color:#3a455c;font-weight:400}
   .cell.masked{opacity:.35}
   .cell.chosen{outline:2px solid var(--ok);outline-offset:-2px}
@@ -93,8 +92,6 @@
       <option value="uv">util · detectable vol</option>
       <option value="age">age</option>
       <option value="team">teammate_pot</option>
-      <option value="gp">guidepost</option>
-      <option value="bf">bf_dist→target</option>
       <option value="bu">radar · utility (out-of-window)</option>
       <option value="bt">radar · teammate (out-of-window)</option>
     </select></label>
@@ -260,7 +257,7 @@ async function loadTrace(url){
   for(let a=0;a<A.trace.meta.n_agents;a++){ const o=document.createElement("option"); o.value=a;o.text="agent "+a; $("agent").add(o);}
   populateAttnControls();
   A.t=0; A.agent=0; A.actSel=null; A.sel=null; render();
-  $("hint").textContent = `map ${A.trace.meta.map_idx} · ${A.trace.steps.length} steps · gate_eps=${A.trace.meta.gate_eps} · ${A.trace.meta.target_mode}`;
+  $("hint").textContent = `map ${A.trace.meta.map_idx} · ${A.trace.steps.length} steps`;
 }
 
 // Short label for head h from its A2 raw-feature group (real config): e.g. "geometry", "utility".
@@ -371,9 +368,6 @@ function drawNodes(){
     ctx.beginPath(); ctx.arc(n.x,n.y, rad, 0, 6.283); ctx.fill();
     ctx.lineWidth=0.6; ctx.strokeStyle="#000"; ctx.stroke();
   }
-  // target ring
-  const tgt = ag.nodes.find(n=>n.i===ag.target);
-  if(tgt){ ctx.strokeStyle=getCSS("--amber"); ctx.lineWidth=2.5; ctx.beginPath(); ctx.arc(tgt.x,tgt.y,9,0,6.283); ctx.stroke(); }
   // curr disc (filled, at actual current position) + chosen-action arrow
   const cur = ag.nodes.find(n=>n.i===ag.curr) || {x:ag.pos[0],y:ag.pos[1]};
   ctx.fillStyle=acol(A.agent); ctx.beginPath(); ctx.arc(cur.x,cur.y,6,0,6.283); ctx.fill();   // own palette color
@@ -654,8 +648,7 @@ function panels(){
     ? `<tr><td colspan=2 style="text-align:center;color:var(--ok);font-weight:600;padding:5px 0;border-bottom:1px solid var(--ok)">✓ EPISODE COMPLETE · full map (both agents)</td></tr>`
     : "";
   $("meta").innerHTML = banner + row("step",A.t)+row("agent",A.agent)+row("value",ag.value)
-    +`<tr><td class=k>gate</td><td class=v><span class="pill ${ag.gate?'on':'off'}">${ag.gate?'STRATEGIC (local exhausted)':'LOCAL (climb)'}</span></td></tr>`
-    +row("curr node",ag.curr)+row("target node",ag.target)+row("chosen action",ag.action);
+    +row("curr node",ag.curr)+row("chosen action",ag.action);
   // communication: per teammate, live (knows true pos) vs estimate (stale belief).
   const tms=ag.teammates||[];
   $("comm").innerHTML = tms.length ? tms.map(tm=>{
@@ -677,20 +670,20 @@ function panels(){
     const fin_v=(v!==null&&Math.abs(v)<9000);
     const frac=fin_v?Math.max(-1,Math.min(1,v/scale)):0;     // [-1,1]; sign = direction
     const h=Math.round(Math.abs(frac)*50);                    // % of half-cell height
-    const chosen=(k===ag.action), gp=ag.guidepost_dir[k]>0.01, sel=(k===A.actSel);
+    const chosen=(k===ag.action), sel=(k===A.actSel);
     const posc = chosen? getCSS('--ok') : '#365275';          // positive: muted blue (green if chosen)
     const negc = '#9c4a58';                                   // negative: muted red
     const fillStyle = frac>=0
       ? `bottom:50%;height:${h}%;background:${posc}`
       : `top:50%;height:${h}%;background:${negc}`;
     const cls = `cell${masked?' masked':''}${chosen?' chosen':''}${sel?' sel':''}`;
-    return `<div class="${cls}" data-k="${k}" title="dir ${k} logit=${v}${masked?' [masked]':''}${gp?' [guidepost]':''}">
+    return `<div class="${cls}" data-k="${k}" title="dir ${k} logit=${v}${masked?' [masked]':''}">
       <div class="zero"></div>
       <div class="fill" style="${fillStyle};opacity:.55"></div>
-      <span class="val">${fin_v?v.toFixed(2):'—'}</span>${gp?'<span class="gpf">→</span>':''}</div>`;
+      <span class="val">${fin_v?v.toFixed(2):'—'}</span></div>`;
   }).join("");
   $("hint2").innerHTML = `Raw pointer scores over the 8 move-neighbours (the actor samples a direction from these). `
-    + `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; → guidepost dir &nbsp;·&nbsp; faded = masked.`
+    + `<span class="swatch" style="background:${getCSS('--ok')}"></span>chosen &nbsp;·&nbsp; faded = masked.`
     + `<br>Bar diverges from mid-line: <span style="color:#365275">▲ positive (up)</span> &nbsp; <span style="color:#9c4a58">▼ negative (down)</span>.`
     + `<br><b>Click a cell</b> → selects that neighbour node & shows its GAT attention below.`;
   // reward — component terms first, then a separator, then `total` as the sum result.
@@ -729,9 +722,9 @@ function showNode(){
   const buv = n.bu!=null?row("radar util (out-of-win)",n.bu):"";
   const btv = n.bt!=null?row("radar teammate (out-of-win)",n.bt):"";
   $("node").innerHTML = row("utility (diffused)",n.util)+ubv+uvv
-    +row("age",n.age)+row("teammate_pot",n.team)+row("guidepost",n.gp)+row("bf→target (nodes)",n.bf)
+    +row("age",n.age)+row("teammate_pot",n.team)
     +buv+btv
-    + (n.i===ag.curr?row("•","CURR"):"") + (n.i===ag.target?row("•","TARGET"):"");
+    + (n.i===ag.curr?row("•","CURR"):"");
 }
 
 // REAL GAT attention for the SELECTED node. For the chosen layer(hop)+head, shows the exact

@@ -4,6 +4,134 @@ Session-based log of design decisions, architectural understanding, observed pro
 
 ---
 
+## Session 2026-07-09 — perf: batched-agents env build + bf16 AMP (+41% sps)
+
+Two of the four proposed optimizations applied (user approved #1/#2; #3 checkpointing deferred
+until VRAM is the binder, #4 compile candidate next):
+
+1. **Agents batched into the batch dim in `_refresh_obs`** (`env/explorer.py`). All GraphLattice
+   ops are batch-agnostic on their leading dim, so Pass 1 (build + BF-from-curr + radar +
+   teammate BF), Pass 2 (feat[4] potential) and Pass 3 (window extract) now run ONCE on
+   B = N·M instead of M sequential calls. `_bf_from_teammates` rewritten batched (one BF per
+   teammate SLOT, M-1 total, warm-start caches preserved via reshape views); new static
+   `_others_idx [M, M-1]` table. Render stash uses `[B]→[N,M]` views instead of stacks.
+   **Verified bit-identical obs/rewards** vs the pre-refactor code on a seeded 30-step +
+   snapshot harness (gotcha found on the way: `Explorer.rng = np.random.default_rng()` at
+   explorer.py:163 is UNSEEDED → spawn/maps differ run-to-run; the harness patches it).
+   env.step 17.9 → 11.5 ms (N=4, M=2, easy).
+
+2. **bf16 AMP** (`train/mappo.py`, `train/driver.py`). `AMP_DTYPE = bfloat16` when supported
+   (Ampere+; fp16+GradScaler fallback else). PPO update autocast now bf16 — same fp32 exponent
+   range → value-target spikes can't overflow → GradScaler disabled (passthrough), the fp16
+   NaN-collapse failure mode is structurally gone (guard kept). Rollout collection, bootstrap
+   and `_run_eval_suite` forward passes now also run under autocast (previously fp32);
+   log_softmax stays fp32 under autocast so rollout logp matches update-side numerics.
+
+**Benchmark** (train/difficult, 32 env, M=2, rollout 256, tbptt 8, 12 iters): ~130 sps clean
+iters / 99-133 avg vs 92 avg with the old code on the identical config (488-iter pipeline log)
+→ **+41%**. 4M-step difficult stage: ~12.1 h → ~8.6 h. Learning curves healthy (v_loss ↓,
+ep_end 24→64% in 12 iters, kl/clip normal, zero nan_skips). Smoke: trace_episode + inspector OK
+on the batched env.
+
+**Stuck-agent diagnosis (traces, no code change yet).** User observed agents stalling in
+rooms/corridors ~40-50 geodesic nodes from remaining frontiers, intermittently. Stall-window
+scan of the ckpt_best traces confirms the radar hypothesis: m240 agent0 stalls steps 308-384
+with max feat[5] b_util = **0.013** (radar mute: 0.92^45/8 ≈ 0.004/node) while an in-window
+utility 0.58 sits across a wall (Euclid-near, geodesic-far → attractive nuisance). m160 stalls
+at bu 0.05/0.14. m320's 80% is time-limit, not stalling. Intermittency explained: b_util is a
+mass SUM — big far rooms stay visible, thin far frontiers vanish. **Planned fix (approved
+direction): radar_gamma 0.92→0.97 + util_norm 8→3 (~20× signal at 45 hops), then a short A/B
+retrain vs control; sweep only if the A/B confirms but under-delivers. Step penalty explicitly
+rejected (informational problem, not motivational).** M>2 postponed until after the radar fix
+(critic mean⊕max is already count-invariant → M=2 ckpt warm-starts M=3/4).
+
+---
+
+## Session 2026-07-08 — dead-code sweep + runs cleanup (during v0.8 training)
+
+Dead code REMOVED (verified: syntax + CPU env/model/buffer smoke; the running v0.8 pipeline is
+unaffected — its code is already in memory):
+- `train/buffer.py`: `BufferStats`, `slice_step`, `slice_chunk`, `_OBS_KEYS_*` constants, and the
+  duplicate `curr_nbr_valid` buffer entry (it IS `action_mask` env-side; update reads action_mask).
+- `train/mappo.py`: `_slice_obs`.
+- `env/world_warp.py`: `reset_occupancy`, `team_occupancy`, `team_occupancy_prob`.
+- `env/explorer.py`: dead cfg knobs `scan_reward_weight` + `team_reward_weight` (with `--scan-weight`
+  / `--team-weight` CLI); dead obs keys `comm_event` (Phase-1b instrumentation never wired, incl.
+  `self._comm_event`) and `bf_parent_from_curr` (the [N,M,N_max] per-step stack — the per-agent
+  `info["bf_parent_from_curr"]` stays, the radar needs it). `EnvCfg.from_ckpt_dict` filters unknown
+  keys → old ckpts still load.
+- `eval/ckpt_loader.py` + `run_eval.py` + `eval_final.py`: legacy `path_bias`→`path_bias_learn`
+  remap shims (those ckpts are incompatible since v0.8 anyway).
+- `scripts/debug_single.sh` deleted (used --no-strategic-head/--div-coef/--path-bias-floor — all gone).
+- `viz/inspector.html` + `eval/trace.py`: last guidepost/target/gate UI leftovers removed.
+- `runs/`: deleted all stopped (ckpt_stop.pt) + mid-truncated runs (~4.3GB freed, 25 dirs).
+  Kept: all COMPLETE runs, the RUNNING rdv pair, step_0x/trace167 artifacts, runs/profile (1.7GB,
+  flagged for user decision).
+
+---
+
+## Session 2026-07-07 — v0.8: critic pooling, analytic-target/guidepost REMOVED, dense rendezvous reward
+
+Big refactor. All verified in container `marlauder` (syntax, env step, model forward, eval GIF,
+inspector trace, multi-iter run_train) and a real easy→difficult training pipeline was launched.
+
+**Problem #1 — critic input.** The CTDE critic took MAPPO's CL/concat-local state
+`Linear(M·d + G, d)` (worst input in the MAPPO paper: bakes M into weights, noisy V → noisy
+advantages). Replaced with symmetric **mean ⊕ max pooling** over agents → `Linear(2·d + G, d)`,
+count-invariant (same weights for any M). Chose mean+max over attention pooling deliberately: no
+softmax dead-zone (the bug we had to repair in GAT + pointer), always passes gradient, sits on the
+proven mean-field baseline from step 0.
+
+**Analytic target + guidepost — FULLY REMOVED.**
+- `node_feat` F_IN 8→7: `0 x_rel,1 y_rel,2 utility,3 age,4 teammate_pot,5 radar-util,6 radar-teammate`
+  (guidepost channel gone; radar reindexed 6/7→5/6). GAT head-3 A2 bias reassigned to the radar
+  channels [5,6] — head 3 is now the beyond-window steering head that replaces the guidepost's role.
+- `graph_lattice.py`: deleted `build_guidepost`, `build_guidepost_v2`, `select_target_*`,
+  `analytic_next_hop` (~400 lines). Kept `bf_from_target` + `build_radar` (radar still uses the
+  from-curr BF; `guidepost_iters` kept as a generic BF iteration cap).
+- `explorer.py`: removed Pass-1 target selection/deconfliction/guidepost bookkeeping,
+  `_prev_target_node`/`_dist_prev`/`_target_prev`/`_steps_on_option`, obs `guidepost_*`/`target`
+  keys, config `target_*`/`analytic_target`/`target_kind`/`disable_guidepost`. Kept `curr_idx_global`
+  (invalid-action fallback) + `bf_dist_team` (feeds geo_pair, radar, feat[4] team_pot).
+- `actor_critic.py`: dropped `strategic_gate_eps` + `_strategic_gate`. Plumbing cleaned in
+  driver/run_train/train_args. eval consumers fixed (rollout/trace/render/ckpt_loader/run_eval/
+  eval_final).
+
+**critic_global 8→7:** dropped `tgt_dist` (was descriptive-only, needed the analytic target).
+Considered adding absolute team centroid cx,cy but DROPPED it — absolute position makes V overfit
+map layouts; `geo_pair` (nearest-teammate geodesic, translation-invariant) already gives the
+relational link. Final: `[explored_frac, t/T, geo_pair, cov_rate, redundancy, idle_frac, imbalance]`.
+
+**Reward — dense rendezvous, no separation (IR2 r_s spirit).**
+- REMOVED give_bonus, recv_bonus (sparse rendezvous), overlap_pen (redundant — novel_scan union
+  already zeroes redundant co-scan), proximity_pen (this WAS the "fear the teammate" term). Deleted
+  `_setop_rewards`, `_proximity_penalty`, `last_meeting_node_mask`.
+- ADDED `rdv_dense = w·g·(φ_prev − φ_now)`: telescoping toward the owed teammate's FIXED last-known
+  pos, gated by surplus `g = clamp(∆M/(rdv_offer_frac·H·W), 0, 1)`. φ = geodesic curr→nearest-
+  teammate /diam. Farm-safe: oscillation cancels, at comm ∆M→0 kills the lkp-jump credit, hover
+  gives Δφ=0. NO separation penalty (privileged novel_scan does the spreading → no "fear the only
+  path", per the design constraint).
+- Reward now: `novel_scan − revisit − stall + completion − step + rdv_dense`.
+
+**Observations — raw rendezvous ingredients.** Added `agent_scalars` [N,M,2] = [∆M surplus-gate,
+staleness] fed to the ACTOR input (`actor_pre = Linear(d+K+2)`; plumbed through buffer + mappo like
+prev_action). The policy DECIDES when to rendezvous — not a precooked weight.
+
+**VRAM / launch geometry (measured on the 12GB 4080 laptop).** OOM driver = the `encode_chunk`
+update peak (∝ tbptt·n_envs·n_layers·window), which is MAP-INDEPENDENT (model always sees the fixed
+225-node ego window). So easy and difficult cap at the SAME ~40 envs; difficult is slightly heavier
+env-side (bigger grids) so ≤ easy, never more. `tbptt=8` halves the update peak vs 16 (which caps at
+a razor-edge 24 envs). Chose **32 env / tbptt=8 / rollout=256 / n-hops=6 / minibatches=1** →
+~8.4GB (easy) / ~9–11GB (difficult), safe headroom. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+
+**Launched:** `pipeline_rdv.sh` — easy (128-step episodes, 2M steps) → difficult (384-step episodes,
+4M steps, warm-start via `--init-ckpt`). Fresh train required (F_IN + actor_pre + critic_pre shapes
+changed → no old-ckpt warm-start). New sweep `sweep_rdv.yaml` (rdv-weight/offer-frac/novel/revisit/
+ent). DELETED obsolete: `scripts/04_test_graph.py`, `05_test_env_random.py`, and 5 stale sweeps
+(sweep.yaml, sweep_div, sweep_stage2, sweep_stage0_commit, sweep_v06_belief).
+
+---
+
 ## Session 2026-06-29 / 06-30 — StrategicHead removal, analytic-only, reward & critic overhaul
 
 Large cleanup + simplification pass. Goal: a genuinely *learned* policy — env supplies an analytic guidepost as context, but no longer hard-forces the agent toward it. **All pre-2026-06-29 checkpoints are broken (actor/critic input dims changed) → full retrain required. 5 sweep yamls reference deleted flags → obsolete.**

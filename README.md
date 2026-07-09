@@ -2,7 +2,7 @@
 
 GPU-vectorized multi-agent reinforcement learning for autonomous map exploration.
 
-Per-agent occupancy maps, intermittent line-of-sight communication, 8-neighbor lattice graph, masked GAT actor-critic with shortest-path guidepost, MAPPO training. Designed to run end-to-end on a single GPU with no CPU roundtrip during the rollout.
+Per-agent occupancy maps, intermittent signal-strength communication, 8-neighbor lattice graph, masked GAT actor-critic with GRU memory and a pointer action head, MAPPO training. A learned policy — no analytic guidepost or hand-picked target: the agent steers purely from the ego-window graph features (local frontier utility + beyond-window "radar" channels) plus two rendezvous scalars. Designed to run end-to-end on a single GPU with no CPU roundtrip during the rollout.
 
 For deep architectural detail, see [DOCS.md](DOCS.md). For session-by-session design notes, see [dev_log.md](dev_log.md).
 
@@ -10,18 +10,17 @@ For deep architectural detail, see [DOCS.md](DOCS.md). For session-by-session de
 
 ## Features
 
-- GPU-resident simulation: Warp LiDAR + torch graph build + frontier detection + Bellman-Ford on GPU, all batched across N envs.
-- Multi-agent (1..M) with intermittent communication: agents fuse occupancy maps when within `comm_range_px` AND with clear line of sight on ground truth.
+- GPU-resident simulation: Warp LiDAR + torch graph build + frontier detection + Bellman-Ford on GPU, all batched across N envs (agents folded into the batch dim — one build for N·M).
+- Multi-agent (1..M) with intermittent communication: agents fuse occupancy maps when they can connect. Default comm model is a **signal-strength path-loss radio** (walls attenuate, per-episode shadowing noise), with a legacy hard line-of-sight model available.
 - Per-agent occupancy maps `[N, M, H, W]` stored flat for Warp 3-dim kernel compatibility.
-- 8-neighbor regular lattice graph (NR=16 px → ~1200 nodes on 480×640), flood-fill reachability, collision-checked edges.
-- **Ego-centric GAT encoder** (configurable `n_hops` window) — restricts attention to a `(2·n_hops+3)²` window around curr.
-- **Strategic frontier-attention head** — per-agent MHA over top-K=16 global frontier candidates with BF-distance, teammate-distance, comm-gap, yield, and joint-distribution (`team_alt_score`) features. Gumbel-ST discrete pick. Replaces the previous hard `guidepost_nbr_bias` hijack.
-- **BF-from-curr + BF-from-teammate** for true wall-aware shortest-path candidate distances (warm-started). Plus a floored+learnable `path_bias` soft prior on action logits toward the BF first-hop of the strategic pick (floor keeps it from collapsing).
-- **Per-agent set-op reward** (v0.4): per-agent scan-delta, give/recv at rendezvous, overlap penalty (lattice set-op baselined at last meeting), revisit + proximity penalty. Per-agent GAE advantages, shared CTDE value baseline.
-- **Debug full-sharing flags** + **ramping curriculum** scaffold. fp16 NaN-guarded action logits.
-- Centralized-training-decentralized-execution (CTDE) critic.
-- MAPPO with GAE-λ (per-agent advantages with shared V baseline), value normalization, AMP fp16, TBPTT (chunked encoder forward), torch.compile on encoder.
-- Per-agent side-by-side eval rendering: each panel shows that agent's own occupancy, frontier, graph, **strategic target + correct BF path**, trail, and green comm-link line drawn whenever the pair is in range.
+- 8-neighbor regular lattice graph (NR=16 px), flood-fill reachability, collision-checked edges, diagonal cost √2.
+- **Ego-centric GAT encoder** (configurable `n_hops` window) — restricts attention to a `(2·n_hops+3)²` window around the agent's current node. Per-head learnable temperature (A1) and per-head structural feature-bias groups (A2) specialize heads on explore / rendezvous / recency / beyond-window steering.
+- **RADAR beyond-window channels** — `build_radar` compresses the known world *beyond* the ego window onto the geodesic horizon nodes (obstacle-aware, routed down the BF parent chain), giving a feed-forward-friendly heading toward far exploration mass and far teammates. Replaces the removed analytic guidepost.
+- **Dense rendezvous economy** — `rdv_dense` reward (telescoping geodesic approach to the owed teammate, gated by the map-surplus you owe) plus two actor observations `[∆M surplus-gate, staleness]` that let the policy DECIDE when to meet. No separation penalty — the privileged novel-scan credit already spreads agents.
+- **Per-agent privileged novel-scan reward** — an agent is paid only for cells new to the *team union*, so splitting up is the highest-paying policy by construction. Per-agent GAE advantages, count-invariant (mean⊕max pooled) CTDE value baseline.
+- **Feed-forward actor + critic by default**; optional GRU temporal memory via `--gru` (both GRUCells still exist for checkpoint compatibility).
+- Debug full-sharing / full-comm flags + gated easy→difficult curriculum scaffold. bf16 AMP, TBPTT chunked encoder forward, optional `torch.compile`.
+- Per-agent side-by-side eval rendering: each panel shows that agent's own occupancy, frontier, graph, trail, and a green comm-link line drawn whenever the pair is connected. Interactive step-through inspector with REAL per-layer/head GAT attention.
 
 ---
 
@@ -42,7 +41,7 @@ docker compose up -d
 docker exec -it marlauder bash
 ```
 
-The container mounts the parent directory at `/workspace` so `MARLauder/` and adjacent repos (e.g. `IR2-Multi-Robot-RL-Exploration/`) are both reachable.
+The container mounts the parent directory at `/workspace` so `MARLauder/` and adjacent repos are both reachable.
 
 ### Smoke train (~1 min)
 
@@ -56,52 +55,37 @@ PYTHONPATH=. python scripts/run_train.py \
 
 Verifies the full pipeline boots, runs a few PPO updates, writes a checkpoint, and emits an eval GIF.
 
-### Full training run
+### Full training pipeline
 
-See [DOCS.md §6](DOCS.md) for the canonical command. Set `--rollout-len ≥ --max-episode-steps` so episodes complete inside a rollout (populates `ep_end`). Summary:
+The canonical two-stage run is `pipeline_rdv.sh` (easy → difficult warm-start). Summary of one stage:
 
 ```bash
 PYTHONPATH=. python scripts/run_train.py \
     --split train/easy \
-    --total-steps 5_000_000 \
-    --n-envs 64 --n-agents 2 \
-    --comm-range 120 \
-    --rollout-len 256 --max-episode-steps 256 \
-    --minibatches 4 \
-    --lr 3e-4 --ent-coef 0.01 \
-    --path-bias-floor 1.5 \
-    --compile --eval-on-ckpt \
-    --out /workspace/MARLauder/runs/run_v04
+    --total-steps 2_000_000 \
+    --n-envs 32 --n-agents 2 \
+    --rollout-len 256 --max-episode-steps 128 \
+    --n-hops 6 --tbptt-steps 8 --minibatches 1 --k-epochs 4 \
+    --rdv-weight 0.10 \
+    --eval-on-ckpt \
+    --out /workspace/MARLauder/runs/run_easy
 ```
+
+Set `--rollout-len ≥ --max-episode-steps` so episodes complete inside a rollout (populates `ep_end`). See [DOCS.md §6](DOCS.md) for the canonical command and the VRAM/launch geometry.
 
 ### Eval a checkpoint on N random maps
 
 ```bash
 PYTHONPATH=. python scripts/eval_final.py \
-    /workspace/MARLauder/runs/run_v03/final.pt \
+    /workspace/MARLauder/runs/run_easy/final.pt \
     --split train/easy --n-maps 5 --steps 512
 ```
 
-GIFs land next to the checkpoint as `eval_map00892.gif`, `eval_map04388.gif`, ...
-Each is a side-by-side panel per agent. Architecture is inferred from the checkpoint weights — no need to pass `--d-hidden`/`--n-heads`/`--n-layers`.
+GIFs land next to the checkpoint as `eval_map00892.gif`, ... Each is a side-by-side panel per agent. Architecture (d, heads, layers, agents, `use_gru`) is inferred from the checkpoint weights — no need to pass it. Pin maps via `--map-idx N [N ...]`.
 
-Pin specific maps via `--map-idx N [N ...]` (single or list, overrides `--n-maps`/`--seed`), e.g. `--map-idx 9580 1234`. Without `--map-idx`, indices are drawn from `--seed`.
+### Best-checkpoint selection
 
-### Eval one specific map by index
-
-```bash
-PYTHONPATH=. python scripts/run_eval.py \
-    --ckpt /workspace/MARLauder/runs/run_v04/final.pt \
-    --split train/easy --map-idx 9580 \
-    --n-agents 2 \
-    --d-hidden 128 --n-heads 4 --n-layers 2 \
-    --steps 256 \
-    --out /workspace/MARLauder/runs/run_v04/eval_map9580.gif
-```
-
-`--map-idx N` selects map at index `N` (0-indexed). Start positions placed via `_spread_starts_graph` (lattice-adjacent FREE nodes, BFS + segment-clear, same as training). Env cfg (`n_hops`, `top_k`, comm/force flags) is read from the checkpoint via `EnvCfg.from_ckpt_dict`. Add `--force-full-occupancy-sharing` / `--force-full-pos-sharing` to force persistent sharing at eval. Pass `--d-hidden`/`--n-heads`/`--n-layers` to match the trained network.
-
-The rendered amber target/path is the **strategic head's chosen frontier + its correct BF path** — the node the policy actually pursues.
+`eval_best.py` scores every milestone checkpoint on a fixed 32-map suite and writes `ckpt_best.pt`. The web inspector exposes a "Find best ckpt" action.
 
 ---
 
@@ -111,30 +95,35 @@ The rendered amber target/path is the **strategic head's chosen frontier + its c
 MARLauder/
 ├── env/                Simulation: Warp world, sensors, lattice graph, frontier, env loop
 │   ├── world_warp.py       Per-agent occupancy maps + LiDAR kernels (Warp)
-│   ├── explorer.py         Vectorized env: step, comm check, map fusion, reward
-│   ├── graph_lattice.py    8-neighbor graph build + Bellman-Ford guidepost
+│   ├── explorer.py         Vectorized env: step, comm check, map fusion, reward, obs build
+│   ├── graph_lattice.py    8-neighbor graph build + Bellman-Ford + build_radar
+│   ├── teammate_belief.py  Teammate-state belief scaffold (last-known pos + staleness)
 │   ├── frontier.py         conv2d frontier detector
 │   └── maps.py             Map split loading + batched sampling
 ├── models/             Networks
-│   ├── gat.py              MaskedGATLayer + GATEncoder
-│   ├── actor_critic.py     MarlActorCritic (shared encoder + actor + CTDE critic)
+│   ├── gat.py              MaskedGATLayer (A1 temp + A2 feat-bias) + GATEncoder
+│   ├── actor_critic.py     MarlActorCritic (shared encoder + GRU actor/critic + PointerHead)
 │   └── value_normalizer.py Welford running mean/var for V normalization
 ├── train/              MAPPO trainer
 │   ├── buffer.py           Rollout buffer + GAE-λ
-│   ├── mappo.py            PPO update with chunked encoder forward
-│   └── driver.py           TrainCfg, main loop, milestone checkpoints, eval GIF on ckpt
+│   ├── mappo.py            PPO update with chunked encoder forward + TBPTT
+│   └── driver.py           TrainCfg, main loop, milestone checkpoints, eval on ckpt
 ├── eval/               Inference + visualization
 │   ├── rollout.py          Deterministic rollout, per-agent frame builder
+│   ├── trace.py            Step-through episode trace for the inspector
+│   ├── ckpt_loader.py      Architecture inference from a checkpoint
 │   └── render.py           Palette + painters + composite_frame + hstack_frames
 ├── scripts/            CLI entrypoints
 │   ├── run_train.py        Training
+│   ├── train_args.py       CLI flag definitions (grouped)
 │   ├── run_eval.py         Single-map eval
 │   ├── eval_final.py       Batch eval on N random maps
-│   ├── baseline_random.py  Random-policy sanity baseline
-│   └── 0[1-7]_test_*.py    Step-by-step component tests
+│   ├── eval_best.py        Best-checkpoint selection on the fixed suite
+│   └── trace_episode.py    Emit an inspector trace
+├── viz/                inspector.html (attention + reward step-through), index.html
+├── docs/               architecture.html (pipeline diagram)
 ├── data/               Preprocessed map tensors (memmap + meta.npz per split)
-├── docker/             Dockerfile (base: PyTorch CUDA 12.8)
-├── docker-compose.yml
+├── docker/             Dockerfile (base: PyTorch CUDA)
 ├── DOCS.md             Deep reference (modules, data flow, parameters, diagnostics)
 ├── dev_log.md          Session-by-session design notes
 └── README.md           This file
@@ -147,178 +136,110 @@ MARLauder/
 A single iteration prints a dense one-liner:
 
 ```
-[train] iters=152  steps/iter=16384  total≈2,490,368
-[it    1/152] ep_end=  9.3%(ended= 64)  pg=-0.0123  v=0.7521  ent=2.063  kl=+0.0041  clip=8.3%  sps=540(540avg) coll=687 upd=2514
-[it    2/152] ep_end= 11.1%(ended= 64)  pg=-0.0118  v=0.7204  ent=2.041  kl=+0.0045  clip=9.1%  sps=560(550avg) coll=690 upd=2520
-...
-[ckpt] /workspace/MARLauder/runs/run_v04/ckpt_025.pt
-[eval] /workspace/MARLauder/runs/run_v04/eval_ckpt_025_m0.gif  map=12  final_explored=42.1%  frames=256
-...
-[done] /workspace/MARLauder/runs/run_v04/final.pt
+[it    1/152] ep_end=  9.3%(ended= 64)  pg=-0.0123  v=0.7521  ent=2.063  kl=+0.0041  clip=8.3%  sps=130(130avg) coll=687 upd=2514
 ```
-
-Field meanings:
 
 | Field | What it means |
 |---|---|
-| `ep_end` | Mean explored fraction at the terminal step of all episodes that ENDED this iter. `ended=K` = how many episodes that was. `n/a` until ≥1 completes — set `--rollout-len ≥ --max-episode-steps` so episodes finish inside a rollout. |
-| `pg` | PPO policy gradient loss. Small negative (-0.005 to -0.02) is healthy. |
+| `ep_end` | Mean explored fraction at the terminal step of all episodes that ENDED this iter. `ended=K` = how many. `n/a` until ≥1 completes — set `--rollout-len ≥ --max-episode-steps`. |
+| `pg` | PPO policy-gradient loss. Small negative (-0.005 to -0.02) is healthy. |
 | `v` | Value loss. Drops then plateaus. |
 | `ent` | Action-distribution entropy. Should decay smoothly, not collapse. |
-| `kl` | KL between old/new policy. Stays < 0.02 with `clip-eps=0.2`. |
+| `kl` | KL between old/new policy. Stays < 0.02 with `clip-eps=0.15`. |
 | `clip` | Fraction of samples hit by the PPO clip. Healthy: 5–20%. |
 | `sps` | Total env steps per wall-clock second (current iter / running average). |
 | `coll` / `upd` | Per-phase sps — rollout collection vs PPO update. |
 
-Full diagnostic table including warning signs: [DOCS.md §8](DOCS.md).
-
-Checkpoints are written at 25%, 50%, 75%, 100% of total iterations as `ckpt_025.pt`, ..., `ckpt_100.pt` plus a final `final.pt`. With `--eval-on-ckpt`, two eval GIFs are also produced at each milestone on randomly sampled maps.
+Full diagnostic table: [DOCS.md §8](DOCS.md). Checkpoints written at 25/50/75/100% as `ckpt_025.pt`..`ckpt_100.pt` + `final.pt`; with `--eval-on-ckpt`, eval GIFs at each milestone.
 
 ---
 
 ## Common CLI flags
 
-The most-used `run_train.py` flags:
+Most-used `run_train.py` flags (full list: `scripts/train_args.py`, grouped by section):
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--split` | `train/easy` | Map split: `train/easy`, `train/difficult`, `test/{complex,corridor,hybrid}` |
-| `--out` | `runs/run_default` | Output directory for checkpoints + eval GIFs |
-| `--seed` | `-1` | torch RNG (actions, init). Maps use independent fresh-entropy RNG each run |
-| `--total-steps` | `5_000_000` | Total environment transitions (`n_envs × rollout_len × iters`) |
+| `--split` | `train/easy` | Map split: `train/{easy,difficult}`, `test/{complex,corridor,hybrid}` |
+| `--out` | auto | Output directory for checkpoints + eval GIFs |
+| `--seed` | `0` | torch RNG (actions, init). Maps use independent fresh-entropy RNG each run |
+| `--total-steps` | `5_000_000` | Total environment transitions |
 | `--n-envs` | `16` | Parallel envs. Must be divisible by `--minibatches` |
-| `--n-agents` | `1` | Number of cooperative agents per env |
-| `--comm-range` | `120.0` | Communication range in pixels (0 = never communicate) |
-| `--rollout-len` | `128` | Steps per PPO update. Set ≥ `--max-episode-steps` to populate `ep_end` |
-| `--max-episode-steps` | `512` | Episode truncation |
-| `--n-hops` | `2` | Ego-centric encoder window radius |
-| `--top-k` | `16` | Strategic-head frontier candidates per agent |
-| `--path-bias-floor` | `1.5` | Floor on target-following bias |
-| `--yield-scale` / `--overlap-pen` / `--proximity-pen` | `3.0` / `3.0` / `0.05` | Anti-chase knobs |
-| `--revisit-pen` / `--stall-pen` | `0.05` / `0.1` | Anti-loop (graduated) / anti-standing-still |
-| `--novel-scan-weight` | `1.0` | α_novel: privileged team-union novel-scan credit (v2 core reward) |
-| `--target-switch-pen` | `0.01` | δ_obj: objective second-guessing penalty (argmax intent, BF-tree branch flip) |
-| `--clip-eps` / `--k-epochs` / `--gae-lambda` / `--gamma` / `--vf-coef` / `--tbptt-steps` | `0.2` / `4` / `0.95` / `0.99` / `0.5` / `16` | MAPPO knobs (exposed for sweeps) |
-| `--wandb` (+ `--wandb-project/-entity/-group/-run-name/-mode/-tags`) | off | Log metrics to Weights & Biases |
-| `--force-full-pos-sharing` / `--force-full-occupancy-sharing` | off | Debug: perfect teammate positions / synced maps |
-| `--curriculum` | off | Ramp easy→difficult mix (needs same-canvas splits) |
-| `--compile` | off | `torch.compile` the encoder (~2× update speedup) |
-| `--eval-on-ckpt` | off | Emit 2 eval GIFs at each milestone |
+| `--n-agents` | `1` | Cooperative agents per env |
+| `--rollout-len` / `--max-episode-steps` | `128` / `512` | Steps per PPO update / episode truncation |
+| `--minibatches` / `--tbptt-steps` | `1` / `16` | PPO minibatches / truncated-BPTT chunk length |
+| `--n-hops` | `6` | Ego-centric encoder window radius (GAT depth ties to it) |
+| `--comm-model` | `signal_strength` | `signal_strength` (path-loss radio) or `los` (hard line-of-sight) |
+| `--comm-range` | `120.0` | LOS-mode Euclidean cutoff (px). Ignored in signal-strength mode |
+| `--sensor-range` / `--ss-thresh` | `80.0` / `-70.0` | LiDAR range (px) / rx sensitivity (dBm) |
+| `--novel-scan-weight` | `1.0` | α: privileged team-union novel-scan credit (core reward) |
+| `--rdv-weight` / `--rdv-offer-frac` | `0.10` / `0.15` | Dense rendezvous strength / surplus at which the gate saturates |
+| `--revisit-pen` / `--revisit-window` / `--stall-pen` | `0.05` / `8` / `0.1` | Anti-loop (graduated) / window / anti-standing-still |
+| `--radar-gamma` / `--radar-util-norm` | `0.92` / `8.0` | Beyond-window radar travel-discount / mass normalizer |
+| `--gru` | off | Enable GRU temporal memory in actor+critic (default is feed-forward) |
+| `--init-ckpt` | none | Warm-start from a checkpoint (stage-2 of the pipeline) |
+| `--lr` / `--ent-coef` / `--clip-eps` / `--k-epochs` / `--gae-lambda` / `--gamma` / `--vf-coef` | `3e-4` / `0.01` / `0.15` / `4` / `0.95` / `0.99` / `0.5` | MAPPO knobs |
+| `--force-full-comm` / `--force-full-pos-sharing` / `--force-full-occupancy-sharing` | off | Debug: perfect comm / teammate positions / synced maps |
+| `--curriculum` / `--curriculum-gated` | off | Ramp easy→difficult (fixed schedule / eval-score-gated) |
+| `--compile` / `--eval-on-ckpt` | off | `torch.compile` the encoder / emit eval GIFs at milestones |
+| `--wandb` (+ project/entity/group/run-name/mode/tags) | off | Log to Weights & Biases |
 
-Full parameter reference + reward weights: [DOCS.md §5](DOCS.md). Hardcoded knobs: [DOCS.md §11](DOCS.md).
-
-`eval_final.py` infers architecture from the checkpoint weights and reads env cfg from the checkpoint. `run_eval.py` / `eval_final.py` `--seed` defaults to system entropy (different maps each run).
+Full parameter reference + hardcoded knobs: [DOCS.md §5](DOCS.md), [DOCS.md §11](DOCS.md).
 
 ---
 
-## Reward (v0.4)
+## Reward
 
-Per-agent set-op reward, lattice-level, baselined at last comm event between each pair:
+Per-agent, lattice-level, in map-independent units (`scan_norm_nodes=50` ≈ one sensor disk):
 
 ```
-reward[a] = α_novel · novel_scan[a]          # cells I scanned that are NEW TO THE TEAM UNION (privileged, v2)
-          + β     · team_delta_node           # Δunion FREE nodes (cooperation anchor, same norm)
-          + ζ_give · give[a]                  # NEW cells I bring to teammate at comm
-          + ζ_recv · recv[a]                  # NEW cells I receive at comm
-          − η_lap  · overlap[a]               # we BOTH scanned same area since last meeting
-          − γ      · revisit_pen[a]           # node visited within last W=8 steps
-          − ε_prox · proximity_pen[a]         # teammate within sensor_range AND visible
-          − δ_obj  · target_switch_pen[a]     # objective second-guessing (argmax intent, BF-tree branch flip)
-          − δ_stall· stall_pen[a]             # standing still (no net displacement this step)
-          + 1{terminated} · completion_bonus
-          − step_penalty
+reward[a] = α · novel_scan[a]              # cells I scanned that are NEW TO THE TEAM UNION (privileged)
+          − γ · revisit_pen[a]             # node visited within last W=8 steps (graduated by recency)
+          − δ_stall · stall_pen[a]         # no net displacement this step
+          + 1{explored ≥ 99%} · completion_bonus
+          − step_penalty                   # axial = step_cost, diagonal = ·√2
+          + w · g · (φ_prev − φ_now)       # rdv_dense: net geodesic approach to the owed teammate, gated by surplus g
 ```
 
-Defaults: `α_novel=1.0, β=0.3, ζ_give=1.5, ζ_recv=0.5, η_lap=3.0, γ=0.05, ε_prox=0.05, δ_obj=0.01, δ_stall=0.1, completion_bonus=10.0, step_penalty_coef=0.1`.
+Defaults: `α=1.0, γ=0.10, δ_stall=0.1, completion_bonus=10.0, step_penalty_coef=0.015, w(rdv)=0.10, rdv_offer_frac=0.15`.
 
-**v2 novel-scan credit (IR2-style privileged `r_f`)**: an agent earns scan reward only for cells **new to the team union map** — a follower scanning a leader's wake earns exactly 0, so splitting up is the highest-paying policy by construction (kills the chase/free-ride incentive that `scan_self + shared team_delta` created). Privileged signal, training-only (CTDE); the deployed actor never sees the union. `scan_self_delta` is still logged as a diagnostic. Dense terms normalized by `scan_norm_nodes=50` (≈ one sensor disk) instead of N_max≈1200, so shaping is O(0.1) instead of O(0.001) vs the completion bonus.
+**Privileged novel-scan credit (IR2-style `r_f`)**: an agent earns scan reward only for cells **new to the team union map** — a follower scanning a leader's wake earns exactly 0, so splitting up is the highest-paying policy by construction. Privileged, training-only (CTDE); the deployed actor never sees the union. There is **no separation / proximity penalty** — the design constraint is that novel-scan does the spreading, so agents never "fear the only path".
 
-`stall_pen[a] = 1` when the agent makes **no net displacement** this step (`‖Δpos‖ < nr·0.5`) — catches both collision-revert holds and invalid/curr-node picks. Heavily weighted (`δ_stall=0.1`) to break chase/standoff deadlocks and force separation. `revisit_pen` is now **graduated** by recency (`(W−age)/W`, tighter loops hurt more) and `proximity_pen` is strengthened (`ε_prox=0.05`). These three are the anti-chase / anti-loop / anti-stall knobs the W&B sweep tunes (see below).
-
-`target_switch_pen[a] = 1` when the agent **flips its committed branch** of the BF-from-curr tree toward the strategic target while the previous target was still **reachable + not-yet-reached** (B+D). Same-direction shifts (frontier receding down the same branch) cost 0 — the penalty keys on graph *direction* (first-hop branch), not target-node identity. v2: the env receives the head's **argmax intent** (`target_argmax`), not the Gumbel-sampled pick — sampling noise no longer registers as second-guessing — and the default coef dropped 0.05→0.01 (sweep v1 showed the sampled variant dominating the dense reward 10–50×). Off at eval (`target_choice` not plumbed).
-
-Each agent gets its **own** scalar reward. GAE computes per-agent advantages with a shared CTDE value baseline. Anti-chase comes from `overlap`/`proximity` penalties plus the strategic head's `cand_own_minus_team` (yield) and `team_alt_score` (joint distribution) features — all smooth, no hard thresholds. A floored+learnable `path_bias` keeps the actor following its chosen target so grid-utility doesn't dominate.
+**Dense rendezvous (`rdv_dense`)**: telescoping toward the owed teammate's FIXED last-known position, gated by **relative map growth** `g = clamp(∆M / (rdv_offer_frac · own_map_at_last_sync), 0, 1)` — the cells I mapped that the teammate I owe most still lacks, as a fraction of the map I already had when we last met (floored by one sensor disk). So `g→1` means "I have grown my known map by `rdv_offer_frac` since we last met → I hold enough NEW content to be worth sharing". Farm-safe: oscillation cancels, and at comm `∆M→0` kills the gate so the last-known-position jump is never paid. The SAME gate `g` (plus a normalized `staleness`) is fed to the actor as `agent_scalars` so the policy decides *when* to rendezvous — the reward and the observation share the trigger.
 
 Full reward derivation + decentralization properties: [DOCS.md §4](DOCS.md).
 
 ---
 
-## Weights & Biases + hyperparameter sweeps
-
-Training logs to W&B when `--wandb` is set (off by default → no network). Each iter logs
-`train/*` (pg, v, ent, kl, clipfrac), `perf/*` (sps), `reward/*` (per-term signed
-contributions), `metric/*` (exploration quality, below), and — every `eval_every=10` iters —
-the **fixed eval suite** `eval/*` block.
-
-**Fixed eval suite (v2, the sweep's scoring source)**: the policy is run *deterministically*
-on the same 8 hardcoded validation maps (`train/driver.py: EVAL_MAP_IDX`) for every run on
-every machine — same exam for every trial, no map luck, no sampling noise. The sweep
-maximizes `eval/score = coverage_auc − 0.5·contrib_imbalance − 0.25·sensing_overlap`.
-
-| Eval metric | Meaning | Good direction |
-|---|---|---|
-| `eval/coverage_auc` | mean explored fraction over the episode (area under coverage curve; early finish padded) | high = fast AND complete |
-| `eval/contrib_imbalance` | `max_a(novel share) − 1/M` — how unequally agents contribute union-new cells (IR2 map-σ analog) | low = balanced labor (chase → ~0.4+) |
-| `eval/sensing_overlap` | fraction of steps pair within 2·sensor_range (MARVEL overlap ratio) | low |
-| `eval/comm_duty` | fraction of steps pair in comm. Persistent ≈1.0 = chase signature | dips mid-episode, spikes at rendezvous |
-| `eval/success_rate` | episodes reaching ≥99% in budget | high |
-| `eval/steps_to_90` | steps to 90% coverage | low |
-
-**Per-iter rollout metrics** (printed as `redun`/`stall`/`pair`): `metric/redundancy`
-(pre-fusion map divergence), `stall_rate`, `revisit_rate`, `mean_pair_dist`,
-`comm_duty_cycle`, `sensing_overlap`, `coverage_per_dist`, `steps_to_*_per_kfree`.
-Per-agent novel contribution is exposed via `info["novel_cells_ep"]`.
-
-**Two-stage sweeps** (MAPPO frozen at lr 3e-4 / ent 0.005 / clip 0.2 / k 4 / λ 0.95 / γ 0.99
-/ mb 4 — sweep v1 showed no MAPPO signal and k=6 KL blowups):
-
-1. `sweep.yaml` — **Stage 1, division of labor under perfect information**: trials run with
-   `--force-full-occupancy-sharing --force-full-pos-sharing`, where the rendezvous terms
-   degenerate and novel-scan is the only per-agent credit. Sweeps `novel-scan-weight`,
-   `team-weight`, `proximity-pen`, `target-switch-pen`, `n-hops ∈ {2,4,6}`.
-2. `sweep_stage2.yaml` — **Stage 2, rendezvous economy at comm-range 120**: paste Stage-1
-   winners into the marked block, sweep only `overlap-pen`, `give-bonus`, `recv-bonus`.
-
-```bash
-docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb login && wandb sweep sweep.yaml'
-docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb agent <ENTITY/PROJECT/SWEEP_ID>'
-```
-
-Every swept key matches a CLI flag (dashed names). `wandb` is in `requirements.txt`; if the
-image predates it, `pip install wandb` inside the container.
-
----
-
 ## Multi-agent communication
 
-Two agents `i` and `j` can communicate at step `t` if both:
+Default `comm_model = signal_strength`: a log-distance path-loss radio. The segment between two agents is split into free vs obstacle length; walls **attenuate** (γ_obst=4) rather than hard-block; per-episode shadowing noise is resampled each reset. Agents connect iff received power `P_R = P_T − PL > ss_thresh`. A legacy `los` model (hard Euclidean `comm_range_px` + Bresenham LOS on ground truth) is available.
 
-1. `‖pos[i] − pos[j]‖ < comm_range_px`
-2. Sampled Bresenham line on ground truth between `pos[i]` and `pos[j]` contains no obstacle cell (default 40 samples).
+On connection, on the same step:
 
-When the condition holds, on the same step:
+- Per-agent occupancy log-odds maps are fused via elementwise **max-magnitude** — preserves OBSTACLE evidence a plain `max` would drop. Idempotent while connected.
+- `last_known_pos[i][j]` is overwritten with the actual current position of agent `j` (and vice versa); the pair's staleness timer resets.
 
-- Per-agent occupancy log-odds maps are fused via elementwise **max-magnitude** (`where(|lo_i|≥|lo_j|, lo_i, lo_j)`) — preserves OBSTACLE evidence (negative lo) that a plain `max` would drop. Idempotent across consecutive steps in range.
-- `last_known_pos[i][j]` is overwritten with the actual current position of agent `j` (and vice versa).
+When out of range, agents drift with their own partial maps; `last_known_pos` goes stale. The teammate's direction — both in-window (`teammate_pot`) and beyond-window (radar `b_teammate`) — reaches the policy through the graph features.
 
-When out of range, agents drift with their own partial maps. The `last_known_pos` entries become stale until the next rendezvous. Feature `node_feat[..., 5]` exposes a one-hot at the lattice node nearest each known teammate position.
-
-Agent–agent collision is enforced at the env level: if a planned sub-step move would bring two agents within `nr` pixels, the lower-priority agent (**higher** per-episode `_collision_key`) yields — it holds its previous position while the winner advances. The winner reverts too only if it is **still** within `nr` of the loser's hold cell (true blockage). Priority is re-drawn randomly each episode, so there is no systematic role bias; it is decentralized (derivable from a shared per-episode seed at deploy). This replaces the old symmetric both-revert rule, which deadlocked adjacent agents contesting the same cell.
+Agent–agent collision is enforced env-side: if a sub-step move would bring two agents within `nr` px, the lower-priority agent (higher per-episode `_collision_key`) yields and holds; the winner reverts only if still blocked. Priority is re-drawn each episode (no systematic role bias; decentralized via a shared per-episode seed).
 
 ---
 
 ## Architecture (brief)
 
 ```
-GT map → Warp LiDAR per agent → per-agent log-odds → torch occupancy categorical
+GT map → Warp LiDAR per agent → per-agent log-odds → torch occupancy
    → conv2d frontier → graph_lattice.build (nodes + edges + utility integral image)
-   → BF-from-curr + BF-from-teammate → extract_topk_candidates (K=16, wall-aware dist)
+   → BF-from-curr + BF-from-teammate → build_radar (beyond-window channels) → extract_local_window
    → obs dict [N, M, ...]
-   → ego-centric GAT encoder → StrategicHead (Gumbel-ST target pick)
-   → actor GRU + PointerHead (+path_bias toward target's BF first-hop) → action
-                                                  └→ CTDE critic GRU → V(s)
+   → ego-centric GAT encoder (A1 temp + A2 head feat-bias)
+   → actor: (curr_emb ‖ prev_action ‖ agent_scalars[∆M-gate, staleness]) → GRU → PointerHead → action
+   → critic (CTDE): mean⊕max pool over agents ‖ critic_global[7] → GRU → V(s)
 ```
 
+Node features `F_IN = 7`: `0 x_rel, 1 y_rel, 2 utility, 3 age, 4 teammate_pot, 5 radar-util, 6 radar-teammate`.
+GAT A2 head feature-bias groups: `H0 [2,5]` explore · `H1 [4,6]` rendezvous · `H2 [3]` recency · `H3 [5,6]` beyond-window steering.
 Full pipeline and shapes: [DOCS.md §9](DOCS.md).
 
 ---
@@ -328,11 +249,11 @@ Full pipeline and shapes: [DOCS.md §9](DOCS.md).
 | Version | Goal | Status |
 |---|---|---|
 | v0.1 | Single-agent baseline (Warp LiDAR + lattice graph + GAT + MAPPO) | ✓ |
-| v0.2 | Terminology cleanup, Bellman-Ford guidepost, diagonal cost, MAPPO speedup | ✓ |
+| v0.2 | Bellman-Ford guidepost, diagonal cost, MAPPO speedup | ✓ (guidepost later removed) |
 | v0.3 | Multi-agent intermittent communication, per-agent maps, per-agent eval render | ✓ |
-| v0.4 | Strategic frontier-attention head (Gumbel-ST), ego-centric encoder, BF-from-curr + BF-from-teammate cand ranking, joint-distribution feature, floored path-bias, per-agent set-op reward, anti-chase signals, debug full-sharing flags, curriculum scaffold | ✓ (current) |
-| v0.5 | Curriculum train/easy → train/difficult (scaffold landed; blocked on differing canvas sizes) | Partial |
-| v0.6 | Eval suite: per-split curves, TB logger, voluntary-rendezvous reward | Planned |
-| v0.7 | ToM teammate-belief module (probabilistic teammate-state encoder, replaces point lkp in cand features) | Planned |
+| v0.4–v0.7 | StrategicHead / analytic-target experiments | ✓ then **removed** (analytic target/guidepost/path-bias/strategic-head all deleted; a genuinely learned policy) |
+| v0.8 | Critic mean⊕max pooling, analytic target & guidepost REMOVED (F_IN 8→7), dense rendezvous reward + `agent_scalars`, realistic signal-strength comm, ego-window radar channels | ✓ (current) |
+| — | Perf: batched-agent env build + bf16 (+41% sps); best-ckpt selection; entity-split GAT heads | ✓ |
+| next | Radar-gain fix (mute far-field at long range), rendezvous under-experience with M=2, M>2 warm-start | In progress |
 
-v0.8 (hierarchical L2 graph) explicitly out of scope for this rewrite.
+See [dev_log.md](dev_log.md) for the full session history and the current open problems.

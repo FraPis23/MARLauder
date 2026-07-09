@@ -71,16 +71,12 @@ def main() -> None:
     sd = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in ckpt["model"].items()}
     # Strip torch.compile prefix if present.
     sd = {k.replace("encoder._orig_mod.", "encoder."): v for k, v in sd.items()}
-    # I.3 — old checkpoints store `path_bias`; new model uses `path_bias_learn`. Remap + tolerant.
-    if "path_bias" in sd and "path_bias_learn" not in sd:
-        sd["path_bias_learn"] = sd.pop("path_bias")
     model.load_state_dict(sd, strict=False)
-    # Restore high-level strategic gate + target mode from the training cfg (mutable attrs).
+    # Restore GRU-ablation flag from the training cfg (mutable attr).
     if isinstance(cfg_peek, dict):
-        model.strategic_gate_eps = float(cfg_peek.get("strategic_gate_eps", 0.0))
         model.use_gru = bool(cfg_peek.get("use_gru", True))   # honor a GRU-ablation checkpoint
     model.eval()
-    print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}  strategic_gate_eps={model.strategic_gate_eps}")
+    print(f"[load] {args.ckpt}  iter={ckpt.get('iter', '?')}")
 
     rollout = EvalRollout(env, model, EvalCfg(max_steps=args.steps, env_idx=0,
                                               deterministic=args.deterministic,

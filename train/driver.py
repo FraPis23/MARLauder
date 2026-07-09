@@ -16,7 +16,7 @@ from env.maps import MultiSplit, load_split
 from models.actor_critic import MarlActorCritic
 from models.value_normalizer import ValueNormalizer
 from train.buffer import Rollout
-from train.mappo import MAPPOCfg, ppo_update
+from train.mappo import AMP_DTYPE, MAPPOCfg, ppo_update
 
 
 def _dump_status(out_dir: Path, status: dict) -> None:
@@ -79,8 +79,7 @@ class TrainCfg:
     n_heads: int = 4
     n_hops: int = 6          # ego-centric encoder window radius; n_layers tied to this
     n_layers: int = 6        # GAT layers; default tied to n_hops in make_env_model (6 hops / 6 layers)
-    strategic_gate_eps: float = 0.0  # high-level gate: the analytic guidepost steers the actor only when max ego-window utility < eps (0 = always on)
-    use_gru: bool = True     # False = GRU ablation: actor/critic run feed-forward, no temporal memory
+    use_gru: bool = False    # default OFF (feed-forward actor/critic, no temporal memory). Opt in via --gru
     lr_actor: float = 3e-4
     lr_critic: float = 5e-4   # faster than actor (non-stationary value) but below paper's 1e-3 (oscillation risk)
     device: str = "cuda:0"
@@ -187,7 +186,6 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
         env = Explorer(split, cfg.env, seed=cfg.seed)
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
                             n_heads=cfg.n_heads, n_layers=cfg.n_layers,
-                            strategic_gate_eps=cfg.strategic_gate_eps,
                             use_gru=cfg.use_gru).to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
@@ -220,8 +218,12 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
     steps_to_90 = torch.full((N,), -1.0, device=dev)
     free_at_50  = torch.ones((N,), device=dev)
     free_at_90  = torch.ones((N,), device=dev)
+    # Autocast the policy forward during collection (the update loop already runs AMP): the
+    # encoder is the collect-time hot spot and runs ~2× faster in low precision. log_softmax
+    # stays fp32 under autocast, so the stored logp matches the update-side numerics.
+    use_amp = str(dev).startswith("cuda")
     for t in range(buf.T):
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=use_amp):
             out = model.act(obs, h_act, h_crit, deterministic=False)
         action = out["action"]
         logp = out["logp"]
@@ -256,7 +258,7 @@ def collect_rollout(env: Explorer, model: MarlActorCritic, buf: Rollout, h_act, 
         h_crit = h_crit * nonterm.view(-1, 1)
         obs = obs_next
     # Bootstrap V(s_T) under final obs.
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=use_amp):
         out = model.act(obs, h_act, h_crit, deterministic=True)
         v_last = vnorm.denormalize(out["value"])
     buf.last_value.copy_(v_last)
@@ -376,7 +378,8 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
         success = False
         s90 = float(T)
         for t in range(T):
-            out = model.act(obs, h_act, h_crit, deterministic=True)
+            with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=cfg.device.startswith("cuda")):
+                out = model.act(obs, h_act, h_crit, deterministic=True)
             obs, _r, done, info = eval_env.step(out["action"])
             h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
             er = float(info["explored_rate"][0].item())

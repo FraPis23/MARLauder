@@ -6,21 +6,7 @@ dones and initial recurrent states. GAE-λ on the team-mean per-step reward
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
-
-
-_OBS_KEYS_FLOAT = ("node_feat",)
-_OBS_KEYS_BOOL = ("node_valid", "edge_valid", "curr_nbr_valid", "action_mask")
-_OBS_KEYS_LONG = ("edge_idx", "curr_idx", "curr_nbr")
-
-
-@dataclass
-class BufferStats:
-    explored_rate_mean: float
-    reward_mean: float
-    return_mean: float
 
 
 class Rollout:
@@ -44,13 +30,15 @@ class Rollout:
             "edge_valid":         _z((T, N, M, N_max, K),     torch.bool),
             "curr_idx":           _z((T, N, M),               torch.long),
             "curr_nbr":           _z((T, N, M, K),            torch.long),
-            "curr_nbr_valid":     _z((T, N, M, K),            torch.bool),
+            # action_mask IS curr_nbr_valid env-side; store once (the update reads action_mask only).
             "action_mask":        _z((T, N, M, K),            torch.bool),
             "pos":                _z((T, N, M, 2),             torch.float32),
             # Previous-action one-hot per agent.
             "prev_action":        _z((T, N, M, K),             torch.float32),
-            # CTDE critic-only global state (value head only): 8-dim, shape from sample_obs.
-            # [explored_frac, t/T, geo_pair, coverage_rate, redundancy, tgt_dist, idle_frac, imbalance].
+            # Rendezvous raw actor obs [∆M surplus-gate, staleness] per agent.
+            "agent_scalars":      _z((T, N, M, sample_obs["agent_scalars"].shape[-1]), torch.float32),
+            # CTDE critic-only global state (value head only): shape from sample_obs.
+            # [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance].
             "critic_global":      _z((T, N, sample_obs["critic_global"].shape[-1]), torch.float32),
         }
         self.actions       = _z((T, N, M), torch.long)
@@ -96,11 +84,3 @@ class Rollout:
         ret_per_agent = adv + self.values.unsqueeze(-1).expand(-1, -1, M)  # [T, N, M]
         ret_team = ret_per_agent.mean(dim=-1)                               # [T, N]
         return adv, ret_team
-
-    def slice_step(self, t: int) -> dict:
-        """Return an obs dict at time t with shape [N, M, ...] — ready for model forward."""
-        return {k: v[t] for k, v in self.obs.items()}
-
-    def slice_chunk(self, t0: int, t1: int) -> dict:
-        """Stacked obs across a [t0, t1) chunk → tensors with leading dim (t1-t0)."""
-        return {k: v[t0:t1] for k, v in self.obs.items()}

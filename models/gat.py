@@ -34,14 +34,22 @@ from models.init_utils import apply_orthogonal
 
 
 # Default per-head raw-feature groups (feat order: 0 x_rel, 1 y_rel, 2 utility, 3 age,
-# 4 teammate_pot, 5 guidepost). Head 0→geometry, 1→utility, 2→teammate, 3→guidepost, rest free.
-# Head 3 gets a DEDICATED structural bias on feat[5] (the analytic guidepost ribbon): it's the only
-# anti-loop / beyond-window steering signal and was previously routed ONLY through the gradient-starved
-# input_proj + generic q/k path (no head read it directly) → weakest pathway of any feature. Giving it
-# its own A2 head injects the route directly, so an agent that runs out of local utility follows the
-# guidepost instead of stalling in a loop.
+# 4 teammate_pot, 5 radar-util, 6 radar-teammate). ENTITY split (v0.9):
+#   H0 [2,5] EXPLORE   — in-window utility + its beyond-window radar mass. Disjoint support
+#                        (feat[2] in-window, feat[5] only on horizon gateways) → one scalar bias
+#                        never nets them → a clean scale-invariant "seek exploration value" head.
+#   H1 [4,6] RENDEZVOUS — in-window teammate potential + beyond-window teammate direction. Same
+#                        disjoint-support argument → clean "seek teammate near-or-far" head.
+#   H2 [3]  AGE        — recency / anti-backtrack. Replaces the removed geometry head [0,1], whose
+#                        directional prior was redundant with the GRU + pointer; age is the direct
+#                        spatial anti-revisit signal.
+#   H3 [5,6] FAR-FIELD — dedicated beyond-window steering (anti-stall). b_util/b_teammate share the
+#                        gateway support so this head just says "there is mass beyond the window,
+#                        head to the boundary" (net magnitude ok — the SEPARATED far signals already
+#                        live in H0/H1). Injects the far heading past the gradient-starved q/k path,
+#                        the anti-loop mechanism that replaced the old analytic-guidepost ribbon.
 def default_head_feat_groups(n_heads: int, feat_dim: int) -> list[list[int]]:
-    base = [[0, 1], [2], [4], [5]]
+    base = [[2, 5], [4, 6], [3], [5, 6]]
     groups: list[list[int]] = []
     for h in range(n_heads):
         g = base[h] if h < len(base) else []

@@ -82,8 +82,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     model.encoder.store_attn = True
 
     # Node input-feature names (for the selected-node panel; these are raw obs values, not any
-    # attribution). Order matches node_feat channels 0..5.
-    F_NAMES = ["x_rel", "y_rel", "utility", "age", "teammate_pot", "guidepost",
+    # attribution). Order matches node_feat channels 0..6.
+    F_NAMES = ["x_rel", "y_rel", "utility", "age", "teammate_pot",
                "radar_util", "radar_teammate"]
 
     M = n_agents
@@ -104,7 +104,6 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     explored = None          # last true explored_rate from info; set each step
     completed = False        # episode reached complete_thresh coverage
     for t in range(n_steps):
-        gate = model._strategic_gate(obs, M)
         out = model.act(obs, h_act, h_crit, deterministic=True)
         rg = env._render_global
         nf = rg["node_feat"][0].cpu().numpy()
@@ -113,14 +112,10 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         uv = rg["util_volume"][0].cpu().numpy()      # [M, N_max] revealable unknown volume
         ev = rg["edge_valid"][0].cpu().numpy()
         curr = rg["curr_idx"][0].cpu().numpy()
-        tgt = rg["target"][0].cpu().numpy()
-        gd = rg["guidepost_dist"][0].cpu().numpy()
         logits = out["logits"][0].cpu().numpy()
         value = float(out["value"][0].cpu().numpy())
         action = out["action"][0].cpu().numpy()
-        gp_bias = obs["guidepost_nbr_bias"][0].cpu().numpy()
         amask = obs["action_mask"][0].cpu().numpy()
-        gate_np = gate.cpu().numpy().reshape(M) if gate is not None else np.zeros(M)
         # Teammate visibility for the inspector (env 0). pos_all = ground-truth xy of every
         # agent; lkp[i,j] = i's believed pos of j; cmask[i,j] = i&j communicating this step.
         pos_all = rg["pos"][0].cpu().numpy()                  # [M, 2]
@@ -189,11 +184,10 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             nodes = [{
                 "i": int(n), "x": _r(node_xy[n, 0], 1), "y": _r(node_xy[n, 1], 1),
                 "util": _r(nf[a, n, 2], 4), "age": _r(nf[a, n, 3], 3),
-                "team": _r(nf[a, n, 4], 3), "gp": _r(nf[a, n, 5], 1),
-                "bf": _r(gd[a, n] / nr, 2),
+                "team": _r(nf[a, n, 4], 3),
                 # RADAR boundary-summary channels (nonzero only on geodesic horizon nodes):
                 # bu = out-of-window utility mass, bt = out-of-window teammate direction.
-                "bu": _r(nf[a, n, 6], 3), "bt": _r(nf[a, n, 7], 3),
+                "bu": _r(nf[a, n, 5], 3), "bt": _r(nf[a, n, 6], 3),
                 # utility seed components: boundary-pixel ribbon × revealable volume.
                 "ub": _r(ub[a, n], 3), "uv": _r(uv[a, n], 3),
             } for n in vidx.tolist()]
@@ -217,15 +211,14 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             curr_nbrs = [int(edge_idx[cur, k]) for k in range(K)]
             rec["agents"].append({
                 # one animated GIF per agent; "fi" = frame index (= step t) to seek to.
-                "frame": f"frames/a{a}.gif", "fi": t, "curr": cur, "target": int(tgt[a]),
+                "frame": f"frames/a{a}.gif", "fi": t, "curr": cur,
                 # pre-step position (matches the rendered frame + teammate overlay; reading
                 # env.pos AFTER step() shows the next/teleported-on-reset spot — the last-step bug).
                 "pos": [_r(pos_all[a, 0], 1), _r(pos_all[a, 1], 1)],
-                "value": _r(value), "gate": int(round(float(gate_np[a]))),
+                "value": _r(value),
                 "action": int(action[a]),
                 "logits": [_r(x, 3) for x in logits[a].tolist()],
                 "action_mask": [int(b) for b in amask[a].tolist()],
-                "guidepost_dir": [_r(x, 2) for x in gp_bias[a].tolist()],
                 "curr_nbrs": curr_nbrs,
                 "reward": rew, "nodes": nodes, "edges": edges,
                 "teammates": teammates,
@@ -253,11 +246,10 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             term_agents.append({
                 "frame": f"frames/a{a}.gif", "fi": term_fi,        # union map (last GIF frame)
                 "curr": int(steps[-1]["agents"][a]["curr"]) if steps else 0,
-                "target": -1,
                 "pos": [_r(pos_now[a, 0], 1), _r(pos_now[a, 1], 1)],
-                "value": None, "gate": 0, "action": -1,
+                "value": None, "action": -1,
                 "logits": [None] * K, "action_mask": [0] * K,
-                "guidepost_dir": [0.0] * K, "curr_nbrs": [-1] * K,
+                "curr_nbrs": [-1] * K,
                 "reward": {}, "nodes": [], "edges": [], "gat": None,
                 # all agents share the complete map now → draw teammates solid at true pos.
                 "teammates": [{"j": int(j), "comm": 1,
@@ -290,8 +282,6 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             "n_steps": len(steps), "K_OFFSETS": _KOFF,
             "final_explored": _r(explored) if explored is not None else None,
             "completed": bool(completed),
-            "gate_eps": getattr(model, "strategic_gate_eps", 0.0),
-            "target_mode": "analytic",
             # GAT geometry for the attention viewer: n_layers = message-passing hops, n_heads =
             # separate attention heads (all real, all used by the model).
             "gat_layers": len(model.encoder.layers),

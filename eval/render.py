@@ -89,8 +89,8 @@ def paint_path(
     color: tuple[int, int, int] = C_PATH,
     width: int = 3,
 ) -> Image.Image:
-    """Draw the guidepost polyline. path_xy [P, 2], path_valid [P] bool.
-    Path goes target → ... → curr; valid entries are drawn as a polyline."""
+    """Draw an optional route polyline. path_xy [P, 2], path_valid [P] bool.
+    Valid entries are drawn as a polyline (None → nothing drawn)."""
     if path_xy is None or path_valid is None:
         return im
     pts = [(float(path_xy[p, 0]), float(path_xy[p, 1])) for p in range(path_xy.shape[0]) if bool(path_valid[p])]

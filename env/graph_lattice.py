@@ -18,10 +18,10 @@ order matching the action space:
     0:NW  1:N  2:NE  3:W  4:E  5:SW  6:S  7:SE
 
 Edge lengths (precomputed [K]):
-    axial = NR,  diagonal = NR·√2 — used by `build_guidepost` for true Dijkstra.
+    axial = NR,  diagonal = NR·√2 — used by `bf_from_target` for true geodesic BF.
 
 Per-step compute is O(LH * LW * K) plus a flood-fill (~diameter conv2d iters)
-plus an optional Bellman-Ford for guidepost. All ops batched over n_envs.
+plus a from-curr Bellman-Ford feeding the radar. All ops batched over n_envs.
 
 Public API
 ----------
@@ -29,9 +29,9 @@ Public API
                  collision_samples=5, device=...)
     graph.build(occupancy, frontier, robot_xy_world, visited_step, current_step)
         -> info dict (see return at end of build)
-    graph.build_guidepost(info)
-        -> augments info in-place with guidepost_mask, guidepost_target,
-           guidepost_path_idx, guidepost_path_valid, guidepost_path_xy
+    graph.bf_from_target(info, target, dist_init)   -> geodesic BF dist/parent field
+    graph.build_radar(info, teammate_src, gamma_r)  -> feat[5] b_util, feat[6] b_teammate
+    graph.extract_local_window(info)                -> ego-centric (2·n_hops+3)² window
 """
 from __future__ import annotations
 
@@ -362,10 +362,10 @@ class GraphLattice:
         li_curr = (robot_xy[:, 1] / float(self.NR)).long().clamp(0, self.LH - 1)
         curr_idx = li_curr * self.LW + lj_curr                   # [N]
 
-        # 6) Per-node features (8 dims). Channels 0-5 filled here / by Explorer; 6-7 are the
+        # 6) Per-node features (7 dims). Channels 0-4 filled here / by Explorer; 5-6 are the
         #    RADAR boundary-summary channels (b_util, b_teammate), written by Explorer.build_radar
         #    onto the geodesic receptive-horizon nodes (0 everywhere else). See build_radar().
-        node_feat = torch.zeros((N, self.N_max, 8), dtype=torch.float32, device=dev)
+        node_feat = torch.zeros((N, self.N_max, 7), dtype=torch.float32, device=dev)
         curr_xy = self.node_xy[curr_idx]                          # [N, 2]
         # EGO-SCALE normalization. The GAT only ever sees the (2·n_hops+3)² window centered on
         # curr, so the relative coords of in-window nodes span at most ±window_radius·NR px.
@@ -385,9 +385,8 @@ class GraphLattice:
         age = torch.where(visited_step < 0, torch.ones_like(age), age)
         node_feat[..., 3] = age
         # feat[4] teammate BF-proximity potential (M>1, written by Explorer)
-        # feat[5] guidepost (filled by build_guidepost if called)
-        # feat[6] b_util  — RADAR: geodesically-routed out-of-window utility mass (Explorer)
-        # feat[7] b_teammate — RADAR: geodesically-routed out-of-window teammate direction (Explorer)
+        # feat[5] b_util  — RADAR: geodesically-routed out-of-window utility mass (Explorer)
+        # feat[6] b_teammate — RADAR: geodesically-routed out-of-window teammate direction (Explorer)
         node_feat = node_feat * node_valid.unsqueeze(-1).float()
 
         # 7) curr_nbr gather.
@@ -409,7 +408,6 @@ class GraphLattice:
             "curr_nbr_valid": curr_nbr_valid,
             "utility": utility_norm,
             # util_raw = f_ind: PRE-diffusion frontier seed (nonzero ONLY on true frontier nodes).
-            # Experimental: feed to select_target_analytic instead of the diffused utility_norm.
             "util_raw": f_ind,
             # Inspector decomposition of the utility seed (pre-diffusion, per node) — these are
             # references to tensors already computed above, so they add ZERO training compute
@@ -421,146 +419,6 @@ class GraphLattice:
             "util_volume":   vol,
             "edge_valid_optim": edge_valid_optim,   # [N,N_max,K] or None (M==1 / flag off)
         }
-
-    # ---------------------------------------------------------------------- #
-    # guidepost (Bellman-Ford on GPU)                                         #
-    # ---------------------------------------------------------------------- #
-    @torch.no_grad()
-    def build_guidepost(self, info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Batched Bellman-Ford with edge_len weights from curr_idx.
-
-        Mutates `info` in-place to add:
-            guidepost_mask     bool  [N, N_max]      nodes lying on shortest path
-            guidepost_target   long  [N]             flat idx of best target (utility argmax over reachable)
-            guidepost_path_idx long  [N, P_max]      from-curr-to-target node indices, -1 padded
-            guidepost_path_valid bool [N, P_max]
-            guidepost_path_xy  float [N, P_max, 2]   world coords for render (NaN-padded)
-
-        Also writes the mask into `info['node_feat'][..., 5]` to populate feat[5].
-        """
-        edge_idx = info["edge_idx"]        # [N, N_max, K]
-        edge_valid = info["edge_valid"]    # [N, N_max, K]
-        node_valid = info["node_valid"]    # [N, N_max]
-        utility = info["utility"]          # [N, N_max]
-        curr_idx = info["curr_idx"]        # [N]
-        node_xy = self.node_xy             # [N_max, 2]
-
-        N = edge_idx.shape[0]
-        N_max = self.N_max
-        K_ = K
-        dev = edge_idx.device
-        INF = float("inf")
-
-        # dist[N, N_max] init INF, dist[curr] = 0.
-        dist = torch.full((N, N_max), INF, dtype=torch.float32, device=dev)
-        arange_N = torch.arange(N, device=dev)
-        dist[arange_N, curr_idx] = 0.0
-        parent = torch.full((N, N_max), -1, dtype=torch.long, device=dev)
-
-        edge_len = self.edge_len.view(1, 1, K_)                          # [1, 1, K]
-        edge_idx_safe = edge_idx.clamp(min=0)                             # gather-safe
-
-        # Iterate Bellman-Ford relaxations. Process the relaxation as:
-        #   for each node v, look at its 8 neighbors u; candidate dist via u = dist[u] + w(u, v)
-        # The static `edge_idx[v, k]` here means "what is the neighbor u? edge from v to that u".
-        # Since the graph is undirected with symmetric weights and same K layout,
-        # using the candidate `dist[u] + edge_len[k]` is equivalent to relaxing v through u.
-        for it in range(self.guidepost_iters):
-            # Gather dist of each neighbor.
-            nbr_dist = torch.gather(
-                dist, dim=1, index=edge_idx_safe.view(N, -1)
-            ).view(N, N_max, K_)                                          # [N, N_max, K]
-            cand = nbr_dist + edge_len                                    # [N, N_max, K]
-            cand = cand.masked_fill(~edge_valid, INF)
-            # best per node v over K neighbors
-            best_vals, best_k = cand.min(dim=-1)                          # [N, N_max]
-            # update where best < dist
-            update = best_vals < dist
-            dist = torch.where(update, best_vals, dist)
-            # parent[v] = edge_idx[v, best_k]
-            best_parent = torch.gather(edge_idx, dim=2, index=best_k.unsqueeze(-1)).squeeze(-1)
-            parent = torch.where(update, best_parent, parent)
-            # cheap early exit (avoid sync every iter)
-            if it >= 4 and (it % 8 == 0):
-                if not bool(update.any().item()):
-                    break
-
-        # Pick target = argmax(utility) over reachable + valid nodes.
-        reachable = (dist < INF) & node_valid                             # [N, N_max]
-        util_for_target = torch.where(reachable, utility, torch.full_like(utility, -1.0))
-        target = util_for_target.argmax(dim=-1)                           # [N]
-        # If all unreachable / zero utility, target == curr (no-op).
-        no_util = (util_for_target.max(dim=-1).values <= 0)
-        target = torch.where(no_util, curr_idx, target)
-
-        # Reconstruct path by walking parent pointers from target → curr.
-        P_max = self.guidepost_path_max
-        path_idx = torch.full((N, P_max), -1, dtype=torch.long, device=dev)
-        path_valid = torch.zeros((N, P_max), dtype=torch.bool, device=dev)
-        # Start at target; first slot in path_idx[:, 0] is target.
-        cur = target.clone()
-        active = torch.ones(N, dtype=torch.bool, device=dev) & (target != curr_idx)
-        for p in range(P_max):
-            path_idx[:, p] = torch.where(active, cur, torch.full_like(cur, -1))
-            path_valid[:, p] = active
-            # advance: if cur == curr_idx, stop after recording this slot.
-            reached_curr = (cur == curr_idx)
-            # next node = parent[cur]; deactivate if cur reached curr_idx or parent == -1
-            par = parent[arange_N, cur]
-            stop = reached_curr | (par < 0)
-            active = active & ~stop
-            cur = torch.where(stop, cur, par)
-
-        # Always include curr_idx as final waypoint if path has length.
-        # The loop already records cur == curr_idx when reached_curr triggers.
-
-        # Build mask of nodes on path.
-        guidepost_mask = torch.zeros((N, N_max), dtype=torch.bool, device=dev)
-        # scatter at path_idx where valid
-        safe_pi = path_idx.clamp(min=0)
-        mask_v = path_valid
-        guidepost_mask.scatter_(1, safe_pi, mask_v)
-        # Also include curr itself.
-        guidepost_mask[arange_N, curr_idx] = True
-
-        # Path xy for render. NaN-padded.
-        path_xy = torch.full((N, P_max, 2), float("nan"), dtype=torch.float32, device=dev)
-        safe_xy = node_xy[safe_pi]                                        # [N, P_max, 2]
-        path_xy = torch.where(path_valid.unsqueeze(-1), safe_xy, path_xy)
-
-        # next_hop[N]: the neighbor of curr_idx that lies on the shortest path
-        # toward target. Identify as the node whose parent == curr_idx among path nodes.
-        # path_idx walks target → ... → curr; the slot immediately before curr_idx
-        # is the next hop. Find it by scanning path_idx for entries with parent == curr_idx.
-        next_hop = curr_idx.clone()                                       # default: stay put
-        for p in range(P_max):
-            slot = path_idx[:, p]                                          # [N]
-            slot_safe = slot.clamp(min=0)
-            par = parent[arange_N, slot_safe]                              # parent of slot node
-            is_next = (par == curr_idx) & (slot >= 0) & path_valid[:, p]
-            # only overwrite where we haven't found a next_hop yet (stay put → curr_idx)
-            need = (next_hop == curr_idx) & is_next
-            next_hop = torch.where(need, slot, next_hop)
-
-        # Build per-K bias for pointer: 1.0 at the K-slot whose neighbor flat-idx == next_hop.
-        # curr_nbr is [N, K] from build().
-        curr_nbr = info["curr_nbr"]                                        # [N, K]
-        guidepost_nbr_bias = (curr_nbr == next_hop.unsqueeze(-1)).float()  # [N, K]
-        # If next_hop == curr (no path), bias all zero.
-        any_match = guidepost_nbr_bias.sum(dim=-1, keepdim=True) > 0
-        guidepost_nbr_bias = guidepost_nbr_bias * any_match.float()
-
-        # Write feat[6] guidepost.
-        info["node_feat"][..., 5] = guidepost_mask.float()
-        info["guidepost_mask"] = guidepost_mask
-        info["guidepost_target"] = target
-        info["guidepost_path_idx"] = path_idx
-        info["guidepost_path_valid"] = path_valid
-        info["guidepost_path_xy"] = path_xy
-        info["guidepost_dist"] = dist
-        info["guidepost_next_hop"] = next_hop                              # [N]
-        info["guidepost_nbr_bias"] = guidepost_nbr_bias                    # [N, K]
-        return info
 
     # ---------------------------------------------------------------------- #
     # B1 redo: BF from TARGET + warm-start + overwrite-mode + early exit     #
@@ -710,274 +568,6 @@ class GraphLattice:
         b_team = b_team.clamp(0.0, 1.0)
         return b_util, b_team
 
-    @torch.no_grad()
-    def analytic_next_hop(
-        self,
-        curr_idx: torch.Tensor,                  # [N] flat node idx
-        target: torch.Tensor,                    # [N] flat node idx
-        edge_valid: torch.Tensor,                # [N, N_max, K]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """O(1) analytic direction from curr toward target on the lattice.
-
-        Returns:
-            k_analytic  [N] long  — K-slot of the immediate-step direction toward
-                                    target. -1 when curr == target.
-            edge_clear  [N] bool  — True if the immediate edge (curr, k_analytic)
-                                    is valid. Does NOT trace the full path; only
-                                    checks the first hop. (Full-path tracing would
-                                    require a Python loop and lose the O(1) cost.)
-        """
-        N = curr_idx.shape[0]
-        dev = curr_idx.device
-        arange_N = torch.arange(N, device=dev)
-        curr_li = curr_idx // self.LW
-        curr_lj = curr_idx % self.LW
-        tgt_li = target // self.LW
-        tgt_lj = target % self.LW
-        d_li = torch.sign(tgt_li - curr_li).long()                        # {-1, 0, +1}
-        d_lj = torch.sign(tgt_lj - curr_lj).long()
-        k_analytic = self.K_INDEX_TABLE[d_li + 1, d_lj + 1]               # [N], -1 if curr==target
-        # Check edge_valid[arange, curr_idx, k_analytic]. k_analytic == -1 needs masking.
-        k_safe = k_analytic.clamp(min=0)
-        edge_at = edge_valid[arange_N, curr_idx, k_safe]                  # [N]
-        edge_clear = edge_at & (k_analytic >= 0)
-        return k_analytic, edge_clear
-
-    @torch.no_grad()
-    def select_target_no_bf(
-        self,
-        utility: torch.Tensor,        # [N, N_max]
-        node_valid: torch.Tensor,     # [N, N_max]
-    ) -> torch.Tensor:
-        """Target = argmax(utility · node_valid). node_valid is set by flood-fill from
-        curr in build() and already filters reachability, so a 'valid' node IS reachable
-        from curr through known-FREE space. No BF needed for target selection."""
-        masked = torch.where(node_valid, utility, torch.full_like(utility, -1.0))
-        target = masked.argmax(dim=-1)                                     # [N]
-        return target
-
-    def select_target_analytic(
-        self,
-        utility: torch.Tensor,        # [N, N_max]  (frontier-gated, >0 only near frontiers)
-        node_valid: torch.Tensor,     # [N, N_max]  reachable-through-FREE mask
-        bf_dist_curr: torch.Tensor,   # [N, N_max]  BF path length curr→node (+inf unreachable)
-        d_team: torch.Tensor | None = None,   # [N, N_max] BF dist teammate→node (rendezvous anchor)
-        w: torch.Tensor | None = None,        # [N] offer weight ∈[0,1] (how much fresh map I owe)
-        beta: float = 1.0,            # distance discount (per NR node-unit)
-        lam: float = 1.0,             # rendezvous pull strength
-        prev_target: torch.Tensor | None = None,  # [N] last step's committed target (-1 none)
-        curr_idx: torch.Tensor | None = None,      # [N] curr node — safe fallback when no frontier
-        keep_margin: float = 0.2,     # commit: keep prev unless best beats it by >this fraction
-        exclude: torch.Tensor | None = None,  # [N, N_max] bool: nodes a teammate out-ranked → drop
-        d_team_min: torch.Tensor | None = None,  # [N, N_max] BF dist NEAREST teammate→node (ownership)
-        sep_w: float | torch.Tensor = 0.0,   # separation strength ∈[0,1] (0 = off). [N] tensor → per-env
-                                             # (e.g. 1−w: separate when nothing fresh to offer)
-        sep_k: float = 2.0,           # ownership-gate sigmoid sharpness (per hop)
-        sep_m: float = 0.0,           # margin: hops a teammate must be closer before I yield
-    ) -> torch.Tensor:
-        """Deterministic global target = the frontier that maximizes
-
-            explore(c) = utility(c) / (1 + β·BF_dist(curr→c)/NR)            # nearest-richest
-            score(c)   = explore(c) · (1 + λ·w·rdv(c)),  rdv(c)=1/(1+β·d_team(c)/NR)
-
-        w≈0 → pure exploration; w high → among comparable frontiers prefer the one toward the
-        teammate I owe the most fresh map → explore-while-converging for a map-exchange
-        rendezvous. Candidates restricted to reachable nodes with utility>0 (frontier-anchored).
-        """
-        nr = float(self.NR)
-        dc = bf_dist_curr / nr
-        dc = torch.where(torch.isfinite(dc), dc, torch.full_like(dc, 1.0e6))
-        explore = utility / (1.0 + beta * dc)
-        score = explore
-        if d_team is not None and w is not None:
-            dt = d_team / nr
-            dt = torch.where(torch.isfinite(dt), dt, torch.full_like(dt, 1.0e6))
-            rdv = 1.0 / (1.0 + beta * dt)
-            score = explore * (1.0 + lam * w.unsqueeze(-1) * rdv)
-        # Separation / ownership: down-weight frontiers a teammate is closer to (division of labor).
-        # adv > 0 → I'm closer (mine) → gate≈1; adv < 0 → teammate closer → gate≈0 → score scaled
-        # down by (1 − sep_w). One-sided (never negative → no repulsion); single-frontier still wins
-        # the argmax (only down-weighted, not zeroed → no idle).
-        sep_is_tensor = isinstance(sep_w, torch.Tensor)
-        sep_active = sep_is_tensor or sep_w > 0.0
-        if d_team_min is not None and sep_active:
-            dtm = d_team_min / nr
-            dtm = torch.where(torch.isfinite(dtm), dtm, torch.full_like(dtm, 1.0e6))
-            adv = dtm - dc                                                 # hops; >0 = mine
-            own_gate = torch.sigmoid(sep_k * (adv - sep_m))               # ∈(0,1)
-            sw = sep_w.unsqueeze(-1) if sep_is_tensor else sep_w           # [N,1] broadcast over nodes
-            score = score * (1.0 - sw * (1.0 - own_gate))
-        elig = node_valid & (utility > 0.0)
-        if curr_idx is not None:
-            # Exclude the node the agent is ON: even if it's still a frontier (unknown within NR
-            # due to range/occlusion), staying re-scans nothing — the agent must MOVE toward the
-            # unknown. Zero distance (dc=0) would otherwise let curr win the argmax → self-target.
-            node_idx = torch.arange(self.N_max, device=utility.device).view(1, -1)
-            elig = elig & (node_idx != curr_idx.unsqueeze(1))
-        if exclude is not None:
-            elig = elig & ~exclude                                         # drop teammate-claimed nodes
-        masked = torch.where(elig, score, torch.full_like(score, 0.0))     # 0 = ineligible (scores>0)
-        best_idx = masked.argmax(dim=-1)                                   # [N]
-        best_val = masked.gather(1, best_idx.unsqueeze(1)).squeeze(1)      # [N]
-        has_elig = elig.any(dim=-1)                                        # [N]
-        # Commitment / hysteresis: keep last step's target unless a candidate beats it by
-        # > keep_margin (fraction) — stops the 1-step argmax flip that ping-pongs the guidepost.
-        target = best_idx
-        if prev_target is not None:
-            pv = prev_target.clamp(min=0)
-            prev_elig = torch.gather(elig, 1, pv.unsqueeze(1)).squeeze(1) & (prev_target >= 0)
-            prev_val = masked.gather(1, pv.unsqueeze(1)).squeeze(1)
-            keep = prev_elig & (best_val <= prev_val * (1.0 + keep_margin))
-            target = torch.where(keep, pv, best_idx)
-        # Safe fallback: no eligible frontier at all → stay on curr (guidepost→self→zero bias),
-        # NEVER node 0 (which renders as an off-map top-left target).
-        if curr_idx is not None:
-            target = torch.where(has_elig, target, curr_idx)
-        return target                                                     # [N]
-
-    def select_target_nearest_bf(
-        self,
-        utility: torch.Tensor,        # [N, N_max]  (frontier-gated, >0 only near frontiers)
-        node_valid: torch.Tensor,     # [N, N_max]  reachable-through-FREE mask
-        bf_dist_curr: torch.Tensor,   # [N, N_max]  BF path length curr→node (+inf unreachable)
-        prev_target: torch.Tensor | None = None,   # [N] last step's committed target (-1 none)
-        curr_idx: torch.Tensor | None = None,      # [N] curr node — safe fallback when no frontier
-        keep_margin: float = 0.2,     # commit: keep prev unless a new frontier is >this fraction CLOSER
-        exclude: torch.Tensor | None = None,       # [N, N_max] bool: nodes a teammate claimed → drop
-    ) -> torch.Tensor:
-        """Global target = the reachable frontier with the SMALLEST BF path distance from curr.
-
-        Pure greedy-nearest on the wall-aware BF field — ignores utility magnitude, rendezvous
-        and separation (those are the analytic selector's job). The guidepost then just points the
-        agent at the closest unexplored boundary it can actually reach. Same eligibility set as the
-        analytic path (reachable, utility>0, not the curr node, not teammate-claimed) and the same
-        fallback (stay on curr when no frontier) so downstream code is unchanged.
-        """
-        INF = float("inf")
-        elig = node_valid & (utility > 0.0)
-        if curr_idx is not None:
-            node_idx = torch.arange(self.N_max, device=utility.device).view(1, -1)
-            elig = elig & (node_idx != curr_idx.unsqueeze(1))          # must MOVE off curr
-        if exclude is not None:
-            elig = elig & ~exclude
-        dist = torch.where(elig, bf_dist_curr, torch.full_like(bf_dist_curr, INF))
-        best_idx = dist.argmin(dim=-1)                                  # [N] nearest reachable frontier
-        best_val = dist.gather(1, best_idx.unsqueeze(1)).squeeze(1)     # [N]
-        has_elig = elig.any(dim=-1)                                     # [N]
-        # Commitment / hysteresis: keep last step's target unless a candidate is closer by
-        # > keep_margin (fraction) — stops the 1-step argmin flip when two frontiers tie in reach.
-        target = best_idx
-        if prev_target is not None:
-            pv = prev_target.clamp(min=0)
-            prev_elig = torch.gather(elig, 1, pv.unsqueeze(1)).squeeze(1) & (prev_target >= 0)
-            prev_val = dist.gather(1, pv.unsqueeze(1)).squeeze(1)
-            # smaller dist is better → keep prev unless the new nearest beats it by the margin.
-            keep = prev_elig & (best_val >= prev_val * (1.0 - keep_margin))
-            target = torch.where(keep, pv, best_idx)
-        # Safe fallback: no eligible frontier → stay on curr (never node 0 / off-map top-left).
-        if curr_idx is not None:
-            target = torch.where(has_elig, target, curr_idx)
-        return target                                                     # [N]
-
-    @torch.no_grad()
-    def build_guidepost_v2(
-        self,
-        info: dict[str, torch.Tensor],
-        target: torch.Tensor,                    # [N] target flat idx
-        dist_init: torch.Tensor | None = None,   # [N, N_max] warm-start dist
-    ) -> dict[str, torch.Tensor]:
-        """B1-redo guidepost: BF FROM target (not curr), overwrite-mode, warm-startable.
-
-        Writes the same info-dict fields as `build_guidepost`. Downstream code does
-        not change. The semantic change is: `parent[v]` now points TOWARD target (not
-        toward curr), so the path is reconstructed by walking parent from curr.
-
-        Args:
-            info: dict from `build()` (must contain edge_idx, edge_valid, node_valid,
-                  utility, curr_idx, curr_nbr, curr_nbr_valid, node_xy).
-            target: [N] flat node idx of the BF source (= long-horizon goal).
-            dist_init: optional warm-start [N, N_max] from a previous step. When the
-                       target is unchanged across steps, this dramatically cuts BF iters.
-
-        Writes to `info`:
-            guidepost_mask        bool  [N, N_max]
-            guidepost_target      long  [N]
-            guidepost_path_idx    long  [N, P_max]      curr → ... → target
-            guidepost_path_valid  bool  [N, P_max]
-            guidepost_path_xy     float [N, P_max, 2]
-            guidepost_dist        float [N, N_max]      for next-step warm-start
-            guidepost_next_hop    long  [N]
-            guidepost_nbr_bias    float [N, K]
-        Also fills `info["node_feat"][..., 5]`.
-        """
-        edge_idx = info["edge_idx"]
-        edge_valid = info["edge_valid"]
-        node_valid = info["node_valid"]
-        curr_idx = info["curr_idx"]
-        curr_nbr = info["curr_nbr"]              # [N, K] flat indices, -1 padded
-        curr_nbr_valid = info["curr_nbr_valid"]  # [N, K]
-        node_xy = self.node_xy
-
-        N = edge_idx.shape[0]
-        N_max = self.N_max
-        K_ = K
-        P_max = self.guidepost_path_max
-        dev = edge_idx.device
-        INF = float("inf")
-        arange_N = torch.arange(N, device=dev)
-
-        # 1) BF FROM target with warm-start. Returns dist[N, N_max], parent[N, N_max].
-        dist, parent = self.bf_from_target(info, target=target, dist_init=dist_init)
-
-        # 2) next_hop = parent[curr]. If parent[curr] < 0 (curr == target or unreachable),
-        #    stay put (next_hop = curr).
-        par_at_curr = parent[arange_N, curr_idx]                          # [N]
-        next_hop = torch.where(par_at_curr >= 0, par_at_curr, curr_idx)
-
-        # 3) Reconstruct path by walking parent from curr toward target.
-        path_idx = torch.full((N, P_max), -1, dtype=torch.long, device=dev)
-        path_valid = torch.zeros((N, P_max), dtype=torch.bool, device=dev)
-        cur = curr_idx.clone()
-        active = torch.ones(N, dtype=torch.bool, device=dev)
-        for p in range(P_max):
-            path_idx[:, p] = torch.where(active, cur, torch.full_like(cur, -1))
-            path_valid[:, p] = active
-            reached_target = (cur == target)
-            par = parent[arange_N, cur]
-            stop = reached_target | (par < 0)
-            active = active & ~stop
-            cur = torch.where(stop, cur, par)
-
-        # 4) Mask
-        guidepost_mask = torch.zeros((N, N_max), dtype=torch.bool, device=dev)
-        safe_pi = path_idx.clamp(min=0)
-        guidepost_mask.scatter_(1, safe_pi, path_valid)
-        guidepost_mask[arange_N, curr_idx] = True
-
-        # 5) path_xy for render
-        path_xy = torch.full((N, P_max, 2), float("nan"), dtype=torch.float32, device=dev)
-        safe_xy = node_xy[safe_pi]
-        path_xy = torch.where(path_valid.unsqueeze(-1), safe_xy, path_xy)
-
-        # 6) guidepost_nbr_bias: one-hot over K at the slot matching next_hop
-        guidepost_nbr_bias = (curr_nbr == next_hop.unsqueeze(-1)).float()
-        any_match = guidepost_nbr_bias.sum(dim=-1, keepdim=True) > 0
-        guidepost_nbr_bias = guidepost_nbr_bias * any_match.float()
-
-        # 7) Write feat[6] + info
-        info["node_feat"][..., 5] = guidepost_mask.float()
-        info["guidepost_mask"] = guidepost_mask
-        info["guidepost_target"] = target
-        info["guidepost_path_idx"] = path_idx
-        info["guidepost_path_valid"] = path_valid
-        info["guidepost_path_xy"] = path_xy
-        info["guidepost_dist"] = dist
-        info["guidepost_next_hop"] = next_hop
-        info["guidepost_nbr_bias"] = guidepost_nbr_bias
-        # Target world coords (render uses this — node_xy in obs is local window now).
-        info["guidepost_target_xy"] = node_xy[target]                 # [N, 2]
-        return info
-
     # ---------------------------------------------------------------------- #
     # Phase C: extract ego-centric subgraph window centered on curr_idx       #
     # ---------------------------------------------------------------------- #
@@ -994,9 +584,8 @@ class GraphLattice:
         are LOCAL indices into [0, window_size). The global-flat `curr_nbr`
         (needed by env.step to decode actions) is retained as `curr_nbr_global`.
 
-        All other fields produced by `build()` / `build_guidepost_v2()` are kept
-        from `info` for downstream use (visited_step, guidepost_path_xy in global
-        world coords, etc.). The caller decides which subset to expose in obs.
+        All other fields produced by `build()` are kept from `info` for downstream
+        use. The caller decides which subset to expose in obs.
         """
         edge_idx_global = info["edge_idx"]                     # [N, N_max, K]
         edge_valid_global = info["edge_valid"]                 # [N, N_max, K]

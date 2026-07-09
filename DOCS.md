@@ -1,12 +1,11 @@
 # MARLauder — Module Map, Parameters, Commands
 
-GPU-vectorized graph MAPPO for cooperative exploration. Multi-agent with
-intermittent line-of-sight communication. v0.4 (per-agent occupancy maps,
-comm + map fusion, per-agent eval render, **per-agent set-op reward**,
-**strategic frontier-attention head** with Gumbel-ST, **ego-centric encoder**,
-**BF-from-curr + BF-from-teammate** for true-cost candidate ranking, joint
-exploration-distribution feature, learnable+floored path-following bias,
-anti-chase signals, ramping curriculum, debug full-sharing flags).
+GPU-vectorized graph MAPPO for cooperative exploration. Multi-agent with intermittent
+signal-strength communication. A genuinely **learned** policy: no analytic guidepost, no
+hand-picked target, no strategic candidate head — the actor steers purely from the ego-window
+GAT features (local frontier utility + the beyond-window "radar" channels) plus two rendezvous
+scalars, through a GRU and a pointer action head. Per-agent privileged novel-scan reward + dense
+rendezvous economy; count-invariant CTDE critic (mean⊕max pooling).
 
 ---
 
@@ -17,8 +16,10 @@ MARLauder/
 ├── env/                Simulation: world, sensors, graph, frontier, env loop
 ├── models/             Networks: GAT encoder, ActorCritic, value normalizer
 ├── train/              MAPPO trainer: buffer, update, driver
-├── eval/               Eval: deterministic rollout + GIF renderer
+├── eval/               Eval: deterministic rollout + trace + GIF renderer
 ├── scripts/            CLI entrypoints + step-by-step tests
+├── viz/                inspector.html (attention + reward step-through)
+├── docs/               architecture.html (pipeline diagram)
 ├── data/               Preprocessed map tensors (uint8 memmap + meta.npz)
 ├── docker/             Dockerfile + compose for the runtime image
 └── DOCS.md             This file
@@ -28,52 +29,49 @@ MARLauder/
 
 | File | Purpose |
 |---|---|
-| `world_warp.py` | GPU LiDAR via NVIDIA Warp. Maintains **per-agent** `occupancy_torch [N, M, H, W]` (stored flat as `[N·M, H, W]` for Warp's max-3-dim kernel indexing) and `occupancy_logodds_torch`. Exposes `team_occupancy()` (union across agents) and `fuse_maps(comm_mask)` (elementwise **max-magnitude** log-odds where two agents are in comm — keeps OBSTACLE evidence). **Self-cell FREE invariant** (`_mark_pos_free`): the lidar loop starts at t=1.0 so it never marks the robot's own cell; the kernel stamps a 3×3 footprint at `2·LO_FREE` so the cell clears the strict `v > LO_FREE_TH` test. **Bug history (2026-06-11):** a single `LO_FREE` add landed at exactly the threshold → origin stayed UNKNOWN → the agent's current graph node was invalid (`node_valid` floods FROM the robot cell) → 0 legal moves → every action hit the invalid-action fallback and **teleported**. Coverage still hit ~92% via teleport-bouncing, masking it. ALL pre-fix sweeps (`uelh3hs3`, `odft9txk`, `wyhlx0ki`) are invalid. |
-| `maps.py` | Load preprocessed `data/<split>/maps.npy` + `meta.npz`; sample N maps to GPU. `MultiSplit` wrapper (weighted union of splits, used by curriculum). `sample_batch` accepts `Split` or `MultiSplit`. |
+| `world_warp.py` | GPU LiDAR via NVIDIA Warp. Maintains **per-agent** `occupancy_torch [N, M, H, W]` (stored flat as `[N·M, H, W]` for Warp's max-3-dim kernel indexing) and `occupancy_logodds_torch`. `fuse_maps(comm_mask)` merges connected pairs via elementwise **max-magnitude** log-odds (keeps OBSTACLE evidence a plain `max` would drop). **Self-cell FREE invariant** (`_mark_pos_free`): the lidar loop starts at t=1.0 so it never marks the robot's own cell; the kernel stamps a 3×3 footprint at `2·LO_FREE` so the origin clears the strict `v > LO_FREE_TH` test. Bug history (2026-06-11): a single `LO_FREE` add landed exactly at threshold → origin stayed UNKNOWN → current graph node invalid → 0 legal moves → invalid-action teleport, masked by ~92% coverage. Pre-fix sweeps invalid. |
+| `maps.py` | Load preprocessed `data/<split>/maps.npy` + `meta.npz`; sample N maps to GPU. `MultiSplit` (weighted union of splits, curriculum). |
 | `frontier.py` | Torch conv2d frontier detector. `compute_frontier(occupancy)` → bool [N,H,W]. Frontier = FREE cell with 2..7 UNKNOWN neighbors. |
-| `graph_lattice.py` | Core graph manager. 8-neighbor lattice on free cells, reachability flood-fill, collision-checked edges, integral-image utility. `bf_from_target(info, target, dist_init)` — overwrite-mode warm-startable Bellman-Ford from any source node (used for guidepost target, BF-from-curr, BF-from-teammate). `extract_topk_candidates(util, valid, curr_xy, K, bf_dist)` — top-K frontier candidates with BF distances. `build_guidepost_v2`. `curr_idx` from O(1) floor-divide. |
-| `explorer.py` | Vectorized environment. Per-agent occupancy + positions + `last_known_pos[N,M,M,2]` + `visited_step` + reward-baseline caches (`last_meeting_node_mask`, `last_own_free_node`) + BF warm-start caches (`_dist_curr_prev`, `_dist_team_prev`). `step(action)`: sub-step LiDAR move, wall revert + **asymmetric agent-agent collision** (lower-priority agent yields via per-episode `_collision_key`; winner advances, reverts too only if still blocked), `_comm_check` (Euclidean range + Bresenham LOS), `fuse_maps`, **per-agent set-op reward** (incl. objective second-guessing penalty via `_prev_target_node` + `target_choice`), `_refresh_obs`. `_refresh_obs` builds per-agent graph + BF-from-curr + BF-from-teammate + top-K candidates + strategic features. `reload_map(env_idx, map_idx)` does a full reset for eval. `_spread_starts_graph` places M agents on adjacent FREE lattice nodes (BFS + segment-clear). `EnvCfg.from_ckpt_dict(d, **overrides)` rebuilds cfg from a saved checkpoint dict. |
-| `teammate_belief.py` | Stub for v0.7 ToM teammate-state estimator. Unused. |
+| `graph_lattice.py` | Core graph manager. 8-neighbor lattice on free cells, reachability flood-fill, collision-checked edges, integral-image utility. `bf_from_target(info, target, dist_init)` — overwrite-mode warm-startable Bellman-Ford from any source (BF-from-curr, BF-from-teammate). `build_radar(info, teammate_src, gamma_r)` — compresses the known world BEYOND the ego window onto the geodesic horizon gateway nodes → `b_util` (feat[5]) + `b_teammate` (feat[6]). `extract_local_window(info)` — slices the `(2·n_hops+3)²` ego window per agent. `curr_idx` from O(1) floor-divide. |
+| `explorer.py` | Vectorized environment. Per-agent occupancy + positions + `last_known_pos[N,M,M,2]` + `t_last_comm` (staleness timer) + `visited_step` + `_own_expl_at_comm` (surplus baseline) + BF warm-start caches + `_rdv_phi_prev`/`_rdv_gate`. `step(action)`: sub-step LiDAR move, wall revert + **asymmetric agent-agent collision** (lower-priority agent yields via per-episode `_collision_key`), `_comm_check` (signal-strength or LOS), `fuse_maps`, reward assembly, `_refresh_obs`, then the dense `rdv_dense` term (needs the post-refresh geodesic-to-teammate field). `_refresh_obs` (3-pass, agents batched into B=N·M): build graph + BF-from-curr + BF-from-teammate + `build_radar`; cross-agent feat[4] teammate potential; `extract_local_window`; also builds `critic_global[7]` and `agent_scalars[N,M,2]`. `reload_map` for eval. `EnvCfg.from_ckpt_dict(d, **overrides)` rebuilds cfg from a checkpoint (filters unknown keys → old ckpts load). |
+| `teammate_belief.py` | Teammate-state belief scaffold (last-known pos + staleness σ-inflation). |
 
 ### models/
 
 | File | Purpose |
 |---|---|
-| `gat.py` | `MaskedGATLayer` + `GATEncoder`. Multi-head attention over K=8 padded neighbors. Pure torch — no PyG. Accepts any leading batch dim. Runs on the ego-centric window `(2·n_hops+3)²`, not the full lattice. |
-| `actor_critic.py` | `MarlActorCritic`. Shared ego-centric GAT encoder; `StrategicHead` (MHA over top-K candidates → Gumbel-ST pick → `strategic_emb` + `target_idx`); actor (`actor_pre` over `[curr_emb ‖ strategic_emb ‖ next_hop_onehot ‖ prev_action]` → GRUCell → PointerHead over K=8 neighbors, with finite-masked logits + NaN guard); learnable+floored `path_bias` adds a soft prior on the BF first-hop of the strategic pick; critic (CTDE: concat per-agent curr_emb → MLP → GRUCell → V scalar). `encode_chunk()` batches encoder across T for MAPPO speedup. |
+| `gat.py` | `MaskedGATLayer` + `GATEncoder`. Multi-head attention over K=8 padded neighbors, self-loop included. Pure torch — no PyG. Two learnable shaping terms on the attention scores: **A1** per-head temperature `τ_h` (`score := q·k/√D · τ_h`, clamped [0.1,10] — fixes the near-uniform softmax that made the agent pick neighbors at random), and **A2** per-head structural feature-bias `bias_h(j) = Linear(raw_feat[j, group_h]) → scalar`. Default A2 groups (entity split): `H0 [2,5]` explore (utility + its radar), `H1 [4,6]` rendezvous (teammate + its radar), `H2 [3]` recency, `H3 [5,6]` beyond-window steering. Runs on the ego window, not the full lattice. |
+| `actor_critic.py` | `MarlActorCritic`. Shared ego-centric GAT encoder → per-agent `curr_emb` + `nbr_embs[K]`. **Actor** (decentralized): `actor_pre` over `[curr_emb ‖ prev_action[K] ‖ agent_scalars[2]]` → `gru_actor` (GRUCell) → `PointerHead` — a scaled dot-product `logit_k = (q·k_k)/√d · τ` over the K=8 neighbor embeddings, finite-masked + NaN-guarded, learnable temperature τ. **Critic** (CTDE): pool per-agent `curr_emb` across M via **mean⊕max** (`2·d`, count-invariant) ‖ `critic_global[7]` → `critic_pre` MLP → `gru_critic` → V scalar. **Default feed-forward** (both GRUCells bypassed); `--gru` opts into temporal memory (the modules always exist for ckpt compat). `encode_chunk()` batches the encoder across T for the MAPPO update. |
 | `value_normalizer.py` | Welford online mean/var. Critic predicts normalized V, GAE uses denormalized. |
 
 ### train/
 
 | File | Purpose |
 |---|---|
-| `buffer.py` | Pre-allocated rollout `[T, N, M, ...]` for obs (incl. `cand_*`, `prev_action`, `cand_bf_first_hop`), action, `target_choice`, logp, value, reward, done. **Per-agent** GAE-λ with a shared CTDE value baseline (`compute_gae` → advantages `[T,N,M]`, returns `[T,N]` team-mean for the V target). |
-| `mappo.py` | PPO update. One encoder call per TBPTT chunk (`encode_chunk`), then GRU re-roll per timestep replaying the stored strategic pick (`target_choice`) through `evaluate_step_from_enc`. Per-agent advantages. PPO clip, value MSE, entropy bonus. Minibatching over N. AMP fp16. Single grad clipper + scaler. |
-| `driver.py` | Main loop. `TrainCfg` defaults, rollout collection, ppo_update, milestones (25/50/75/100 %), throughput logging, optional `torch.compile`, optional ramping curriculum (`_curriculum_weights`), `_emit_eval_gif` (uses `reload_map` + `EnvCfg.from_ckpt_dict`). Logs `ep_end` (mean explored at terminal step over episodes that ended this iter). |
+| `buffer.py` | Pre-allocated rollout `[T, N, M, ...]` for obs (incl. `agent_scalars`, `prev_action`), action, logp, value, reward, done. **Per-agent** GAE-λ with a shared CTDE value baseline (`compute_gae` → advantages `[T,N,M]`, returns `[T,N]` team-mean V target). |
+| `mappo.py` | PPO update. One encoder call per TBPTT chunk (`encode_chunk`), then GRU re-roll per timestep (`evaluate_step_from_enc`). Per-agent advantages. PPO clip, clipped value MSE (Huber δ=10), entropy bonus. Minibatching over N. **bf16 AMP** (GradScaler disabled — bf16 has fp32 exponent range, so the fp16 NaN-collapse mode is structurally gone). |
+| `driver.py` | Main loop. `TrainCfg` defaults, rollout collection, ppo_update, milestones (25/50/75/100 %), throughput logging, optional `torch.compile`, optional curriculum (fixed or eval-score-gated), `_run_eval_suite` on the fixed 32-map `EVAL_MAP_IDX`. `_normalize_cfg` ties `n_layers = n_hops`. Logs `ep_end`. |
 
 ### eval/
 
 | File | Purpose |
 |---|---|
-| `render.py` | Palette + painters: `shade_occupancy_prob`, `paint_frontier`, `paint_graph`, `paint_path`, `paint_target`, `paint_agent`, `paint_comm_link` (green line between agents in comm range), `composite_frame` orchestrator, `hstack_frames` (concatenate per-agent panels horizontally). Per-agent colors from `C_AGENTS` palette. |
-| `rollout.py` | `EvalRollout`: deterministic single-episode play. Builds **one panel per agent** showing that agent's own occupancy + frontier + graph + guidepost + comm-link, hstacks them into a wide frame. |
+| `render.py` | Palette + painters (`shade_occupancy_prob`, `paint_frontier`, `paint_graph`, `paint_agent`, `paint_comm_link`, `composite_frame`, `hstack_frames`). Per-agent colors from `C_AGENTS`. |
+| `rollout.py` | `EvalRollout`: deterministic single-episode play; one panel per agent (own occupancy + frontier + graph + comm-link), hstacked. |
+| `trace.py` | Step-through episode trace for the inspector (per-step obs, action, per-agent reward components, GAT attention). |
+| `ckpt_loader.py` | Infers architecture (`n_layers`/d/heads/agents/`use_gru`) from the checkpoint state dict. |
 
 ### scripts/
 
 | File | Use |
 |---|---|
-| `01_test_maps.py` | Load split, render 2×2 mosaic with start markers. |
-| `02_test_lidar.py` | Single LiDAR scan from start. Verifies probabilistic occupancy. |
-| `03_test_frontier.py` | Single scan + frontier overlay. Verifies frontier ∩ wall = 0. |
-| `04_test_graph.py` | Build graph + guidepost after short walk. Renders edges, utility-colored nodes, amber path, target ring. Prints diag/axial = √2. |
-| `05_test_env_random.py` | Random policy rollout over N envs, per-env GIF (full render). |
-| `06_test_model_shapes.py` | Instantiate model, forward + backward, assert grad flows. |
-| `07_smoke_mappo.py` | Tiny PPO run (2 envs × 32 steps × 2 updates × 1 epoch). |
-| `baseline_random.py` | Random-policy explored-rate on a fixed map (sanity vs MAPPO eval). |
-| `run_train.py` | Full training entrypoint. |
-| `run_eval.py` | Load ckpt → deterministic episode on one map → GIF. Reads FULL env cfg from ckpt (`n_hops`, `top_k`, force flags) via `EnvCfg.from_ckpt_dict`; `--force-full-*` CLI override. Pass `--d-hidden`/`--n-heads`/`--n-layers` to match net. |
-| `eval_final.py` | Batch eval on N random maps (or `--map-idx`). Infers architecture from checkpoint weights; reads env cfg from ckpt. Strips `encoder._orig_mod.` from torch.compile checkpoints; remaps legacy `path_bias`→`path_bias_learn`. |
-| `debug_spawn.py` | Audit spawn adjacency over N maps (reports % non-adjacent, min/max/mean agent distance). |
+| `run_train.py` | Full training entrypoint (`train_args.py` defines the grouped CLI). |
+| `run_eval.py` | Load ckpt → deterministic episode on one map → GIF. Reads env cfg from ckpt; `--force-full-*` override. |
+| `eval_final.py` | Batch eval on N random maps (or `--map-idx`). Infers architecture from the checkpoint. |
+| `eval_best.py` | Score every milestone ckpt on the fixed 32-map suite → write `ckpt_best.pt`. |
+| `trace_episode.py` | Emit an inspector trace JSON. |
+| `baseline_random.py` | Random-policy explored-rate (sanity vs MAPPO eval). |
+| `01_test_*.py … 07_*.py` | Step-by-step component tests (maps, lidar, frontier, model shapes, smoke MAPPO). |
 
 ---
 
@@ -81,295 +79,200 @@ MARLauder/
 
 ```
 data/<split>/maps.npy  (memmap, uint8 [N, H, W])
-   │
-   ▼  env.maps.sample_batch  (N maps to GPU)
-WarpWorld.gt_torch  +  WarpWorld.occupancy_logodds_torch  +  WarpWorld.occupancy_torch
-   │
+   │  env.maps.sample_batch  (N maps to GPU)
+   ▼
+WarpWorld.gt_torch  +  occupancy_logodds_torch  +  occupancy_torch
    │ env.step(action) for t in [0, T):
    │   1. decode action (K=8 slot) via curr_nbr_global → target node world coord
-   │   2. path-follow K_sub sub-steps:  Warp LiDAR per sub-step
-   │   3. _comm_check + fuse_maps + update last_known_pos (force flags may override mask)
-   │   4. per-agent set-op reward (scan/team/give/recv/overlap/revisit/proximity/...)
+   │   2. path-follow K_sub sub-steps: Warp LiDAR per sub-step (+ asymmetric collision)
+   │   3. _comm_check + fuse_maps + update last_known_pos / t_last_comm
+   │   4. per-agent reward: novel_scan − revisit − stall + completion − step
    ▼
-   │ _refresh_obs per agent:
-   │   compute_frontier(occupancy)                 (torch conv2d)
-   │   GraphLattice.build()                        (flood-fill + collision + utility)
-   │   bf_from_target(curr)  → bf_dist_from_curr   (warm-started)
-   │   bf_from_target(teammate lkp, edge_valid=edge_valid_optim) → bf_dist_team (per teammate)
-   │   extract_topk_candidates(util, valid, curr_xy, K=16, bf_dist)
-   │   build cand_feat[N,M,K,8] + cand_bf_first_hop + ego-centric window
+   │ _refresh_obs (agents batched into B = N·M):
+   │   compute_frontier(occupancy)                        (torch conv2d)
+   │   GraphLattice.build()                               (flood-fill + collision + utility)
+   │   bf_from_target(curr)  → bf_dist_from_curr          (warm-started)
+   │   bf_from_target(teammate lkp, edge_valid_optim)     (FREE∪UNKNOWN graph)
+   │   build_radar(teammate_src) → feat[5] b_util, feat[6] b_teammate
+   │   feat[4] teammate potential (cross-agent, global)
+   │   extract_local_window → ego window (2·n_hops+3)²
+   │   critic_global[7] + agent_scalars[N,M,2]=[∆M gate, staleness]
+   │   5. rdv_dense = w · g · (φ_prev − φ_now)   (added to reward, post-refresh)
    ▼
 obs dict [N, M, ...] → MarlActorCritic.act(obs, h_act, h_crit)
                           ├── ego-centric GAT encoder → curr_emb, nbr_embs
-                          ├── StrategicHead(curr_emb, cand_feat) → Gumbel-ST target pick
-                          ├── actor_pre([curr_emb‖strategic_emb‖next_hop‖prev_action])
-                          │     → GRU → PointerHead (+ path_bias·first_hop) → action
-                          └── CTDE critic GRU → V(s)
-   │
-   ▼ buffer.store(t, obs, action, target_choice, logp, value, reward, done)
-   │
-   │ after T steps, compute_gae → per-agent advantages [T,N,M], team-mean returns [T,N]
-   │
+                          ├── actor_pre([curr_emb ‖ prev_action ‖ agent_scalars])
+                          │     → GRU → PointerHead → action
+                          └── mean⊕max pool ‖ critic_global → critic_pre → GRU → V(s)
+   │ buffer.store(t, obs, action, logp, value, reward, done)
+   │ after T steps: compute_gae → per-agent adv [T,N,M], team-mean returns [T,N]
    ▼ MAPPO update (k_epochs × n_minibatches × T/tbptt_steps chunks)
-        │
         ├── encode_chunk(chunk_obs)  ← ONE pass per chunk
-        ├── for tt: replay stored target_choice → strategic STE → GRU + pointer + critic
+        ├── for tt: GRU + pointer + critic re-roll
         └── optimizer.step()
-   │
    ▼ next rollout
 ```
 
 ---
 
-## 3. Graph node features (NODE_INPUT_DIM = 6)
+## 3. Graph node features (F_IN = 7)
 
 | Idx | Name | Meaning | Range |
 |---|---|---|---|
-| 0 | `x_rel` | `(node.x - curr.x) / (window_radius·NR)` — **EGO-scale** (window half-extent), not half-map, so in-window coords span the full range | [-1, +1] in window |
-| 1 | `y_rel` | `(node.y - curr.y) / (window_radius·NR)` | [-1, +1] in window |
-| 2 | `utility_norm` | **info-gain** — estimated UNKNOWN area revealed on arrival (unknown cells in a `sensor_range_px` disk / disk area), diffused along valid edges. Captures big rooms behind small openings | [0, 1] |
-| 3 | `age` | **stationary recency**: `clamp((current_step − last_visit)/visit_age_window, 0,1)`; never-visited = 1 (cold/re-explorable), just-walked = 0 (avoid backtrack). Replaces old `visited{0,1}` + `last_visit_norm` (latter was non-stationary — value drifted every step — and redundant with actor GRU). `visit_age_window` default 16 | [0, 1] |
-| 4 | `teammate_pos` | **BF teammate-proximity POTENTIAL** `exp(−d/4·NR)` where d = BF geodesic from nearest teammate's lkp (optimistic FREE∪UNKNOWN graph) to this node. Dense, gradient-rich, wall-aware, points toward teammate (was a single dead one-hot). Zero for M=1 | [0, 1] |
-| 5 | `guidepost` | 1 if node lies on Bellman-Ford shortest path from curr to nearest high-utility reachable node | {0, 1} |
+| 0 | `x_rel` | `(node.x − curr.x) / win_half` — **EGO-scale** (window half-extent), so in-window coords span the full range | [-1, +1] |
+| 1 | `y_rel` | `(node.y − curr.y) / win_half` | [-1, +1] |
+| 2 | `utility` | **info-gain** — estimated UNKNOWN area revealed on arrival (unknown cells in a `sensor_range_px` disk / disk area), diffused along valid edges. Captures big rooms behind small openings | [0, 1] |
+| 3 | `age` | **stationary recency**: `clamp((step − last_visit)/visit_age_window, 0, 1)`; never-visited = 1 (cold/re-explorable), just-walked = 0 (avoid backtrack). `visit_age_window` default 16 | [0, 1] |
+| 4 | `teammate_pot` | **BF teammate-proximity POTENTIAL** — dense, wall-aware, points toward the nearest teammate's last-known position (in-window). Zero for M=1 | [0, 1] |
+| 5 | `radar-util` (`b_util`) | **RADAR** — beyond-window utility mass routed geodesically onto the horizon gateway nodes (0 elsewhere). Far-exploration heading | [0, 1] |
+| 6 | `radar-teammate` (`b_teammate`) | **RADAR** — beyond-window teammate direction routed onto the same gateway nodes | [0, 1] |
 
-Invalid nodes have feature row zeroed. Edges to invalid neighbors masked in GAT attention. The GAT encoder runs on the ego-centric window `(2·n_hops+3)²` centered on `curr`, not the full lattice.
+Invalid nodes have their feature row zeroed. Edges to invalid neighbors are masked in GAT attention. The encoder runs on the ego window `(2·n_hops+3)²` centered on `curr`, not the full lattice.
 
-**Utility (v3, info-gain, wall-aware)**: prior versions measured frontier-pixel **ribbon
-length** — boundary size, not the hidden volume behind it, so a small door fronting a huge
-unexplored room scored low. v3 seeds the diffusion with **estimated information gain**: the
-count of UNKNOWN cells inside a `sensor_range_px` disk around each node (one-scan lookahead,
-integral image), normalized by disk area to a fraction ∈ [0,1]. Then h=⌈UR/NR⌉ rounds of graph
-diffusion along **collision-checked `edge_valid` edges** (mass flows only through passable
-edges → walls block by construction), normalized by 2^h. A small frontier opening onto a big
-unknown component now scores high. Within-disk occlusion is a second-order error accepted for
-an arrival estimate. (v2 used the frontier-ribbon source; the diffusion + edge-masking
-scaffold is unchanged.)
+**Utility (info-gain, wall-aware)**: seeds the diffusion with estimated information gain — the count of UNKNOWN cells inside a `sensor_range_px` disk around each node (one-scan lookahead, integral image), normalized to a fraction. Then h=⌈UR/NR⌉ rounds of graph diffusion along **collision-checked `edge_valid` edges** (mass flows only through passable edges → walls block by construction), normalized by 2^h. A small frontier opening onto a big unknown component scores high.
 
-### 3.1 Strategic candidate features (CAND_FEAT_DIM = 9)
-
-Separate from the GAT node features above. For each agent, the top-K (`--top-k`, default 16) reachable frontier candidates are extracted globally (not windowed) and fed to the `StrategicHead`. Per-candidate feature vector:
-
-| Idx | Name | Meaning |
-|---|---|---|
-| 0,1 | `rel_xy` | candidate world position − agent position, / canvas_diag |
-| 2 | `utility` | candidate frontier-density utility ∈ [0, 1] |
-| 3 | `bf_dist` | BF shortest-path distance from curr to candidate (wall-aware), / canvas_diag |
-| 4 | `min_team_bf_dist` | min over teammates of BF dist FROM teammate to candidate (in my map), / canvas_diag |
-| 5 | `max_comm_gap` | steps since last comm with the most-stale teammate, / max_episode_steps |
-| 6 | `own_minus_team` | (my bf_dist − min teammate dist) × `--yield-scale`, clamped [-1,1]. Positive = teammate closer → yield. |
-| 7 | `team_alt_score` | mean over teammates of "teammate's best alternative − this cand's value" (H.2 joint distribution). High = teammate has other good options → I can take this. |
-| 8 | `prev_branch_match` | 1.0 if this candidate's BF first-hop branch == the branch committed last step → direction-commitment memory for the feedforward head (stops per-step target thrash). |
-
-The head outputs `target_logits[K]` (Gumbel-ST → one-hot pick) and a pooled `strategic_emb`. `cand_bf_first_hop[K, 8]` one-hot maps the chosen candidate to its first K=8 lattice hop (for the `path_bias` action prior).
+**RADAR (`build_radar`)**: replaces the removed analytic guidepost. Nodes BEYOND the receptive horizon (`D_h = n_hops·NR` px from curr) route their mass DOWN the BF parent chain to their first gateway node at/inside the horizon — obstacle-aware, the path bends around walls; never a straight-line projection through a wall. Weight `= γ_r^(hops beyond horizon)` (travel-cost discount, `--radar-gamma` 0.92), normalized by `--radar-util-norm` (8.0). Gives a feed-forward-friendly heading toward far exploration mass / far teammates for an agent that runs out of local utility, instead of stalling in a loop.
 
 ---
 
-## 4. Reward (v0.4 — per-agent set-op formulation)
+## 4. Reward
 
-Each agent receives an **independent** scalar reward. Set ops are on the lattice (N_max ≈ 1200 nodes per env), baselined at the last comm event between each pair.
+Per-agent, lattice-level, in **map-independent units** (`scan_norm_nodes=50` ≈ one sensor disk, not /N_max≈1200 — so shaping is O(0.1), not O(0.001), vs the completion bonus).
 
 ```
 # Per step, per agent a:
-scan_self_delta[a]   = (#FREE nodes I LiDAR-scanned this step) / N_max        # post-scan, pre-fusion
-team_delta           = Δ(union FREE pixels) / total_free                       # cooperation anchor
+novel_scan[a]  = |cells a scanned this step ∧ ¬union_prev| / scan_norm      # NEW TO THE TEAM UNION
+revisit_pen[a] = (W − age)/W  if chosen node visited within last W steps     # graduated by recency
+stall_pen[a]   = 1 if ‖pos_after − pos_before‖ < nr·0.5                      # no net displacement
+step_penalty   = step_cost · (edge_len / NR)                                 # axial=1, diagonal=√2
 
-# Per pair (i, j) gated by comm_mask[i, j] (rendezvous event):
-B_ij = M_i ∧ ¬last_meeting_node_mask[i, j]    # cells i scanned since last meeting with j
-B_ji = M_j ∧ ¬last_meeting_node_mask[i, j]
-give[i]    = |B_ij ∧ ¬M_j| / N_max             # NEW cells I bring to j (j doesn't have)
-recv[i]    = |B_ji ∧ ¬M_i| / N_max             # NEW cells I receive from j
-overlap[i] = |B_ij ∧ B_ji|  / N_max             # we BOTH scanned same area since last meeting
+# Dense rendezvous (M>1, added after _refresh_obs):
+g              = clamp(∆M / (rdv_offer_frac · own_map_at_last_sync), 0, 1)   # RELATIVE growth I owe the teammate
+φ              = geodesic(curr → owed-teammate lkp) / diam
+rdv_dense[a]   = w · g · (φ_prev − φ_now)                                    # NET geodesic approach
 
-# Anti-loop / anti-chase / anti-stall:
-revisit_pen[a]   = (W − age)/W  if chosen node visited within last W steps (graduated by recency)
-proximity_pen[a] = 1 if teammate within sensor_range AND visible (comm)
-stall_pen[a]     = 1 if ‖pos_after − pos_before‖ < nr·0.5  (no net displacement this step)
-
-# Objective second-guessing (graph-tree, B+D):
-target_switch_pen[a] = 1 if  branch(g_t) ≠ branch(g_{t-1})  AND  g_{t-1} still pursuable
-                       branch(g) = first-hop slot off curr toward g in the BF-from-curr tree
-                       pursuable = reachable (bf_dist finite) AND not reached (bf_dist > 1.5·nr)
-
-# v2 — privileged novel-scan credit (IR2-style r_f). union = team union FREE-node mask:
-novel_scan[a] = |cells a scanned this step ∧ ¬union_prev| / scan_norm_nodes(=50)
-team_delta_node = |union_now ∧ ¬union_prev| / scan_norm_nodes
-
-# Final reward (v2):
-reward[a] = α_novel · novel_scan[a]
-          + β     · team_delta_node
-          + ζ_give · Σ_j give[a]
-          + ζ_recv · Σ_j recv[a]
-          − η_lap  · Σ_j overlap[a]
-          − γ      · revisit_pen[a]
-          − ε_prox · proximity_pen[a]
-          − δ_obj  · target_switch_pen[a]
-          − δ_stall· stall_pen[a]
-          + 1{terminated} · completion_bonus
+# Final reward:
+reward[a] = α · novel_scan[a]
+          − γ · revisit_pen[a]
+          − δ_stall · stall_pen[a]
+          + 1{explored ≥ 0.99} · completion_bonus
           − step_penalty
+          + rdv_dense[a]
 ```
 
-Defaults: `α_novel=1.0`, `β=0.3`, `ζ_give=1.5`, `ζ_recv=0.5`, `η_lap=3.0`, `γ=0.05`, `ε_prox=0.05`, `δ_obj=0.01`, `δ_stall=0.1`, `W=8`, `completion_bonus=10.0`, `step_penalty_coef=0.1`.
+Defaults: `α=1.0`, `γ=0.10`, `δ_stall=0.1`, `completion_bonus=10.0`, `step_penalty_coef=0.015`, `w(rdv)=0.10`, `rdv_offer_frac=0.15`, `W=8`.
 
-**v2 novel-scan credit**: pays only cells **new to the team union** — a follower scanning a
-leader's wake earns 0, so splitting up is the highest-paying policy by construction (the old
-`scan_self + shared team_delta` paid the follower a β commission on the leader's work →
-chasing was rational). Privileged (training-only, CTDE; deployed actor never sees the union).
-`scan_self_delta` remains as the logged diagnostic `reward/scan_self_diag`. Both-scan-same-cell
-ties credit both agents (simultaneous discovery). Spawn scans are baseline, not credited.
-Relationship to give/recv/overlap: those are the **rendezvous accounting** (fire at comm
-events, baselined at last meeting); novel-scan is **instantaneous credit at scan time** —
-complementary, and under `--force-full-occupancy-sharing` (per-step fusion) the rendezvous
-terms degenerate to ≈0 leaving novel-scan as the only per-agent channel (exploited by the
-Stage-1 sweep, §12). Dense normalization `scan_norm_nodes=50` (≈ one sensor disk) replaces
-/N_max≈1200 so shaping is O(0.1), not O(0.001), vs the completion bonus.
+**Privileged novel-scan credit (IR2-style `r_f`)**: pays only cells **new to the team union** — a follower scanning a leader's wake earns 0, so splitting up is the highest-paying policy by construction. Privileged (training-only, CTDE; the deployed actor never sees the union). Both-scan-same-cell ties credit both (simultaneous discovery). `scan_self_delta` remains as the logged diagnostic `reward/scan_self_diag`. **There is deliberately NO separation / proximity penalty** — the design constraint is that novel-scan does the spreading, so agents never "fear the only path".
 
-**v2 target_switch**: env receives the strategic head's **argmax intent** (`target_argmax`
-from `model.act`), not the Gumbel-sampled `target_choice` — sampling noise no longer counts
-as second-guessing. Default coef 0.05→0.01 (sweep v1: sampled variant dominated the dense
-reward 10–50×, `reward/target_switch` = −0.007…−0.054/step vs scan +0.0004…+0.0018).
+**Dense rendezvous (`rdv_dense`)**: telescoping toward the owed teammate's FIXED last-known position, gated by **relative map growth** `g` — the cells I mapped that the teammate I owe most still lacks (`∆M = own_expl − _own_expl_at_comm`), as a fraction of the map I already had when we last met (`rdv_offer_frac · own_map_at_last_sync`, floored by `scan_norm_nodes`). So `g→1` = "I have grown my known map by `rdv_offer_frac` since we last met → enough NEW content to be worth sharing", independent of canvas size. Farm-safe: oscillation cancels, and at comm `∆M→0` kills the gate so the last-known-position jump is never paid; a hover gives `Δφ=0`. **The SAME gate `g` and a normalized `staleness` are fed to the actor as `agent_scalars`** so the policy DECIDES when to rendezvous — the reward and the observation share the trigger, no precooked weight.
 
-**Stall penalty (anti-standing-still)**: physical no-progress detector — snapshot `pos` at the
-top of `step()`, compare after the sub-step loop; `‖Δpos‖ < nr·0.5` → `stall_pen=1`. Catches
-BOTH collision-revert holds (asymmetric-collision loser) and invalid/curr-node picks. Heavily
-weighted (`δ_stall=0.1` ≫ old revisit) to break chase/standoff deadlocks and push agents to
-reroute / separate. `revisit_pen` is now **graduated** (`(W−age)/W`) so tighter loops cost
-more; `ε_prox` raised 0.005→0.05. These plus `δ_stall` are the primary anti-degenerate knobs
-the W&B sweep tunes (§12).
+**Stall penalty**: physical no-progress detector — snapshot `pos` at the top of `step()`, compare after the sub-step loop. Catches both collision-revert holds and invalid/curr-node picks. Heavily weighted (`δ_stall=0.1`) to break deadlocks and force reroute/separation.
 
-**Objective second-guessing penalty (B+D, graph-tree)**: treats the BF-from-curr parent tree (`bf_parent_from_curr`) as the exploration tree. The strategic target `g_t` lives in some first-hop branch off the current node; `branch(g)` = walk `bf_parent` from `g` back to a curr-neighbor. Penalty fires only when the committed branch **flips** AND the previous target was still **reachable + unreached** (D gate via cached `bf_dist_from_curr`). A target that shifts *forward along the same branch* (receding frontier) keeps the same first-hop → **0 penalty**, regardless of how far it jumped — the term keys on graph *direction*, not node identity. Reaching / invalidating the old target opens free re-selection. Computed in the PRE-step frame (tree rooted where the decision was made), from `self._last_obs` + `self._prev_target_node`. Requires `target_choice` plumbed from `model.act` → `env.step`; eval/baseline pass nothing → term off. Agent-local → decentralized, real-robot-safe.
+**Decentralization**: every term is computed from agent-local state (own occupancy, own visited, own `last_known_pos`/staleness) or via comm-gated set ops. The privileged team-union subtraction in `novel_scan` is the only CTDE-only signal — its unobservable overlap variance is absorbed by the centralized critic baseline (which is why `critic_global` carries `redundancy`).
 
-**Why per-agent**:
-- Phase A v2's strategic head needs per-agent gradient signal to differentiate yielding.
-- Set-op decomposition gives the policy credit for the right behavior: scan-self, bring info, receive info, avoid overlap, avoid backtrack, avoid chasing.
-
-**Decentralization**: each term computed from agent-local state (own occupancy, own visited, own last_known_pos) or via comm-gated set ops on rendezvous events.
-
-**Optimistic teammate-distance graph** (`edge_valid_optim`, built in `graph_lattice.build()` when M>1): BF-from-teammate is rooted at the teammate's `last_known_pos` in the agent's OWN map. Once agents split, the teammate usually sits in the agent's UNKNOWN region; on the FREE graph (`node_valid` = `occ==FREE` ∧ reachable) that node is invalid/disconnected, so `bf_from_target` returns `+inf` for every candidate and the `team_alt_score` / `cand_own_minus_team` coordination signals go silent — exactly when map-sharing is off. Fix: a second edge graph flooded through FREE∪UNKNOWN (`occ != OBSTACLE`) from the robot cell, reusing the same `!= OBSTACLE` collision check. The teammate BF passes this graph via `bf_from_target(..., edge_valid=info["edge_valid_optim"])`. Result: exact geodesic through known-free space, ≈Euclidean through unknown, and `+inf` ONLY when a KNOWN wall separates the pair (pure Euclidean would lie there). Used for the teammate-distance heuristic only; the agent's own navigation BF (`bf_from_curr`, target pick) stays on the FREE graph. `bf_from_target` reads geometric edge indices (`edge_idx_static`) masked by the active `edge_valid` so both graphs resolve neighbours correctly.
-
-**Last-meeting baseline**: `last_meeting_node_mask[i, j]` snapshots the post-fusion union at the most recent comm between i and j. Set ops are over "new scans since last meeting", so initial co-spawn overlap doesn't keep firing.
-
-**v0.4 anti-chase signals**:
-- `overlap` penalty fires at every comm event with overlap (default `η_lap=3.0`).
-- ~~`proximity` penalty~~ **ELIMINATED (default `ε_prox=0.0`, 2026-06-12)**: the raw-distance
-  per-step reflex was the **stalemate/ping-pong driver** — it over-corrected into back-and-forth
-  and punished BOTH agents converging on the last frontier (deadlock). `novel_scan` already pays
-  0 for team-known cells, so anti-chase is covered without it. Flag kept for ablation; optional
-  fallback is a *productivity gate* (`*= novel_scan<=0`) so only freeloading proximity is penalized.
-- **`target_switch_pen` raised 0.01→0.05** (B+D graph-tree branch-flip): commitment to a
-  direction; now on argmax intent so safe to strengthen → punishes uncommitted back-and-forth.
-- **Target-claim at rendezvous** (`last_known_target`, comm-gated): when two agents are in comm,
-  the **lowest agent-ID keeps its target**; a higher-ID agent whose candidate set contains a
-  lower-ID teammate's claimed target has that candidate **masked** (`cand_valid→False`) so it
-  diverts — UNLESS it is the agent's only option (**single-frontier guard**: both commit, never
-  back down). Decentralized (only acts in comm range); out-of-comm division → Phase 2 surplus obs.
-- `cand_own_minus_team` feature (amplified by `--yield-scale 3.0`) → "yield to closer agent".
-- `team_alt_score` feature (H.2) → "take a frontier the teammate has good alternatives for".
-- `path_bias` (fixed floor `--path-bias-floor 1.5` + learnable extra) keeps the actor following the strategic pick's BF first-hop so grid-utility doesn't fully dominate.
-
-**Debug full-sharing flags** (training-only sanity, NOT for deployment):
-- `--force-full-pos-sharing` — teammate positions always fresh (decouples lkp from comm).
-- `--force-full-occupancy-sharing` — maps fused every step regardless of comm range.
-Both are saved in the checkpoint cfg and propagated to eval so renders reflect training behavior.
-
-**v0.3 → v0.4 migration**: the old single-scalar team reward is replaced by the per-agent set-op reward. Per-agent advantages flow through GAE against a shared CTDE value baseline.
+**Debug full-sharing flags** (training-only sanity, NOT deployment): `--force-full-comm` (every pair connects), `--force-full-pos-sharing` (fresh teammate positions), `--force-full-occupancy-sharing` (maps fused every step). Saved in the ckpt cfg and propagated to eval.
 
 ---
 
 ## 5. Training parameters (CLI flags of `scripts/run_train.py`)
 
-| Flag | Default | Range / Note |
+Flags are grouped by `add_argument_group` (the group title shows in the launch banner). Full source: `scripts/train_args.py`.
+
+**Run / scale**
+
+| Flag | Default | Note |
 |---|---|---|
-| `--split` | `train/easy` | `train/easy`, `train/difficult`, `test/{complex,corridor,hybrid}` |
-| `--out` | `runs/run_default` | Output dir. Ckpts at `ckpt_{025,050,075,100}.pt` + `final.pt` (all carry `cfg`). With `--eval-on-ckpt` also `eval_ckpt_{pct}_m{0,1}.gif` on random maps |
-| `--seed` | `-1` | torch RNG (action sampling, init). `-1` = time-based. Map sampling RNG is independent (fresh entropy) so maps differ each run |
-| `--device` | `cuda:0` | Or `cpu` (CPU is slow; AMP/Warp disabled) |
-| `--total-steps` | `5_000_000` | Total env transitions (`n_envs × rollout_len × iters`) |
+| `--split` | `train/easy` | `train/{easy,difficult}`, `test/{complex,corridor,hybrid}` |
+| `--stage` | none | `easy`/`difficult` shorthand for the two-stage pipeline |
+| `--out` | auto | Ckpts `ckpt_{025,050,075,100}.pt` + `final.pt` (carry `cfg`); with `--eval-on-ckpt` also eval GIFs |
+| `--seed` | `0` | torch RNG (actions, init). Map sampling RNG is independent (fresh entropy) |
+| `--device` | `cuda:0` | Or `cpu` (slow; AMP/Warp disabled) |
+| `--total-steps` | `5_000_000` | Total env transitions |
 | `--n-envs` | `16` | Parallel envs. Must be divisible by `--minibatches` |
-| `--n-agents` | `1` | Number of cooperative agents per env |
-| `--comm-range` | `120.0` | Communication range (px). Set 0 to disable comm entirely |
-| `--rollout-len` | `128` | T per PPO update |
-| `--max-episode-steps` | `512` | Episode truncation (typically ≥ rollout-len) |
-| `--minibatches` | `1` | PPO minibatches per epoch. Must divide `n-envs`. **Keep at 1** (max 2): MAPPO paper Suggestion 3 (Fig.5b) shows 4 minibatches fails to solve maps while 1 is best on 22/23 — avoid splitting the batch |
-| `--lr` | `3e-4` | Adam learning rate for actor |
-| `--ent-coef` | `0.01` | Entropy bonus weight |
-| `--compile` | off | `torch.compile` the encoder (~2× update speedup) |
-| `--eval-on-ckpt` | off | Emit 2 eval GIFs on random maps at each milestone (25/50/75/100%) |
-| `--eval-steps` | `-1` | Episode length for eval-on-ckpt GIFs. `-1` aligns with `--max-episode-steps` (G.2) |
-| `--n-hops` | `2` | Ego-centric encoder window radius. Window = (2·n_hops+3)². n_layers tied to this |
-| `--top-k` | `16` | Top-K frontier candidates per agent for strategic attention head (Phase A v2) |
-| `--strategic-gate-eps` | `0.0` | High-level gate: StrategicHead + BF path-bias steer the actor **only** on steps where max ego-window utility < this. `0.0` = gate off (head always influences). Makes the head a high-level chooser consulted when local exploration is exhausted, not a per-step driver |
-| `--force-full-comm` | off | Debug: bypass dist/LOS check; every pair communicates every step |
-| `--force-full-pos-sharing` | off | Debug: persistent teammate-position awareness (positions only, maps still comm-gated) |
-| `--force-full-occupancy-sharing` | off | Debug: maps fused every step (occupancy synced across agents) |
-| `--curriculum` | off | Ramp train/easy → train/difficult mix (0–30% easy, 30–60% 70/30, 60–100% 50/50). Requires same-canvas splits |
-| `--eval-split` | = `--split` | Split for eval-on-ckpt GIFs (defaults to `test/complex` when `--curriculum`) |
-| `--scan-weight` | `1.0` | (v2: diagnostic only — scan_self no longer in the reward) |
-| `--novel-scan-weight` | `1.0` | α_novel: privileged team-union novel-scan credit (v2 core reward term) |
-| `--team-weight` | `0.3` | β: shared Δunion coef (cooperation anchor) |
-| `--give-bonus` | `1.5` | ζ_give: NEW cells brought to teammate at comm |
-| `--recv-bonus` | `0.5` | ζ_recv: NEW cells received at comm |
-| `--overlap-pen` | `3.0` | η_lap: redundant parallel-scan penalty |
-| `--revisit-pen` | `0.05` | γ: revisit penalty per step (graduated by recency) |
-| `--revisit-window` | `8` | W: revisit lookback steps |
-| `--yield-scale` | `3.0` | amplify `cand_own_minus_team` yield feature |
-| `--proximity-pen` | `0.05` | per-step penalty when teammate visible within sensor_range |
-| `--target-switch-pen` | `0.01` | δ_obj: objective second-guessing penalty (v2: argmax intent, default lowered from 0.05) |
-| `--stall-pen` | `0.1` | δ_stall: heavy penalty for standing still (no net displacement this step) |
-| `--path-bias-floor` | `1.5` | fixed floor on target-following bias (actor logits toward strategic pick's BF first-hop) |
-| `--clip-eps` | `0.2` | PPO clip ε (→ `MAPPOCfg`) |
-| `--k-epochs` | `4` | PPO epochs per rollout |
-| `--gae-lambda` | `0.95` | GAE λ |
-| `--gamma` | `0.99` | discount factor |
-| `--vf-coef` | `0.5` | value loss weight |
+| `--n-agents` | `1` | Cooperative agents per env |
+| `--rollout-len` | `128` | T per PPO update. Set ≥ `--max-episode-steps` to populate `ep_end` |
+| `--max-episode-steps` | `512` | Episode truncation |
+| `--minibatches` | `1` | **Keep at 1** (MAPPO paper Suggestion 3: 4 minibatches fails while 1 is best on 22/23 maps) |
+| `--n-hops` | `6` | Ego-window radius. Window = (2·n_hops+3)². `n_layers` tied to this |
+
+**Sensing & communication**
+
+| Flag | Default | Note |
+|---|---|---|
+| `--comm-model` | `signal_strength` | Path-loss radio (walls attenuate) or `los` (hard Euclidean + Bresenham LOS) |
+| `--comm-range` | `120.0` | LOS-mode cutoff (px). Ignored in signal-strength mode |
+| `--sensor-range` | `80.0` | LiDAR reach (px, matches IR2 SENSOR_RANGE) |
+| `--ss-thresh` | `-70.0` | rx sensitivity (dBm): connect iff `P_R > this` |
+| `--force-full-comm` / `--force-full-pos-sharing` / `--force-full-occupancy-sharing` | off | Debug sharing |
+
+**Reward shaping**
+
+| Flag | Default | Note |
+|---|---|---|
+| `--novel-scan-weight` | `1.0` | α: privileged team-union novel-scan credit |
+| `--rdv-weight` | `0.10` | w: dense rendezvous strength |
+| `--rdv-offer-frac` | `0.15` | relative map growth since last sync (fraction of the own map AT that sync) at which the gate `g` saturates; also normalizes the `∆M` obs |
+| `--revisit-pen` / `--revisit-window` | `0.05` / `8` | γ: revisit penalty (graduated) / lookback W |
+| `--stall-pen` | `0.1` | δ_stall: standing-still penalty |
+| `--radar-gamma` / `--radar-util-norm` | `0.92` / `8.0` | beyond-window travel-discount / mass normalizer |
+
+**Model ablation & warm-start**
+
+| Flag | Default | Note |
+|---|---|---|
+| `--gru` | off | Enable GRU temporal memory (default is feed-forward, both GRUCells bypassed) |
+| `--init-ckpt` | none | Warm-start from a checkpoint (stage-2 of the pipeline) |
+
+**PPO / learning**
+
+| Flag | Default | Note |
+|---|---|---|
+| `--lr` | `3e-4` | Adam LR |
+| `--ent-coef` | `0.01` | Entropy bonus |
+| `--clip-eps` | `0.15` | PPO clip ε |
+| `--k-epochs` | `4` | PPO epochs per rollout (reduce to 2 if KL > 0.02) |
+| `--max-grad-norm` | `2.0` | Global gradient clip |
+| `--gae-lambda` / `--gamma` | `0.95` / `0.99` | GAE λ / discount |
+| `--vf-coef` | `0.5` | Value loss weight |
 | `--tbptt-steps` | `16` | TBPTT chunk length |
-| `--lr` | `3e-4` | Adam LR (now wired to `lr_actor`) |
-| `--wandb` | off | Log to Weights & Biases. `--wandb-project/-entity/-group/-run-name/-mode/-tags` |
 
-**On `--seed`**: seeds torch RNG (action sampling, init) only. Map sampling RNG uses fresh entropy each run, so training and eval see different maps regardless of `--seed`. `eval_final.py --seed N` accepts an int for reproducible map selection.
+**Curriculum / eval scoring / runtime**
 
-MAPPO knobs (`clip-eps`, `k-epochs`, `gae-lambda`, `gamma`, `vf-coef`, `tbptt-steps`) and the
-reward coefs above are all exposed precisely so the W&B sweep (§12) can tune them. Remaining
-hardcoded knobs (lattice spacing, GAT width, ...): see [§11](#11-currently-hardcoded-knobs-not-on-the-cli).
+| Flag | Default | Note |
+|---|---|---|
+| `--curriculum` / `--curriculum-gated` | off | Ramp easy→difficult (fixed schedule / eval-score-gated) |
+| `--curriculum-stage-splits` / `-stage-steps` / `-gate-score` / `-min-stage-iters` | — | Gated-curriculum config |
+| `--score-w-imbalance` / `--score-w-overlap` / `--score-w-idle` | `0.5` / `0.25` / `0.25` | Eval-suite score weights |
+| `--compile` | off | `torch.compile` the encoder |
+| `--eval-on-ckpt` / `--eval-steps` / `--eval-n-maps` / `--eval-map-idx` | off / `-1` / `2` / `-1` | Milestone eval GIFs |
+| `--wandb` (+ project/entity/group/run-name/mode/tags) | off | Weights & Biases |
 
 ---
 
-## 6. Recommended training command (v0.4)
+## 6. Recommended training command
 
-Set `--rollout-len ≥ --max-episode-steps` so full episodes complete inside a rollout and `ep_end` is populated each iter. `--max-episode-steps` should be large enough to actually explore (256+ on 480×640).
+The canonical run is the two-stage `pipeline_rdv.sh` (easy learns to MOVE with short 128-step episodes, difficult uses 384-step episodes warm-started via `--init-ckpt`). Shared block:
 
 ```bash
-docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python scripts/run_train.py \
-    --split train/easy \
-    --total-steps 5_000_000 \
-    --n-envs 64 --n-agents 2 \
-    --comm-range 120 \
-    --rollout-len 256 --max-episode-steps 256 \
-    --minibatches 1 \
-    --lr 3e-4 --ent-coef 0.01 \
-    --path-bias-floor 1.5 \
-    --compile --eval-on-ckpt \
-    --out /workspace/MARLauder/runs/run_v04'
+COMMON="--n-envs 32 --n-agents 2 --rollout-len 256 --n-hops 6 --tbptt-steps 8 \
+        --minibatches 1 --k-epochs 4 --rdv-weight 0.10 --eval-on-ckpt"
+
+# Stage 1 — easy
+python scripts/run_train.py --split train/easy --max-episode-steps 128 \
+    --total-steps 2000000 $COMMON --out runs/run_easy
+
+# Stage 2 — difficult (warm-start)
+python scripts/run_train.py --split train/difficult --max-episode-steps 384 \
+    --total-steps 4000000 $COMMON --init-ckpt runs/run_easy/final.pt --out runs/run_difficult
 ```
 
-Debug sanity (perfect info — verify coordination ceiling):
+**VRAM / launch geometry (12 GB 4080 laptop).** The OOM driver is the `encode_chunk` update peak (∝ tbptt·n_envs·n_layers·window), which is MAP-INDEPENDENT (the model always sees the fixed 225-node ego window at n-hops=6). So easy and difficult cap at the SAME ~40 envs. `tbptt=8` halves the update peak vs 16. **32 env / tbptt=8 / rollout=256 / n-hops=6 / minibatches=1** → ~8.4 GB (easy) / ~9–11 GB (difficult). Use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+
+Smoke run (~1 min):
 
 ```bash
-docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python scripts/run_train.py \
-    --split train/easy --total-steps 5_000_000 \
-    --n-envs 64 --n-agents 2 \
-    --rollout-len 256 --max-episode-steps 256 --eval-on-ckpt \
-    --force-full-pos-sharing --force-full-occupancy-sharing \
-    --out /workspace/MARLauder/runs/run_v04_godmode'
-```
-
-Smoke run (~1 min, verify pipeline):
-
-```bash
-docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python scripts/run_train.py \
-    --split train/easy --total-steps 40000 \
-    --n-envs 8 --n-agents 2 \
-    --rollout-len 64 --max-episode-steps 64 \
-    --out /workspace/MARLauder/runs/smoke'
+python scripts/run_train.py --split train/easy --total-steps 40000 \
+    --n-envs 8 --n-agents 2 --rollout-len 64 --max-episode-steps 64 --out runs/smoke
 ```
 
 ---
@@ -379,58 +282,35 @@ docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python s
 ### Batch eval on N random maps — `eval_final.py`
 
 ```bash
-docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python scripts/eval_final.py \
-    /workspace/MARLauder/runs/run_v03/final.pt \
-    --split train/easy --n-maps 5 --steps 512'
+python scripts/eval_final.py runs/run_difficult/final.pt --split train/difficult --n-maps 5 --steps 512
 ```
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `<ckpt>` (positional) | — | Path to `final.pt` or `ckpt_*.pt` |
-| `--split` | `train/easy` | Map split to eval on |
-| `--n-maps` | `5` | Number of random maps to eval |
-| `--steps` | `512` | Max episode steps |
-| `--seed` | `None` | RNG for map sampling. `None` → system entropy (random each run). Pass an integer for reproducibility |
-| `--out` | ckpt dir | Output dir for GIFs (defaults next to checkpoint) |
-| `--device` | `cuda:0` | Device |
+Architecture (`n_agents`, `d`, `n_heads`, `n_layers`, `use_gru`) is inferred from the checkpoint. Handles `torch.compile` checkpoints (strips `encoder._orig_mod.`). Outputs `eval_map{idx:05d}.gif` per map + summary stats. `--map-idx N [N ...]` pins maps; `--seed` defaults to system entropy.
 
-Architecture (`n_agents`, `d_hidden`, `n_heads`, `n_layers`) inferred automatically from checkpoint weights. Handles `torch.compile` checkpoints (strips `encoder._orig_mod.` key prefix). Outputs `eval_map{idx:05d}.gif` per map + summary stats (mean/std/min/max explored).
+### Best-checkpoint selection — `eval_best.py`
+
+Scores every milestone ckpt on the fixed 32-map suite and writes `ckpt_best.pt`. The web inspector exposes a "Find best ckpt" action.
 
 ### Single map by index — `run_eval.py`
 
 ```bash
-docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python scripts/run_eval.py \
-    --ckpt /workspace/MARLauder/runs/run_v04/final.pt \
-    --split train/easy --map-idx 9580 \
-    --n-agents 2 \
-    --d-hidden 128 --n-heads 4 --n-layers 2 \
-    --steps 256 \
-    --out /workspace/MARLauder/runs/run_v04/eval_map9580.gif'
+python scripts/run_eval.py --ckpt runs/run_difficult/final.pt --split train/difficult \
+    --map-idx 9580 --n-agents 2 --steps 256 --out runs/run_difficult/eval_map9580.gif
 ```
 
-Env cfg (`n_hops`, `top_k`, force flags) is read from the checkpoint. To force persistent sharing on a checkpoint trained without it, add `--force-full-occupancy-sharing` / `--force-full-pos-sharing`. Use a milestone `ckpt_*.pt` or a v0.4 `final.pt` — both carry `cfg`; older `final.pt` lacked it (use the CLI override flags then).
+Env cfg is read from the checkpoint. Add `--force-full-occupancy-sharing` / `--force-full-pos-sharing` to force sharing at eval.
 
 ### Eval rendering
 
-Each frame is a horizontal stack of **M panels** (one per agent). Each panel shows:
-
-- That agent's personal occupancy map (sigmoid of log-odds). Under `--force-full-occupancy-sharing` all panels render the same fused map.
-- That agent's own frontier (red tint).
-- Ego-centric lattice graph: nodes colored cyan→orange by utility, current-node yellow ring.
-- **Strategic head's chosen target** (amber ring) + the **correct BF path** from curr to it (amber polyline). This is what the policy actually pursues — not the legacy env-argmax target.
-- The agent itself (filled dot in its `C_AGENTS` color) + trail.
-- Other agents as "ghosts" (smaller dots).
-- Green line between agents whenever both are within `comm_range_px` AND have LOS clear.
-- Top-left text bar: `[A0] t=N explored=X.X%`.
+Each frame is a horizontal stack of **M panels** (one per agent): that agent's own occupancy (sigmoid of log-odds), its own frontier, the ego-centric lattice (nodes cyan→orange by utility, current-node yellow ring), the agent + trail, other agents as ghosts, a green comm-link line whenever the pair is connected, and a `[A0] t=N explored=X.X%` bar.
 
 ### Random-policy baseline (sanity)
 
 ```bash
-docker exec marlauder bash -lc 'cd /workspace/MARLauder && PYTHONPATH=. python scripts/baseline_random.py \
-    --split test/complex --map-idx 0 --steps 512 --episodes 16 --nr 16'
+python scripts/baseline_random.py --split test/complex --map-idx 0 --steps 512 --episodes 16 --nr 16
 ```
 
-Trained policy on `train/easy` should beat the random baseline by ≥ 2× to count as "learning".
+A trained policy should beat the random baseline by ≥ 2×.
 
 ---
 
@@ -439,102 +319,85 @@ Trained policy on `train/easy` should beat the random baseline by ≥ 2× to cou
 Per-iter log line:
 
 ```
-[it   N/T] ep_end=XX.X%(ended=K)  pg=±0.0NNN  v=N.NNNN  ent=N.NNN  kl=±0.0NNN  clip=N.N%  redun=N.NN stall=N% pair=N.NN sps=NNN(NNNavg)
+[it   N/T] ep_end=XX.X%(ended=K)  pg=±0.0NNN  v=N.NNNN  ent=N.NNN  kl=±0.0NNN  clip=N.N%  sps=NNN(NNNavg) coll=NNN upd=NNN
 ```
 
-| Metric | Meaning / Healthy | Warning sign |
+| Metric | Healthy | Warning sign |
 |---|---|---|
-| `ep_end` | mean explored fraction at the terminal step of all episodes that ENDED this iter. `ended=K` = how many episodes that was. Grows over iters. `n/a` until ≥1 episode completes (set `rollout-len ≥ max-episode-steps`). | flat near random after 100+ iters |
-| `pg` | small negative (-0.005..-0.02) | always positive, or huge swings |
-| `v` | drops then plateaus | climbing, or stuck (normalizer not adapting) |
-| `ent` | decays smoothly | crashes to ~0 within a few iters (collapse) |
+| `ep_end` | mean explored at the terminal step of episodes that ENDED this iter (`ended=K`). Grows over iters. `n/a` until ≥1 completes | flat near random after 100+ iters |
+| `pg` | small negative (-0.005..-0.02) | always positive / huge swings |
+| `v` | drops then plateaus | climbing / stuck |
+| `ent` | decays smoothly | crashes to ~0 (collapse) |
 | `kl` | < 0.02 | > 0.1 (clip ineffective) |
 | `clip` | 5-20% | > 50% (lr too high) or 0% (too low) |
-| `redun` | redundancy `(Σ own_free − union)/union`. Lower over training = agents stop overlapping | stays high / rises (chasing, scanning same area) |
-| `stall` | fraction of steps with no net displacement. Should fall toward 0 | stays high (deadlocks / standing still) |
-| `pair` | mean pairwise inter-agent distance / canvas-diag. Rises as agents separate | stays low (chasing / clustered) |
 | `coll`/`upd` sps | flat across run | dropping (memory pressure / recompile / oom) |
 
-Full exploration-quality metric set (logged to W&B, §12): `metric/redundancy`,
-`metric/stall_rate`, `metric/revisit_rate`, `metric/mean_pair_dist`,
-`metric/coverage_per_dist`, `metric/steps_to_50`, `metric/steps_to_90`, plus per-term reward
-contributions under `reward/*` and the composite `explore/efficiency`.
+**ep_end populated only when episodes finish in the rollout** — match `rollout-len ≥ max-episode-steps` for a number every iter.
 
-**ep_end populated only when episodes finish in the rollout.** With `rollout-len < max-episode-steps`, most iters show `n/a` (only 99%-threshold completions land). Match them for a number every iter.
+**bf16 AMP**: the update autocast is bf16 (same fp32 exponent range as fp32 → value-target spikes can't overflow → the fp16 NaN-collapse mode is structurally gone; GradScaler disabled). A finite large-negative logit mask + `nan_to_num` still guard the pointer against a one-step spike.
 
-**fp16 late-training NaN guard**: at very low entropy a logit row could go all-`-inf`/NaN and crash `Categorical`. v0.4 masks with a finite large-negative and `nan_to_num`-guards the logits, so a one-step spike no longer kills the run. Frequent guard activation still signals instability — lower `--lr` or raise `--ent-coef` late.
-
-Random baseline final explored on `train/easy` (96 steps, NR=16, rays=720, sensor=60): **~6%**. Trained policy should beat ≥ 2×.
+Exploration-quality metrics (logged to W&B): `metric/{redundancy, stall_rate, revisit_rate, mean_pair_dist, coverage_per_dist, steps_to_50, steps_to_90}`, per-term `reward/*`, per-agent `info["novel_cells_ep"]`.
 
 ---
 
 ## 9. Architecture summary
 
 ```
-                                  ┌──────────────────────────┐
-                                  │  Warp LiDAR (GPU)        │   n-rays per agent
-                                  │  PER-AGENT log-odds      │   occupancy[N,M,H,W]
-                                  └────────┬─────────────────┘
-                                           │
-                          ┌────────────────▼────────────────┐
-                          │  _comm_check (range + LOS)       │
-                          │  fuse_maps (max log-odds)        │   comm_mask[N,M,M]
-                          │  update last_known_pos           │
-                          └────────────────┬────────────────┘
-                                           │
-                          ┌────────────────▼────────────────┐
-                          │  per-agent loop:                 │
-                          │   frontier (torch conv2d)        │
-                          │   graph_lattice.build            │
-                          │   bf_from_target(curr)           │
-                          │   bf_from_target(teammate lkp)   │
-                          │   extract_topk_candidates(K=16)  │
-                          └─────────────┬───────────────────┘
-                                        │ node_feat[N,M,N_max,7] (ego-window), edge_idx, masks,
-                                        │ cand_feat[N,M,K,8], cand_bf_first_hop,
-                                        │ prev_action, last_known_pos
-                                        ▼
+                          ┌──────────────────────────┐
+                          │  Warp LiDAR (GPU)        │   n_rays per agent
+                          │  PER-AGENT log-odds      │   occupancy[N,M,H,W]
+                          └────────┬─────────────────┘
+                                   │
+                  ┌────────────────▼────────────────┐
+                  │  _comm_check (signal-strength)   │
+                  │  fuse_maps (max-magnitude)       │   comm_mask[N,M,M]
+                  │  update last_known_pos / t_comm  │
+                  └────────────────┬────────────────┘
+                                   │  (agents batched into B = N·M)
+                  ┌────────────────▼────────────────┐
+                  │   frontier (torch conv2d)        │
+                  │   graph_lattice.build            │
+                  │   bf_from_target(curr)           │
+                  │   bf_from_target(teammate lkp)   │
+                  │   build_radar → feat[5], feat[6] │
+                  │   feat[4] teammate potential     │
+                  │   extract_local_window (ego)     │
+                  └─────────────┬───────────────────┘
+                                │ node_feat[N,M,W²,7], edge_idx, masks,
+                                │ prev_action, agent_scalars[∆M-gate, staleness], critic_global[7]
+                                ▼
    ┌──────────── Ego-centric GAT Encoder (per (env, agent))  ────────────────┐
-   │   window (2·n_hops+3)²; Linear(7→d); MaskedGATLayer × n_layers           │
-   │   curr_emb [N·M, d]   nbr_embs [N·M, K=8, d]                             │
+   │  window (2·n_hops+3)²; Linear(7→d); MaskedGATLayer × n_layers            │
+   │  A1 per-head temperature · A2 per-head feature-bias groups               │
+   │  curr_emb [N·M, d]   nbr_embs [N·M, K=8, d]                              │
    └───────────────┬─────────────────────────────────────┬──────────────────┘
-                   │                                     │
         decentralized actor                       centralized critic (CTDE)
-                   │                                     │
    ┌─── per agent ─▼─────────────────────────┐  ┌─ per env ─▼───────────────┐
-   │ StrategicHead(curr_emb, cand_feat[K,8])  │  │ concat curr_emb over M     │
-   │   → target_logits[K] → Gumbel-ST pick    │  │ → Linear(M·d→d)+GELU       │
-   │   → strategic_emb, target_idx            │  │ GRUCell(joint, h_prev)     │
-   │ actor_pre([curr_emb‖strategic_emb        │  │ Linear→GELU→Linear→V(s)    │
-   │   ‖next_hop_onehot‖prev_action])         │  └────────────────────────────┘
-   │ GRUCell → PointerHead(nbr_embs, mask)    │
-   │   logits[K=8] + path_bias·first_hop      │
-   │ (finite mask + NaN guard) → action       │
+   │ actor_pre([curr_emb ‖ prev_action        │  │ mean⊕max pool over M (2·d) │
+   │   ‖ agent_scalars[∆M-gate, staleness]])   │  │ ‖ critic_global[7]         │
+   │ GRUCell → PointerHead(nbr_embs, mask)     │  │ → critic_pre MLP           │
+   │   logit_k = (q·k_k)/√d · τ                 │  │ GRUCell → Linear → V(s)    │
+   │ (finite mask + NaN guard) → action        │  └────────────────────────────┘
    └──────────────────────────────────────────┘
-                   │
-                   ▼  env.step(action) → per-agent reward / done / next obs
-                   ▼  buffer.store(.., target_choice, ..)
-            ┌──────────────────────────┐
+                   │  env.step → per-agent reward / done / next obs
+            ┌──────▼───────────────────┐
             │ MAPPO update             │
             │  per-agent GAE-λ         │
             │  shared CTDE V baseline  │
-            │  replay stored pick (STE)│
-            │  PPO clip ε=0.2, AMP fp16│
+            │  PPO clip ε=0.15, bf16   │
             │  TBPTT chunks, encode_chunk
             └──────────────────────────┘
 ```
 
 Invariants:
 - Encoder weights shared actor↔critic — both gradients flow back.
-- Actor decentralized: each agent sees only its own ego-window + its own candidate set.
-- Strategic head shared across agents but operates per-agent (per-agent inputs).
-- Critic centralized: concatenates per-agent curr_emb → joint state V(s).
+- Actor decentralized: each agent sees only its own ego window + its own `agent_scalars`.
+- Critic count-invariant: mean⊕max pool over agents → same weights for any M (unlocks M warm-start).
 - Per-agent advantages (GAE) against a single shared V; returns target = team-mean.
-- Hidden states zeroed at episode resets via `(1 - done)` mask.
+- Hidden states zeroed at episode resets via `(1 − done)` mask (only when `--gru`).
 - All obs tensors live on GPU; no host roundtrips during rollout.
-- `N_max = (H/NR)·(W/NR)` fixed → pure pad+mask, no PyG dynamic batching.
 - Edge length: axial `NR`, diagonal `NR·√2` — used in all Bellman-Ford calls.
-- Encoder called ONCE per TBPTT chunk; strategic pick replayed via stored `target_choice`.
+- Encoder called ONCE per TBPTT chunk.
 
 ---
 
@@ -543,42 +406,38 @@ Invariants:
 | Ver | Goal | Status |
 |---|---|---|
 | v0.1 | Single-agent baseline (Warp LiDAR + lattice graph + GAT + MAPPO) | ✓ |
-| v0.2 | Terminology rename, Bellman-Ford guidepost, diagonal cost, MAPPO speedup, docs | ✓ |
-| v0.3 | Multi-agent intermittent comm, per-agent maps, per-agent eval render, step-penalty + completion-bonus reward, O(1) curr_idx, FREE-only start placement, random-seed eval | ✓ |
-| v0.4 | Phase A v2 strategic frontier-attention head, Phase B BF target-rooted + warm-start, Phase C ego-centric encoder (n_hops), Phase D per-agent set-op reward, Option A BF-from-curr for cand ranking, G.3 strategic-pick render + BF path bias, G.4 anti-chase (yield-scale + proximity + overlap), random map RNG | ✓ (current) |
-| v0.5 | Curriculum train/easy → train/difficult (ramp scaffold landed in v0.4; **blocked** until splits share a canvas — easy=480×640, difficult=1000×1000) | partial |
-| v0.6 | Eval suite: per-split curves, TB logger, milestone GIF auto-generation, voluntary-rendezvous reward | planned |
-| v0.7 | ToM `teammate_belief.py` module (probabilistic teammate-state estimator + belief merge on rendezvous; replaces point `lkp` in candidate features) | planned |
+| v0.2 | Bellman-Ford guidepost, diagonal cost, MAPPO speedup | ✓ (guidepost later removed) |
+| v0.3 | Multi-agent intermittent comm, per-agent maps, per-agent eval render, O(1) curr_idx | ✓ |
+| v0.4–v0.7 | StrategicHead / analytic-target / path-bias experiments | ✓ then **REMOVED** — a genuinely learned policy |
+| v0.8 | Critic mean⊕max pooling; analytic target & guidepost DELETED (F_IN 8→7); dense rendezvous reward + `agent_scalars`; realistic signal-strength comm (sensor 80px); ego-window radar channels | ✓ (current) |
+| — | Perf: batched-agent env build + bf16 (+41% sps); best-ckpt selection; entity-split GAT heads (`[[2,5],[4,6],[3],[5,6]]`) | ✓ |
+| next | Radar-gain fix (far-field mute at long range → `radar-gamma 0.97 / util-norm 3`); rendezvous under-experience with M=2 (surplus gate rarely fires); M>2 warm-start | open |
 
-v0.8 (hierarchical L2 graph) explicitly **out of scope** for this rewrite.
-
-**Curriculum note**: `--curriculum` + `MultiSplit` are implemented and ramp the easy/difficult mix over iters, but `MultiSplit` raises if the two splits differ in canvas size. To enable, pre-process maps to a common H×W first.
-
-See [dev_log.md](dev_log.md) for design-decision context behind each version.
+See [dev_log.md](dev_log.md) for the design-decision context behind each version and the current open problems.
 
 ---
 
 ## 11. Currently hardcoded (knobs not on the CLI)
 
-These defaults live in dataclass definitions and are not exposed as CLI flags. Edit the dataclass to change them.
+Edit the dataclass to change these.
 
 ### `env.explorer.EnvCfg`
 
 | Name | Default | Effect |
 |---|---|---|
-| `nr` | `16` | Lattice spacing (px). Smaller → denser graph (more nodes, more memory). N_max scales as `(H/nr)·(W/nr)` |
-| `sensor_range_px` | `60.0` | LiDAR range (px) |
+| `nr` | `16` | Lattice spacing (px). N_max scales as `(H/nr)·(W/nr)` |
+| `sensor_range_px` | `80.0` | LiDAR range (px). Overridable via `--sensor-range` |
 | `n_rays` | `720` | LiDAR ray count per scan |
-| `utility_range_px` | `30` | Half-window size (px) for frontier-density utility integral |
-| `num_sim_steps` | `5` | LiDAR sub-steps per high-level step (collision check granularity) |
-| `flood_max_iters` | `200` | Max iterations of flood-fill in `node_valid` |
-| `done_explored_thresh` | `0.99` | Episode `terminated` threshold (fraction of GT-free seen) |
-| `comm_los_samples` | `40` | Number of Bresenham samples for line-of-sight comm check |
-| `step_penalty_coef` | `0.1` | Total step penalty budget per episode (penalty = coef / max_episode_steps) |
-| `completion_bonus` | `10.0` | One-shot reward at terminal step when `terminated` |
-| `proximity_penalty_radius_px` | `-1` | Proximity penalty radius. `-1` = sensor_range_px |
-
-(`cand_own_minus_team_scale`, `top_k_candidates`, force flags, reward weights → exposed on the CLI; see §5.)
+| `utility_range_px` | `30` | Diffusion horizon (px) for the info-gain utility |
+| `visit_age_window` | `16` | Recency horizon for feat[3] `age` |
+| `num_sim_steps` | `5` | LiDAR sub-steps per high-level step |
+| `flood_max_iters` | `200` | Max flood-fill iterations for `node_valid` |
+| `done_explored_thresh` | `0.99` | Episode `terminated` threshold |
+| `comm_los_samples` | `40` | Bresenham samples for the LOS comm check |
+| `scan_norm_nodes` | `50.0` | Dense-reward normalizer (≈ one sensor disk of nodes) |
+| `step_penalty_coef` | `0.015` | Per-axial-step movement cost (diagonal ·√2) |
+| `completion_bonus` | `10.0` | One-shot terminal reward |
+| `ss_*` | IR2 scale | Signal-strength path-loss params (`ss_p_t=-20`, `ss_pl_o=31`, `ss_dist_o=35`, `ss_gamma=2`, `ss_gamma_obst=4`, shadowing `X_g,K ~ U[0,13]`) |
 
 ### `train.driver.TrainCfg`
 
@@ -586,105 +445,41 @@ These defaults live in dataclass definitions and are not exposed as CLI flags. E
 |---|---|---|
 | `d_hidden` | `128` | Encoder + GRU hidden width |
 | `n_heads` | `4` | GAT attention heads (must divide `d_hidden`) |
-| `n_layers` | `2` | GAT layers; tied to `n_hops` in `_normalize_cfg` |
-| `lr_actor` | `3e-4` | Adam LR (overridden by `--lr`) |
-| `lr_critic` | `1e-3` | (unused; single optimizer) |
-| `eval_steps` | `-1` | Eval-on-ckpt episode length; `-1` = `max_episode_steps` (set via `--eval-steps`) |
-| `eval_n_maps` | `2` | Number of eval GIFs per milestone |
-| `eval_map_idx` | `-1` | `-1` = random map each time |
-| `path_bias_floor` | `1.5` | Fixed floor on path-following bias (set via `--path-bias-floor`) |
-| `curriculum` | `False` | Ramp easy/difficult mix (set via `--curriculum`) |
-| `curriculum_splits` | `("train/easy","train/difficult")` | Splits used when curriculum on |
+| `n_hops` / `n_layers` | `6` / `6` | Ego-window radius; `n_layers` tied to `n_hops` in `_normalize_cfg` |
+| `use_gru` | `False` | GRU memory OFF by default (feed-forward); enable via `--gru` |
+| `eval_every` | `10` | Iters between eval-suite runs |
 
 ### `train.mappo.MAPPOCfg`
 
 | Name | Default | Effect |
 |---|---|---|
-| `clip_eps` | `0.2` | PPO clip ε (`--clip-eps`) |
+| `clip_eps` | `0.15` | PPO clip ε (`--clip-eps`) |
 | `vf_coef` | `0.5` | Value loss weight (`--vf-coef`) |
-| `ent_coef` | `0.01` | Entropy bonus weight (`--ent-coef`) |
-| `k_epochs` | `4` | PPO epochs per rollout (`--k-epochs`). Reduce to 2 if KL > 0.02 |
-| `tbptt_steps` | `16` | TBPTT chunk length for hidden-state truncation (`--tbptt-steps`) |
-| `n_minibatches` | `1` | PPO minibatches per epoch (`--minibatches`). Must divide `n-envs` |
-| `gamma` | `0.99` | Discount factor (`--gamma`) |
-| `lam` | `0.95` | GAE λ (`--gae-lambda`) |
-| `grad_clip` | `0.5` | Global gradient clip norm |
-| `clip_vloss` | `True` | Clipped value loss (max of unclipped and `V_old±clip_eps` error). MAPPO paper §3.3 / Alg.1 |
-| `huber_delta` | `10.0` | Value-loss Huber delta (paper Tab.7). `0.0` = squared error. Robust to return-spike outliers |
+| `ent_coef` | `0.01` | Entropy bonus (`--ent-coef`) |
+| `k_epochs` | `4` | PPO epochs per rollout (`--k-epochs`) |
+| `tbptt_steps` | `16` | TBPTT chunk length (`--tbptt-steps`) |
+| `n_minibatches` | `1` | PPO minibatches (`--minibatches`) |
+| `gamma` / `lam` | `0.99` / `0.95` | Discount / GAE λ |
+| `clip_vloss` | `True` | Clipped value loss (MAPPO paper §3.3) |
+| `huber_delta` | `10.0` | Value-loss Huber delta (paper Tab.7); `0.0` = squared error |
 
-**Weight init**: all `nn.Linear` / `nn.GRUCell` use orthogonal init (gain √2), policy/strategic logits gain 0.01, value head gain 1.0 — MAPPO paper Tab.7 (`models/init_utils.py`). Was torch-default before.
+**Weight init**: all `nn.Linear` / `nn.GRUCell` use orthogonal init (gain √2), policy logits gain 0.01, value head gain 1.0 — MAPPO paper Tab.7 (`models/init_utils.py`).
 
 ---
 
 ## 12. Weights & Biases + hyperparameter sweeps
 
-`wandb` is in `requirements.txt` (pip-installable in the running container if the image
-predates it). Logging is **off by default** — pass `--wandb` (no network otherwise).
+`wandb` is in `requirements.txt`. Logging is **off by default** — pass `--wandb`.
 
-**Per-iter logging** (`train.driver.train`, guarded import → silent no-op if `--wandb` off or
-package missing): `train/{pg_loss,v_loss,entropy,kl,clipfrac}`, `perf/{sps,coll_sps,upd_sps}`,
-`explore/{ep_end,ep_end_n,efficiency}`, `reward/*` (per-term signed contributions from
-`info["reward_terms"]`), `metric/*` (exploration quality from `info["metrics"]`, aggregated
-over the rollout in `collect_rollout`). `wandb.init(config=…)` flattens the full `TrainCfg`
-(incl. `env` + `ppo`).
+**Per-iter logging**: `train/{pg_loss,v_loss,entropy,kl,clipfrac}`, `perf/{sps,coll_sps,upd_sps}`, `explore/{ep_end,ep_end_n}`, `reward/*` (per-term signed contributions), `metric/*` (exploration quality). `wandb.init(config=…)` flattens the full `TrainCfg`.
 
-**Fixed eval suite (v2 — the sweep's scoring source)**: every `TrainCfg.eval_every=10` iters,
-`_run_eval_suite` runs the policy **deterministically** on the 8 hardcoded validation maps
-`EVAL_MAP_IDX` (same for every run/machine — "same exam") in a persistent 1-env Explorer that
-mirrors the training cfg (force flags incl.). Logs `eval/{coverage_auc, contrib_imbalance,
-contrib_imbalance_norm, fairness, sensing_overlap, comm_duty, success_rate, steps_to_90,
-score, score_std}`.
-**D2 — equity rebalance**: `eval/score` is the mean of per-map scores, each
-`= coverage_auc − w_imb·(contrib_imbalance / (1−1/M)) − w_ov·sensing_overlap`. The
-imbalance is **normalized to [0,1]** before weighting (raw `contrib_imbalance` spans only
-`[0, 1−1/M]` ≈ [0, 0.5] for M=2, so at the old weight it was a near-free rider and the
-sweep optimized ~90% raw coverage — that's why a mechanical `proximity_pen` won). Weights
-exposed as `--score-w-imbalance` (0.5) / `--score-w-overlap` (0.25) flags. `eval/fairness`
-= Jain index over per-agent novel shares (1 = perfectly equal) — scale-robust cooperation
-read. `eval/score_std` = cross-map spread of per-map score → exposes map-luck/noise
-(motivates seed replicas, D5). AUC pads early success with the final explored_rate so
-finishing sooner scores strictly higher. `contrib_imbalance` = `max_a(novel share) − 1/M`
-from `info["novel_cells_ep"]`. These 8 maps are validation — final reporting must use fresh
-random maps / `test/*` splits. Cost ≈ 5% wall time.
+**Fixed eval suite (the sweep's scoring source)**: every `eval_every=10` iters, `_run_eval_suite` runs the policy **deterministically** on the fixed `EVAL_MAP_IDX` (32 maps evenly spaced over the big splits — same exam for every run/machine) in a persistent 1-env Explorer mirroring the training cfg. Logs `eval/{coverage_auc, contrib_imbalance, sensing_overlap, comm_duty, success_rate, steps_to_90, score, score_std}`.
 
-Legacy rollout-based `explore/efficiency` (= ep_end − 0.5·redundancy − 0.5·stall_rate) is
-still logged but is NOT the sweep target anymore (it saturated in sweep v1).
+`eval/score` = mean of per-map `coverage_auc − w_imb·(contrib_imbalance/(1−1/M)) − w_ov·sensing_overlap` (imbalance normalized to [0,1] before weighting). Weights via `--score-w-imbalance` (0.5) / `--score-w-overlap` (0.25) / `--score-w-idle` (0.25). AUC pads early success with the final explored-rate so finishing sooner scores strictly higher. These maps are **validation** — final reporting must use fresh random maps / `test/*`.
 
-**Exploration metrics** (`env.explorer.step` → `info["metrics"]`, all GPU):
-
-| Key | Definition |
-|---|---|
-| `redundancy` | `(Σ_a own_free − union_free)/union_free` on **PRE-fusion** per-agent maps (overlap; low good). Pre-fusion is essential — post-fusion in-comm agents share an identical map → metric pinned at M−1 |
-| `stall_rate` | mean of `stall_pen` (fraction of steps with no net displacement) |
-| `revisit_rate` | fraction of steps revisiting a node within `W` |
-| `mean_pair_dist` | mean pairwise `‖pos_i−pos_j‖` / canvas-diag (separation; chase = low). Clean — unaffected by fusion |
-| `coverage_per_dist` | `Σ team_delta / Σ step_disp` (Δunion per pixel travelled; efficiency, size-invariant) |
-| `steps_to_50` / `steps_to_90` | first step each env crosses 50/90% coverage this rollout (raw speed) |
-| `steps_to_50_per_kfree` / `_90_per_kfree` | above ÷ (free cells / 1000) → **map-size-normalized** speed (comparable across maps with different free area) |
-
-Residual caveat on `redundancy`: even pre-fusion, each agent's map carries cells fused in *past* rendezvous, so the metric reflects current map *divergence* rather than pure independent-scan overlap. `mean_pair_dist` + `coverage_per_dist` are the cleaner, fusion-free chase/efficiency signals — cross-check all three.
-
-**Sweeps v2 — two stages, MAPPO frozen** (sweep v1 over 17 dims produced no signal: saturated
-metric, dominated reward, no MAPPO separation, k_epochs=6 KL blowups). Both stages maximize
-`eval/score`; Hyperband `min_iter: 3` counts eval-suite logs (≈ train iter 30). Frozen MAPPO:
-lr 3e-4, ent 0.005, clip 0.2, k 4, λ 0.95, γ 0.99, mb 4, tbptt 16.
-
-1. **`sweep.yaml` — Stage 1, division of labor under perfect information.** Trials run with
-   `--force-full-occupancy-sharing --force-full-pos-sharing` (rendezvous terms degenerate →
-   novel-scan is the only per-agent credit). Swept: `novel-scan-weight [0.5,2]`,
-   `team-weight [0,0.5]`, `proximity-pen [0,0.2]`, `target-switch-pen [0,0.05]`,
-   `n-hops {2,4,6}` (window 49/121/225 nodes, n_layers tied; peak VRAM measured 6.5 GB at
-   h=6 / n-envs 64 — fits the 12 GB 4080).
-2. **`sweep_stage2.yaml` — Stage 2, rendezvous economy at comm-range 120.** Paste Stage-1
-   winners into the marked command block; sweep only `overlap-pen [0.5,3]` (lowered — novel
-   scan already zero-pays redundant cells), `give-bonus [0.5,3]`, `recv-bonus [0,1.5]`.
-   `comm_duty_cycle` becomes meaningful here (Stage 1 pins it at 1.0).
-
-Param keys are the exact dashed CLI flags (W&B emits `--<key>=<value>`).
+**Sweep** (`sweep_rdv.yaml`): tunes the rendezvous economy + core reward — `rdv-weight`, `rdv-offer-frac`, `novel-scan-weight`, `revisit-pen`, `ent-coef`. MAPPO is frozen (sweep history: no MAPPO signal, k=6 KL blowups). Param keys are the exact dashed CLI flags.
 
 ```bash
-docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb login && wandb sweep sweep.yaml'
+docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb login && wandb sweep sweep_rdv.yaml'
 docker exec -it marlauder bash -lc 'cd /workspace/MARLauder && wandb agent <ENTITY/PROJECT/SWEEP_ID>'
 ```
-
-To change any of these, edit the dataclass directly. There is no in-place override — values are stamped into the checkpoint's `cfg` field at save time.

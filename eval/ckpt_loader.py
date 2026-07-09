@@ -68,8 +68,6 @@ def load_model_from_ckpt(
 
     model = MarlActorCritic(n_agents=n_agents_final, d=d_hidden_final, n_heads=n_heads_final,
                             n_layers=n_layers_final, use_gru=use_gru).to(device)
-    if "path_bias" in sd and "path_bias_learn" not in sd:
-        sd["path_bias_learn"] = sd.pop("path_bias")
     msd = model.state_dict()
     dropped = [k for k in sd if k in msd and msd[k].shape != sd[k].shape]
     if dropped and verbose:
@@ -79,6 +77,5 @@ def load_model_from_ckpt(
     for k in dropped:
         del sd[k]
     model.load_state_dict(sd, strict=False)
-    model.strategic_gate_eps = float(cfg.get("strategic_gate_eps", 0.0))
     model.eval()
     return model, env_peek

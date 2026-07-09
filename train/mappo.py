@@ -18,6 +18,12 @@ import torch.nn.functional as F
 from models.value_normalizer import ValueNormalizer
 from train.buffer import Rollout
 
+# AMP dtype: bf16 on Ampere+ (same fp32 range → value-target spikes can't overflow → no
+# GradScaler, no NaN-skip collapses), fp16 + GradScaler as the pre-Ampere fallback.
+AMP_DTYPE = (torch.bfloat16
+             if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+             else torch.float16)
+
 
 @dataclass
 class MAPPOCfg:
@@ -72,11 +78,6 @@ def _value_loss(
     return torch.max(loss_unclipped, loss_clipped).mean()
 
 
-def _slice_obs(obs: dict, env_idx: torch.Tensor) -> dict:
-    """Index obs[T,N,M,...] along the N axis with env_idx[N_sub]."""
-    return {k: v[:, env_idx] for k, v in obs.items()}
-
-
 def _slice_chunk_obs(obs: dict, t0: int, t1: int, env_idx: torch.Tensor) -> dict:
     return {k: v[t0:t1, env_idx] for k, v in obs.items()}
 
@@ -97,7 +98,9 @@ def ppo_update(
     vnorm.update(returns)
     returns_norm = vnorm.normalize(returns)
     use_amp = cfg.use_amp and device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # GradScaler only exists to keep fp16 gradients out of the denormal range; bf16 shares the
+    # fp32 exponent so scaling is pointless — disabled, every scaler call becomes a passthrough.
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and AMP_DTYPE is torch.float16)
 
     n_mb = max(1, cfg.n_minibatches)
     assert N % n_mb == 0, f"n_envs={N} must be divisible by n_minibatches={n_mb}"
@@ -123,7 +126,7 @@ def ppo_update(
                 h_crit = h_crit.detach()
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=use_amp):
                     # Slice chunk obs along T and N axes.
                     chunk_obs = _slice_chunk_obs(rollout.obs, c0, c1, env_idx)
                     # ONE encoder pass for the whole chunk.
@@ -156,6 +159,7 @@ def ppo_update(
                             hidden_actor=last_h_act,
                             hidden_critic=last_h_crit,
                             prev_action=chunk_obs["prev_action"][tt],
+                            agent_scalars=chunk_obs["agent_scalars"][tt],
                             critic_global=chunk_obs["critic_global"][tt] if "critic_global" in chunk_obs else None,
                         )
                         new_logp = ev["logp"]

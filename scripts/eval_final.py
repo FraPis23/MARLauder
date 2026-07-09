@@ -52,12 +52,7 @@ def main() -> None:
     print(f"       n_agents={n_agents}  d={d_hidden}  heads={n_heads}  layers={n_layers}")
 
     model = MarlActorCritic(n_agents=n_agents, d=d_hidden, n_heads=n_heads, n_layers=n_layers).to(args.device)
-    # I.3 — remap legacy path_bias → path_bias_learn; tolerant load.
-    if "path_bias" in sd and "path_bias_learn" not in sd:
-        sd["path_bias_learn"] = sd.pop("path_bias")
     model.load_state_dict(sd, strict=False)
-    # Restore high-level strategic gate from the training cfg (mutable attr, not a weight).
-    model.strategic_gate_eps = float(cfg_dict.get("strategic_gate_eps", 0.0))
     model.use_gru = bool(cfg_dict.get("use_gru", True))   # honor a GRU-ablation checkpoint
     _env_d = cfg_dict.get("env", {}) if isinstance(cfg_dict, dict) else {}
     model.eval()

@@ -231,19 +231,3 @@ class WarpWorld:
     def occupancy_prob(self) -> torch.Tensor:
         """Per-agent sigmoid(log-odds) → [N, M, H, W] float32."""
         return torch.sigmoid(self.occupancy_logodds_torch)
-
-    def team_occupancy_prob(self) -> torch.Tensor:
-        """Max log-odds across agents → sigmoid → [N, H, W]. Used for rendering."""
-        return torch.sigmoid(self.occupancy_logodds_torch.max(dim=1).values)
-
-    def team_occupancy(self) -> torch.Tensor:
-        """Union categorical: FREE if any agent sees FREE → [N, H, W] uint8."""
-        occ = self.occupancy_torch         # [N, M, H, W]
-        result = torch.zeros(self.n, self.h, self.w, dtype=torch.uint8, device=self.device)
-        result[(occ == _OBSTACLE).any(dim=1)] = _OBSTACLE
-        result[(occ == _FREE).any(dim=1)]     = _FREE      # FREE wins over OBSTACLE
-        return result
-
-    def reset_occupancy(self) -> None:
-        self._logodds_flat.zero_()
-        self._occ_flat.zero_()

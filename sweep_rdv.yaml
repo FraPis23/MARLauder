@@ -1,0 +1,77 @@
+# W&B sweep — RENDEZVOUS reward + core coefficients (v0.8: critic pooling, no analytic target,
+# dense rdv term, raw ∆M/staleness obs). Replaces the obsolete give/recv/overlap/target sweeps.
+#
+# What it tunes:
+#   rdv-weight        — strength w of the dense rendezvous reward w·g·(φ_prev−φ_now). THE new knob.
+#                       Too high → agents glue together / stop exploring; too low → never rendezvous.
+#   rdv-offer-frac    — surplus ∆M saturation: gate g→1 when map gained since sync reaches this
+#                       fraction of cells (also normalizes the ∆M actor obs). Sets "how much owed
+#                       map is worth converging for".
+#   novel-scan-weight — privileged team-union novel-cell credit (core coverage driver). Balances
+#                       exploration speed against the rdv pull.
+#   revisit-pen       — local anti-loop cost (graduated by recency).
+#   ent-coef          — exploration entropy bonus.
+#
+# Metric = eval/score on the eval suite. Watch eval/redundancy + eval/pair (agent geodesic gap):
+# rdv working = pair drops when ∆M high, redundancy stays low (novel_scan spreads them).
+#
+# Memory-safe launch geometry (verified on 12GB): n-envs 32, tbptt 8, rollout 256, n-hops 6,
+# minibatches 1. ~40 env is the OOM ceiling (encode_chunk update peak, map-independent) → 32 for
+# headroom. Run on train/easy first; re-point --split for the difficult stage.
+#
+# Usage (inside the marlauder container):
+#   wandb sweep sweep_rdv.yaml                 -> SWEEP_ID
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True wandb agent <ENTITY/PROJECT/SWEEP_ID>
+
+program: scripts/run_train.py
+method: bayes
+metric:
+  name: eval/score
+  goal: maximize
+
+early_terminate:
+  type: hyperband
+  min_iter: 3
+  eta: 2
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --split=train/easy
+  - --n-envs=32
+  - --n-agents=2
+  - --rollout-len=256
+  - --max-episode-steps=128
+  - --n-hops=6
+  - --tbptt-steps=8
+  - --minibatches=1
+  - --k-epochs=4
+  - --total-steps=2000000
+  - --lr=0.0003
+  - --clip-eps=0.15
+  - --gae-lambda=0.95
+  - --gamma=0.99
+  - --wandb
+  - --wandb-project=marlauder-rdv
+  - ${args}
+
+parameters:
+  rdv-weight:
+    distribution: log_uniform_values
+    min: 0.02
+    max: 0.40
+  rdv-offer-frac:
+    distribution: uniform
+    min: 0.05
+    max: 0.30
+  novel-scan-weight:
+    distribution: uniform
+    min: 0.5
+    max: 2.0
+  revisit-pen:
+    distribution: uniform
+    min: 0.02
+    max: 0.12
+  ent-coef:
+    values: [0.003, 0.005, 0.01]

@@ -50,14 +50,6 @@ class EvalRollout:
         for t in range(self.cfg.max_steps):
             out = self.model.act(obs, h_act, h_crit, deterministic=self.cfg.deterministic)
             action = out["action"]
-            # The pursued target is the env's analytic guidepost: its world coords +
-            # curr→target BF path are shipped in obs. Snapshot BEFORE env.step.
-            gp_target_xy = obs["guidepost_target_xy"]                           # [N, M, 2]
-            strategic_target_xy: list[tuple[float, float]] = [
-                (float(gp_target_xy[e, ag, 0].item()), float(gp_target_xy[e, ag, 1].item()))
-                for ag in range(M)
-            ]
-            strategic_path_xy: list[np.ndarray] = [None] * M                    # use obs path below
             obs, reward, done, info = env.step(action)
             h_act = out["hidden_actor"]
             h_crit = out["hidden_critic"]
@@ -120,23 +112,9 @@ class EvalRollout:
                     evalid_ag = obs["edge_valid"][e, ag].cpu().numpy()
                     curr_ag  = int(obs["curr_idx"][e, ag])
 
-                # G.3.a — render STRATEGIC head's pick (captured pre-step above), not env-argmax.
-                tgt_xy_ag = strategic_target_xy[ag]
-                ax_, ay_ = trails[ag][-1]
-                at_target = (abs(tgt_xy_ag[0] - ax_) < env.cfg.nr
-                             and abs(tgt_xy_ag[1] - ay_) < env.cfg.nr)
-                # G.3.b — BF path from curr to strategic pick (CORRECT path through known-FREE).
-                if strategic_path_xy[ag] is not None and len(strategic_path_xy[ag]) > 0:
-                    sp = strategic_path_xy[ag]
-                    P_max = obs["guidepost_path_xy"].shape[2]
-                    path_xy_ag = np.full((P_max, 2), float("nan"), dtype=np.float32)
-                    path_valid_ag = np.zeros((P_max,), dtype=bool)
-                    L = min(P_max, len(sp))
-                    path_xy_ag[:L] = sp[:L]
-                    path_valid_ag[:L] = True
-                else:
-                    path_xy_ag    = obs["guidepost_path_xy"][e, ag].cpu().numpy()
-                    path_valid_ag = obs["guidepost_path_valid"][e, ag].cpu().numpy()
+                # Analytic target / guidepost removed → no route overlay to draw.
+                path_xy_ag = None
+                path_valid_ag = None
 
                 other_ags = [oag for oag in range(M) if oag != ag]
                 im_ag = composite_frame(
@@ -148,7 +126,7 @@ class EvalRollout:
                     draw_edges=self.cfg.draw_edges, eidx=eidx_ag, evalid=evalid_ag,
                     win_node_mask=win_mask_ag, win_bbox=win_bbox_ag,
                     path_xy=path_xy_ag, path_valid=path_valid_ag,
-                    target_xy=tgt_xy_ag if not at_target else None,
+                    target_xy=None,
                     extra_agents_xy=[trails[oag][-1] for oag in other_ags],
                     extra_agents_trails=[trails[oag][-self.cfg.trail_len:] for oag in other_ags],
                     extra_agent_indices=other_ags,
