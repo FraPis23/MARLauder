@@ -279,7 +279,7 @@ function populateAttnControls(){
   const lay=$("attnLayer"), hd=$("attnHead");
   lay.innerHTML=""; for(let l=0;l<L;l++){ const o=document.createElement("option"); o.value=l; lay.add(o); }
   updateHopLabels();
-  const hasContrib = A.trace.steps.some(st=>st.agents.some(a=>a.gat&&a.gat.c));
+  const hasContrib = !!A.trace.meta.has_contrib;
   hd.innerHTML="";
   const add=(val,txt)=>{ const o=document.createElement("option"); o.value=val; o.text=txt; hd.add(o); };
   if(hasContrib) add("combined","★ combined (contribution)");
@@ -587,8 +587,26 @@ async function frameImage(url, fi){
   }
   return g.frames[idx];
 }
+// GAT attention isn't embedded in trace.json (would balloon 512-step episodes to 600-700MB —
+// unfetchable by a browser); it's fetched lazily per-step from gat/{t:04d}.json and cached onto
+// the step's agent records in place. Safe to call every render(): no-ops once loaded/known-absent.
+function ensureGat(t){
+  const st=A.trace.steps[t];
+  if(!st || st._gatReq) return;
+  if(!st.agents.some(a=>a.has_gat && !a.gat && !a._gatFail)) return;
+  st._gatReq=true;
+  const pad=String(t).padStart(4,"0");
+  fetch(`${A.dir}gat/${pad}.json`).then(r=>{ if(!r.ok) throw 0; return r.json(); }).then(list=>{
+    for(let a=0;a<st.agents.length;a++){
+      if(list && list[a]) st.agents[a].gat=list[a]; else st.agents[a]._gatFail=true;
+    }
+  }).catch(()=>{ for(const a of st.agents) a._gatFail=true; })
+    .finally(()=>{ st._gatReq=false; if(A.t===t) render(); });
+}
+
 function render(){
   if(!A.trace) return;
+  ensureGat(A.t);
   $("slider").value=A.t; $("tlabel").textContent="t="+A.t; $("agent").value=A.agent;
   const multi = A.view==="agents";
   $("stage").style.display = multi?"none":"flex";
@@ -735,7 +753,9 @@ function showAttrib(){
   const ag=curAgent(), tEl=$("attribTitle"), aEl=$("attrib"), hEl=$("attribHint");
   const m=A.trace.meta;
   const clearGrid=()=>{ $("headsGrid").innerHTML=""; };
-  if(!ag.gat){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>no GAT attention in this trace — regenerate it</td></tr>"; hEl.textContent=""; clearGrid(); return; }
+  if(!ag.has_gat){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>no GAT attention in this trace — regenerate it</td></tr>"; hEl.textContent=""; clearGrid(); return; }
+  if(ag._gatFail){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>attention data unavailable (offline/local-file mode has no gat/ folder to fetch)</td></tr>"; hEl.textContent=""; clearGrid(); return; }
+  if(!ag.gat){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>loading attention…</td></tr>"; hEl.textContent=""; clearGrid(); return; }
   if(A.sel==null){ tEl.innerHTML="GAT attention"; aEl.innerHTML="<tr><td class=k>click a node on the map to see its real weights</td></tr>"; hEl.textContent=""; clearGrid(); return; }
   if(A.attnCompose){ showComposedAttrib(ag); return; }
   const gr=gatRow(ag);
@@ -917,26 +937,41 @@ $("field").addEventListener("change",()=>$("field").blur());
 $("view").addEventListener("change",()=>$("view").blur());
 
 // ---- episode picker: read traces/index.json (written by training / trace_episode.py) ----
-async function loadIndex(){
+// `auto=true` (background poll) never steals the currently-viewed trace out from under the
+// user — it only refills the dropdown and keeps the existing selection if it still exists.
+// A manually-requested eval (eval_ckpt.py, run async from the dashboard) writes new entries
+// here well after this page may have already loaded, so a one-shot fetch at boot silently
+// hides anything finished afterward unless the user notices the tiny ⟳ button.
+async function loadIndex(auto){
   try{
     const r=await fetch("traces/index.json?"+Date.now()); const idx=await r.json();
-    const sel=$("episode"); sel.innerHTML="";
+    const sel=$("episode");
+    const prevVal=sel.value, prevCount=sel.options.length;
+    sel.innerHTML="";
     // sort by checkpoint % then map
     idx.sort((a,b)=> (a.tag<b.tag?-1:1));
     for(const e of idx){ const o=document.createElement("option"); o.value=e.tag;
       o.text=`${e.completed?'✓ ':''}${e.tag}  (expl ${e.final_explored!=null?Math.round(e.final_explored*100)+'%':'?'}, ${e.n_steps} steps)`; sel.add(o); }
-    if(idx.length){ sel.value=idx[idx.length-1].tag; await loadTrace(`traces/${sel.value}/trace.json`); }
-    $("hint").textContent=`${idx.length} episodes in traces/`;
+    if(idx.length){
+      const stillThere=[...sel.options].some(o=>o.value===prevVal);
+      if(stillThere) sel.value=prevVal;
+      else{ sel.value=idx[idx.length-1].tag; await loadTrace(`traces/${sel.value}/trace.json`); }
+    }
+    const grew=idx.length-prevCount;
+    $("hint").textContent=`${idx.length} episodes in traces/`+(auto&&grew>0?` (+${grew} new)`:'');
     return true;
   }catch(e){ return false; }
 }
 $("episode").onchange=e=> loadTrace(`traces/${e.target.value}/trace.json`);
-$("reloadIdx").onclick=loadIndex;
+$("reloadIdx").onclick=()=>loadIndex(false);
 
 // boot: prefer the folder index; fall back to a sibling trace.json
-loadIndex().then(ok=>{ if(!ok) loadTrace("trace.json").catch(()=>{
+loadIndex(false).then(ok=>{ if(!ok) loadTrace("trace.json").catch(()=>{
   $("hint").textContent="serve a run folder (python -m http.server) so traces/index.json is reachable, or use 'file…'";
 }); });
+// background poll: picks up evals that finish (e.g. a manually-requested "complex" eval)
+// while this inspector tab is already open, without disturbing the trace in view.
+setInterval(()=>loadIndex(true), 5000);
 </script>
 </body>
 </html>

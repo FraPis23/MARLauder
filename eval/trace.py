@@ -103,6 +103,16 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     agent_frames = [[] for _ in range(M)]   # per-agent RGB frames → one animated GIF each
     explored = None          # last true explored_rate from info; set each step
     completed = False        # episode reached complete_thresh coverage
+    # GAT attention (per-layer, per-head, per-window-node) is heavy — ~0.5-0.7MB per agent per
+    # step. Embedded inline in trace.json it made long/hard episodes (e.g. 512-step evals on
+    # "complex" maps) balloon to 600-700MB, which no browser can fetch/parse → the whole
+    # inspector silently fails to render (nothing populates, not even the agent/step picker).
+    # Written instead to one small side file per step, fetched lazily by the viewer only for the
+    # step currently being looked at (viz/inspector.html::ensureGat). `has_gat` in the inline
+    # step record just tells the viewer whether it's worth asking.
+    gdir = tdir / "gat"
+    gdir_ready = False
+    has_contrib = False
     for t in range(n_steps):
         out = model.act(obs, h_act, h_crit, deterministic=True)
         rg = env._render_global
@@ -169,6 +179,11 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                         c_layers.append(cl.tolist())
                 gat_agents.append({"node": nodes, "nbr": nbr.tolist(), "w": w_layers,
                                    "c": (c_layers if enc_contrib is not None else None)})
+            if enc_contrib is not None:
+                has_contrib = True
+            if not gdir_ready:
+                gdir.mkdir(parents=True, exist_ok=True); gdir_ready = True
+            (gdir / f"{t:04d}.json").write_text(json.dumps(gat_agents))
 
         for a in range(M):
             prob = torch.sigmoid(env.world.occupancy_logodds_torch[0, a]).cpu().numpy()
@@ -222,8 +237,9 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "curr_nbrs": curr_nbrs,
                 "reward": rew, "nodes": nodes, "edges": edges,
                 "teammates": teammates,
-                # REAL per-layer, per-head GAT neighbor-attention softmax for this agent's window.
-                "gat": (gat_agents[a] if gat_agents is not None else None),
+                # REAL per-layer, per-head GAT neighbor-attention softmax for this agent's window —
+                # NOT embedded here (see gdir above); this just flags whether gat/{t:04d}.json exists.
+                "has_gat": gat_agents is not None,
             })
         # True coverage from info (reset is disabled above, so occupancy is intact).
         explored = float(info["explored_rate"][0].item())
@@ -250,7 +266,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "value": None, "action": -1,
                 "logits": [None] * K, "action_mask": [0] * K,
                 "curr_nbrs": [-1] * K,
-                "reward": {}, "nodes": [], "edges": [], "gat": None,
+                "reward": {}, "nodes": [], "edges": [], "has_gat": False,
                 # all agents share the complete map now → draw teammates solid at true pos.
                 "teammates": [{"j": int(j), "comm": 1,
                                "est":  [_r(pos_now[j, 0], 1), _r(pos_now[j, 1], 1)],
@@ -286,6 +302,7 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             # separate attention heads (all real, all used by the model).
             "gat_layers": len(model.encoder.layers),
             "gat_heads": int(getattr(model.encoder.layers[0], "n_heads", 1)),
+            "has_contrib": has_contrib,   # whether gat/*.json rows carry the "c" (contribution) field
             # Per-head A2 raw-feature groups → the viewer labels heads by what they specialize on
             # (head0→geometry, head1→utility, head2→teammate, …). Real config, not an inference.
             "head_feat_groups": (model.encoder.head_feat_groups()
