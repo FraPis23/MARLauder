@@ -184,6 +184,7 @@ def main() -> None:
             novel_scan_weight=args.novel_scan_weight,
             rdv_dense_weight=args.rdv_weight,
             rdv_offer_frac=args.rdv_offer_frac,
+            teammate_obs=not args.no_teammate_obs,
             revisit_penalty_coef=args.revisit_pen,
             revisit_window=args.revisit_window,
             stall_penalty_coef=args.stall_pen,

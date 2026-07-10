@@ -107,6 +107,11 @@ class EnvCfg:
     # path"). Telescoping toward the teammate's FIXED last-known pos between comms: oscillation
     # cancels, and at comm ∆M→0 kills the gate so the lkp-jump is never paid → no flip/hover farming.
     rdv_dense_weight: float = 0.10          # w: strength of g·(φ_prev−φ_now). 0 disables. M>1 only.
+    # ABLATION — blind the ACTOR to teammates: zeroes agent_scalars [∆M-gate, staleness],
+    # feat[4] (teammate-proximity potential) and feat[6] (radar teammate). Map fusion at comm,
+    # the rdv reward gate and the privileged critic (geo_pair) are untouched. Pure-exploration
+    # test: no approach/avoid reasoning toward teammates possible from the actor's inputs.
+    teammate_obs: bool = True
     rdv_offer_frac: float = 0.15            # gate saturates (g→1) when the map gained since last sync
     #                                         reaches this fraction of the OWN map size AT that sync
     #                                         (relative growth, floored by scan_norm_nodes). Also the ∆M obs norm.
@@ -1054,7 +1059,8 @@ class Explorer:
         # window onto the geodesic receptive-horizon nodes so the feed-forward policy gets a
         # heading toward far exploration mass / teammates (anti-loop without recurrence). Uses
         # the FREE-graph BF just computed. teammate_src = each OTHER agent's last-known node.
-        if self.M > 1:
+        # teammate_obs=False (ablation) → src None → b_team stays zero (actor blind to teammates).
+        if self.M > 1 and self.cfg.teammate_obs:
             ar = torch.arange(self.M, device=self.dev).view(self.M, 1)
             lkp = self.last_known_pos[:, ar, self._others_idx, :]               # [N, M, M-1, 2]
             lx = (lkp[..., 0] / float(self.graph.NR)).long().clamp(0, self.graph.LW - 1)
@@ -1077,7 +1083,10 @@ class Explorer:
         # position to each node (info["bf_dist_team"], built in Pass 1 over the optimistic
         # FREE∪UNKNOWN graph so it stays finite when the teammate is in unexplored space).
         # Gradient-rich, wall-aware, and pointing toward the teammate.
-        if self.M > 1:
+        # teammate_obs=False (ablation) → skip the write, feat[4] stays zero (node_feat is
+        # zero-alloc'd every build). bf_dist_team itself is still built: critic geo_pair +
+        # rdv φ need it and both are reward/critic-side, not actor obs.
+        if self.M > 1 and self.cfg.teammate_obs:
             scale_px = max(1.0, 4.0 * float(self.cfg.nr))
             # min over teammates (self slot left at +inf in Pass 1) → nearest teammate.
             d_min = info["bf_dist_team"].min(dim=1).values                    # [B, N_max]
@@ -1204,7 +1213,12 @@ class Explorer:
             last_comm = self.t_last_comm.gather(2, j_star.unsqueeze(2)).squeeze(2).float()           # [N, M]
             staleness = ((self.t.view(self.N, 1).float() - last_comm).clamp(min=0.0) / T_max).clamp(0.0, 1.0)
             self._rdv_gate = g
-            agent_scalars = torch.stack([g, staleness], dim=-1)                                      # [N, M, 2]
+            # teammate_obs=False (ablation): gate g still feeds the rdv REWARD above, but the
+            # actor's [∆M-gate, staleness] scalars are zeroed — no "when to rendezvous" signal.
+            if self.cfg.teammate_obs:
+                agent_scalars = torch.stack([g, staleness], dim=-1)                                  # [N, M, 2]
+            else:
+                agent_scalars = torch.zeros((self.N, self.M, 2), device=self.dev)
         else:
             self._rdv_gate = torch.zeros((self.N, self.M), device=self.dev)
             agent_scalars = torch.zeros((self.N, self.M, 2), device=self.dev)

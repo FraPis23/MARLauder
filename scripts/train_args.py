@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Debug: persistent teammate-position awareness (positions only, maps still comm-gated)")
     g_sense.add_argument("--force-full-occupancy-sharing", action="store_true",
                     help="H.4 debug: persistent map fusion every step (occupancy synced across agents)")
+    g_sense.add_argument("--no-teammate-obs", action="store_true",
+                    help="ABLATION: blind the actor to teammates — zeroes agent_scalars [∆M-gate, staleness], feat[4] teammate-proximity potential and feat[6] radar-teammate. Map fusion at comm, rdv reward gate and privileged critic (geo_pair) unchanged. Pure-exploration test (pair with --rdv-weight 0)")
 
     g_curr = ap.add_argument_group("Curriculum")
     g_curr.add_argument("--curriculum", action="store_true",
