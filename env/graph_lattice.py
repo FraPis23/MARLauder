@@ -31,6 +31,7 @@ Public API
         -> info dict (see return at end of build)
     graph.bf_from_target(info, target, dist_init)   -> geodesic BF dist/parent field
     graph.build_radar(info, teammate_src, gamma_r)  -> feat[5] b_util, feat[6] b_teammate
+    graph.value_field(info, gamma_vf)               -> per-first-step discounted utility [N, K]
     graph.extract_local_window(info)                -> ego-centric (2·n_hops+3)² window
 """
 from __future__ import annotations
@@ -496,6 +497,65 @@ class GraphLattice:
                     break
 
         return dist, parent
+
+    @torch.no_grad()
+    def value_field(
+        self,
+        info: dict[str, torch.Tensor],
+        gamma_vf: float = 0.97,
+        max_iters: int | None = None,
+    ) -> torch.Tensor:
+        """Per-FIRST-STEP discounted utility mass over the BF shortest-path tree from curr.
+
+        V_k = Σ_{v : shortest path curr→v leaves through neighbor k} gamma_vf^{hops(v)} · utility(v)
+
+        One comparable scalar per action: "how much (distance-discounted) exploration value lies
+        down each of the K exits". Near-weak vs far-strong frontier choices land on the same scale,
+        the comparison is done analytically instead of asking the encoder to integrate window +
+        radar. Reuses bf_dist_from_curr / bf_parent_from_curr already in info (no extra BF).
+
+        Branch assignment by label propagation down the parent tree: seed curr's K neighbors whose
+        BF parent is curr with their own k, then label[v] = label[parent[v]] to a fixed point
+        (≤ tree depth iterations, early-exit like bf_from_target).
+
+        Returns vf [N, K] ∈ [0,1]: V normalized by its max over k (relative branch value,
+        utility-scale-free; all-zero when no reachable utility — the "desert" signal).
+        """
+        dist   = info["bf_dist_from_curr"]                                   # [N, N_max] px
+        parent = info["bf_parent_from_curr"]                                 # [N, N_max]
+        curr   = info["curr_idx"]                                            # [N]
+        util   = info["utility"]                                             # [N, N_max]
+        nbr    = info["curr_nbr"]                                            # [N, K] global idx, -1 = invalid
+        N = dist.shape[0]
+        dev = dist.device
+        arange_N = torch.arange(N, device=dev)
+
+        # Seed: neighbor k of curr whose shortest path is the direct edge (parent == curr).
+        # A neighbor routed elsewhere (e.g. diagonal shortcut) is labeled via propagation instead.
+        label = torch.full((N, self.N_max), -1, dtype=torch.long, device=dev)
+        par_of_nbr = torch.gather(parent, 1, nbr.clamp(min=0))               # [N, K]
+        seed_ok = (nbr >= 0) & (par_of_nbr == curr.unsqueeze(1))             # [N, K]
+        for k in range(K):
+            ok = seed_ok[:, k]
+            label[arange_N[ok], nbr[ok, k]] = k
+
+        # Propagate the first-step label down the tree: label[v] = label[parent[v]].
+        parent_safe = parent.clamp(min=0)
+        max_iters = max_iters if max_iters is not None else self.guidepost_iters
+        for it in range(max_iters):
+            lp = torch.gather(label, 1, parent_safe)                         # [N, N_max]
+            new = torch.where((label < 0) & (parent >= 0) & (lp >= 0), lp, label)
+            if it >= 1 and (it % 8 == 0) and bool(torch.equal(new, label)):
+                label = new
+                break
+            label = new
+
+        hops = dist / float(self.NR)
+        mass = util * torch.pow(torch.as_tensor(gamma_vf, device=dev), hops)
+        mass = torch.where(torch.isfinite(dist) & (label >= 0), mass, torch.zeros_like(mass))
+        V = torch.zeros((N, K), dtype=torch.float32, device=dev)
+        V.scatter_add_(1, label.clamp(min=0), mass)                          # -1 rows carry 0 mass
+        return V / V.max(dim=1, keepdim=True).values.clamp(min=1e-6)
 
     @torch.no_grad()
     def build_radar(

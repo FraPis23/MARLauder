@@ -112,6 +112,12 @@ class EnvCfg:
     # the rdv reward gate and the privileged critic (geo_pair) are untouched. Pure-exploration
     # test: no approach/avoid reasoning toward teammates possible from the actor's inputs.
     teammate_obs: bool = True
+    # VALUE-FIELD obs (anti-loop): per-first-step discounted utility mass over the BF tree from
+    # curr — V_k = Σ γ^hops·utility over the branch leaving through neighbor k, max-normalized to
+    # [0,1]. One comparable scalar per action ("how much is down each exit, distance included"),
+    # so near-weak vs far-strong frontier choices are resolved analytically instead of asking the
+    # GAT to integrate window + radar. Fed to the actor (obs["value_field"] [N, M, K]).
+    vf_gamma: float = 0.97                  # per-hop discount of utility mass (mirrors radar_gamma)
     rdv_offer_frac: float = 0.15            # gate saturates (g→1) when the map gained since last sync
     #                                         reaches this fraction of the OWN map size AT that sync
     #                                         (relative growth, floored by scan_norm_nodes). Also the ∆M obs norm.
@@ -1055,6 +1061,9 @@ class Explorer:
         self._dist_curr_prev.copy_(bf_dist_from_curr.view(self.N, self.M, self.N_max))
         info["bf_dist_from_curr"]  = bf_dist_from_curr
         info["bf_parent_from_curr"] = bf_parent_from_curr   # [B, N_max] predecessor on path from curr
+        # ---- VALUE-FIELD [B, K]: discounted utility mass per first-step branch (see EnvCfg.vf_gamma).
+        vf = self.graph.value_field(info, gamma_vf=float(self.cfg.vf_gamma))
+        self._vf = vf.view(self.N, self.M, self.K)
         # ---- RADAR (feat[5] b_util, feat[6] b_teammate): compress the world BEYOND the ego
         # window onto the geodesic receptive-horizon nodes so the feed-forward policy gets a
         # heading toward far exploration mass / teammates (anti-loop without recurrence). Uses
@@ -1121,6 +1130,8 @@ class Explorer:
                 "pos":            self.pos.clone(),                                              # [N, M, 2]
                 "last_known_pos": self.last_known_pos.clone(),                                   # [N, M, M, 2]
                 "comm_mask":      cm_stash.clone(),                                              # [N, M, M] bool
+                # Inspector: per-first-step value-field (what the actor sees as obs["value_field"]).
+                "value_field":    self._vf.clone(),                                              # [N, M, K]
             }
 
         # ---- Pass 3: extract local windows — ONE batched call, unfold [B, ...] → [N, M, ...] ----
@@ -1250,6 +1261,8 @@ class Explorer:
             "prev_action":          self._prev_action_onehot(),    # [N, M, K=8] float
             # Rendezvous raw obs: [∆M surplus-gate, staleness] per agent (actor input).
             "agent_scalars":        agent_scalars,                 # [N, M, 2] float
+            # Value-field: per-first-step discounted utility mass, max-normalized (actor input).
+            "value_field":          self._vf,                      # [N, M, K] float ∈[0,1]
         }
 
     def _prev_action_onehot(self) -> torch.Tensor:

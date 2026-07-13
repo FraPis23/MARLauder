@@ -133,6 +133,8 @@ def main() -> None:
         n_hops=args.n_hops,
         lr_actor=args.lr,
         use_gru=args.gru and not args.no_gru,   # default OFF; --gru opts in, --no-gru forces off
+        gat_actor=not (args.no_gat_actor or args.no_gat),
+        gat_critic=not args.no_gat,
         device=args.device,
         seed=args.seed,
         compile=args.compile,
@@ -185,6 +187,7 @@ def main() -> None:
             rdv_dense_weight=args.rdv_weight,
             rdv_offer_frac=args.rdv_offer_frac,
             teammate_obs=not args.no_teammate_obs,
+            vf_gamma=args.vf_gamma,
             revisit_penalty_coef=args.revisit_pen,
             revisit_window=args.revisit_window,
             stall_penalty_coef=args.stall_pen,

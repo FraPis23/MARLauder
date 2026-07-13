@@ -44,10 +44,23 @@ K = 8
 CRITIC_GLOBAL_DIM = 7
 
 
+def _mask_scores(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Sanitize + mask K-way logits. Finite large-negative (fp16-safe -1e4): keeps Categorical
+    valid under fp16 / NaN-prone late training. softmax(-1e4)≈0 → masked slots get ~0 prob,
+    identical to -inf for sampling/argmax. A fully-masked row → all NEG → uniform softmax
+    (no NaN). nan_to_num sanitizes any NaN/inf leaked from the encoder before masking."""
+    any_valid = mask.any(dim=-1, keepdim=True)
+    mask_eff = torch.where(any_valid.expand_as(mask), mask, torch.ones_like(mask))
+    NEG = -1.0e4
+    scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0e4, neginf=NEG)
+    return scores.masked_fill(~mask_eff, NEG)
+
+
 class PointerHead(nn.Module):
-    """Pointer over K=8 neighbors: logit_k = (q·k_k)/sqrt(d)·τ. Beyond-window steering reaches
-    the neighbor embeddings through the GAT radar channels (feat[5]/feat[6]); there is no analytic
-    guidepost bias."""
+    """Pointer over K=8 neighbors: logit_k = (q·k_k)/sqrt(d)·τ + w_vf·vf_k. Beyond-window steering
+    reaches the neighbor embeddings through the GAT radar channels (feat[5]/feat[6]); the analytic
+    VALUE-FIELD enters as a per-neighbor logit bias (w_vf learnable, init 1 → the field shapes the
+    policy from step 0; the net can amplify or unlearn it)."""
     def __init__(self, d: int) -> None:
         super().__init__()
         self.q = nn.Linear(d, d)
@@ -59,35 +72,42 @@ class PointerHead(nn.Module):
         # clamped to [0.1, 10] lets the head sharpen its neighbor ranking without runaway.
         # Init 0 → τ=1 → identity at start (back-compat: old ckpts miss this param, load fresh at 1).
         self.log_tau = nn.Parameter(torch.zeros(1))
+        # Value-field logit-bias gain. vf ∈ [0,1] per neighbor → init 1.0 gives a meaningful
+        # (but overridable) prior toward the highest-value branch from the first update.
+        self.w_vf = nn.Parameter(torch.ones(1))
 
     def forward(
         self,
         query: torch.Tensor,           # [B, d]
         keys: torch.Tensor,            # [B, K, d]
         mask: torch.Tensor,            # [B, K] bool (True = valid)
+        vf: torch.Tensor | None = None,  # [B, K] value-field ∈[0,1] (None = no bias)
     ) -> torch.Tensor:
         q = self.q(query).unsqueeze(1)
         k = self.k(keys)
         scores = (q * k).sum(dim=-1) / math.sqrt(self.d)            # [B, K]
         scores = scores * self.log_tau.exp().clamp(0.1, 10.0)       # A1-style learnable sharpening
-        any_valid = mask.any(dim=-1, keepdim=True)
-        mask_eff = torch.where(any_valid.expand_as(mask), mask, torch.ones_like(mask))
-        # Finite large-negative (fp16-safe -1e4): keeps Categorical valid under fp16 / NaN-prone
-        # late training. softmax(-1e4)≈0 → masked slots get ~0 prob, identical to -inf for
-        # sampling/argmax. A fully-masked row → all NEG → uniform softmax (no NaN). nan_to_num
-        # sanitizes any NaN/inf leaked from the encoder before masking.
-        NEG = -1.0e4
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0e4, neginf=NEG)
-        scores = scores.masked_fill(~mask_eff, NEG)
-        return scores
+        if vf is not None:
+            scores = scores + self.w_vf * vf
+        return _mask_scores(scores, mask)
 
 
 class MarlActorCritic(nn.Module):
     def __init__(self, n_agents: int = 1, d: int = 128, n_heads: int = 4, n_layers: int = 2,
-                 use_gru: bool = True) -> None:
+                 use_gru: bool = True, gat_actor: bool = True, gat_critic: bool = True) -> None:
         super().__init__()
         self.M = n_agents
         self.d = d
+        # GAT ablation switches.
+        #   gat_actor=False  → actor blind to the GAT: curr_emb replaced by zeros and the pointer
+        #     (q·k over GAT neighbor embeddings) replaced by actor_head(h) + w_vf_direct·vf — the
+        #     policy steers from the analytic value-field + prev_action + agent_scalars only.
+        #   gat_critic=False → critic drops the GAT too: pooled per-agent embedding becomes
+        #     critic_feat_emb (masked mean⊕max of RAW window node features, projected to d).
+        #   Both False (--no-gat) → the encoder is NEVER RUN: full GAT removal, big speed/VRAM win.
+        self.gat_actor = bool(gat_actor)
+        self.gat_critic = bool(gat_critic)
+        self.use_encoder = self.gat_actor or self.gat_critic
         # GRU ablation switch. use_gru=False bypasses both recurrent cells: the actor query is the
         # feed-forward actor_in and the critic input is the feed-forward joint, with NO temporal
         # memory across steps. The GRUCell modules are still built (so their params exist for
@@ -103,9 +123,18 @@ class MarlActorCritic(nn.Module):
         # when to rendezvous. Beyond-window spatial context still reaches the actor through the
         # GAT-processed node features (utility feat[2] + radar feat[5]/feat[6]).
         self.n_agent_scalars = 2
-        self.actor_pre = nn.Linear(d + K + self.n_agent_scalars, d)
+        # + K: the value-field [B, K] enters the actor trunk too (context for the GRU/MLP),
+        # in addition to its per-neighbor logit bias in the pointer / actor_head.
+        self.actor_pre = nn.Linear(d + K + self.n_agent_scalars + K, d)
         self.gru_actor = nn.GRUCell(d, d)
         self.pointer = PointerHead(d)
+        # VF-only actor head (gat_actor=False): K logits from the trunk + direct vf bias.
+        # Built unconditionally so both arms share one state_dict layout (warm-start across arms).
+        self.actor_head = nn.Linear(d, K)
+        self.w_vf_direct = nn.Parameter(torch.ones(1))
+        # GAT-free critic embedding (gat_critic=False): masked mean⊕max of the raw window node
+        # features → d. Built unconditionally (same state_dict either way).
+        self.critic_feat_proj = nn.Linear(2 * F_IN, d)
         # Critic head (CTDE). Input = pooled team summary (mean ⊕ max over agents = 2·d, see
         # _critic_in) ⊕ CTDE global vector. The 2·d width is independent of n_agents → the critic
         # is count-invariant (unlocks IR2-style variable M without reshaping this weight).
@@ -177,14 +206,42 @@ class MarlActorCritic(nn.Module):
         return torch.cat([pooled, critic_global], dim=-1)          # [N, 2·d + G]
 
     # ---------------- actor ----------------
+    def critic_feat_emb(self, node_feat: torch.Tensor, node_valid: torch.Tensor) -> torch.Tensor:
+        """GAT-free per-agent embedding (gat_critic=False): masked mean ⊕ max of the raw window
+        node features projected to d. Broadcasts over any leading dims:
+        [..., N_max, F] + [..., N_max] → [..., d]."""
+        nv = node_valid.unsqueeze(-1)
+        cnt = nv.float().sum(dim=-2).clamp(min=1.0)
+        mean = (node_feat * nv.float()).sum(dim=-2) / cnt
+        mx = node_feat.masked_fill(~nv, -1.0e4).max(dim=-2).values
+        mx = torch.where(node_valid.any(dim=-1, keepdim=True), mx, torch.zeros_like(mx))
+        return self.critic_feat_proj(torch.cat([mean, mx], dim=-1))
+
     def _actor_in(
         self,
-        curr_emb: torch.Tensor,             # [B, d]
+        curr_emb: torch.Tensor | None,      # [B, d] GAT embedding, or None (no-GAT-actor)
         prev_action: torch.Tensor,          # [B, K] one-hot
         agent_scalars: torch.Tensor,        # [B, 2] [∆M-gate, staleness]
+        vf: torch.Tensor,                   # [B, K] value-field ∈[0,1]
     ) -> torch.Tensor:
-        """Build the actor GRU input: curr_emb || prev_action || agent_scalars."""
-        return self.actor_pre(torch.cat([curr_emb, prev_action, agent_scalars], dim=-1))
+        """Build the actor GRU input: curr_emb || prev_action || agent_scalars || value_field.
+        gat_actor=False → curr_emb slot zeroed (VF-only actor)."""
+        if not self.gat_actor or curr_emb is None:
+            curr_emb = vf.new_zeros(vf.shape[0], self.d)
+        return self.actor_pre(torch.cat([curr_emb, prev_action, agent_scalars, vf], dim=-1))
+
+    def _actor_logits(
+        self,
+        h_act: torch.Tensor,                # [B, d] actor trunk output
+        nbr_embs: torch.Tensor,             # [B, K, d] GAT neighbor embeddings
+        mask: torch.Tensor,                 # [B, K] bool
+        vf: torch.Tensor,                   # [B, K] value-field
+    ) -> torch.Tensor:
+        """K-way action logits. GAT arm: pointer q·k over neighbor embeddings + w_vf·vf.
+        VF-only arm: actor_head(h) + w_vf_direct·vf — no GAT in the actor path."""
+        if self.gat_actor:
+            return self.pointer(h_act, nbr_embs, mask, vf)
+        return _mask_scores(self.actor_head(h_act) + self.w_vf_direct * vf, mask)
 
     def _step_actor(self, actor_in: torch.Tensor, h_in: torch.Tensor) -> torch.Tensor:
         """Recurrent actor step, or feed-forward passthrough when use_gru is False (ablation)."""
@@ -203,12 +260,16 @@ class MarlActorCritic(nn.Module):
     ) -> dict:
         N, M = obs["curr_idx"].shape
         B = N * M
-        h_all, curr_emb, nbr_embs = self._encode(obs)
+        if self.use_encoder:
+            h_all, curr_emb, nbr_embs = self._encode(obs)
+        else:   # --no-gat: encoder never run; critic gets the raw-feature embedding instead.
+            curr_emb, nbr_embs = None, None
+        vf = obs["value_field"].reshape(B, K)
         actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K),
-                                   obs["agent_scalars"].reshape(B, self.n_agent_scalars))
+                                   obs["agent_scalars"].reshape(B, self.n_agent_scalars), vf)
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self._step_actor(actor_in, h_act_in)              # [B, d]
-        pointer_logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
+        pointer_logits = self._actor_logits(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K), vf)
         logits = pointer_logits
         # Inspector: stash the pointer logits + per-layer GAT neighbor attention.
         if self.store_logit_components:
@@ -235,7 +296,8 @@ class MarlActorCritic(nn.Module):
         logp = dist.log_prob(action)
         entropy = dist.entropy()
 
-        curr_emb_per_agent = curr_emb.view(N, M, self.d)
+        curr_emb_per_agent = (curr_emb.view(N, M, self.d) if self.gat_critic
+                              else self.critic_feat_emb(obs["node_feat"], obs["node_valid"]))
         joint = self.critic_pre(self._critic_in(curr_emb_per_agent, obs.get("critic_global")))
         h_crit_out = self._step_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
@@ -260,19 +322,24 @@ class MarlActorCritic(nn.Module):
     ) -> dict:
         N, M = obs["curr_idx"].shape
         B = N * M
-        _, curr_emb, nbr_embs = self._encode(obs)
+        if self.use_encoder:
+            _, curr_emb, nbr_embs = self._encode(obs)
+        else:
+            curr_emb, nbr_embs = None, None
+        vf = obs["value_field"].reshape(B, K)
         actor_in = self._actor_in(curr_emb, obs["prev_action"].reshape(B, K),
-                                   obs["agent_scalars"].reshape(B, self.n_agent_scalars))
+                                   obs["agent_scalars"].reshape(B, self.n_agent_scalars), vf)
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self._step_actor(actor_in, h_act_in)
-        logits = self.pointer(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K))
+        logits = self._actor_logits(h_act_out, nbr_embs, obs["action_mask"].reshape(B, K), vf)
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)
         logp = dist.log_prob(action.reshape(B))
         entropy = dist.entropy()
 
-        curr_emb_per_agent = curr_emb.view(N, M, self.d)
+        curr_emb_per_agent = (curr_emb.view(N, M, self.d) if self.gat_critic
+                              else self.critic_feat_emb(obs["node_feat"], obs["node_valid"]))
         joint = self.critic_pre(self._critic_in(curr_emb_per_agent, obs.get("critic_global")))
         h_crit_out = self._step_critic(joint, hidden_critic)
         value = self.critic_head(h_crit_out).squeeze(-1)
@@ -324,26 +391,29 @@ class MarlActorCritic(nn.Module):
 
     def evaluate_step_from_enc(
         self,
-        curr_emb: torch.Tensor,        # [N, M, d]
-        nbr_embs: torch.Tensor,        # [N, M, K, d]
+        curr_emb: torch.Tensor,        # [N, M, d] GAT emb, or critic_feat_emb when --no-gat
+        nbr_embs: torch.Tensor | None,  # [N, M, K, d]; None when --no-gat
         action_mask: torch.Tensor,     # [N, M, K]
         action: torch.Tensor,          # [N, M]
         hidden_actor: torch.Tensor,    # [N, M, d]
         hidden_critic: torch.Tensor,   # [N, d]
         prev_action: torch.Tensor,     # [N, M, K=8] one-hot
         agent_scalars: torch.Tensor,   # [N, M, 2] [∆M-gate, staleness]
+        value_field: torch.Tensor,     # [N, M, K] per-first-step discounted utility ∈[0,1]
         critic_global: torch.Tensor | None = None,       # [N, CRITIC_GLOBAL_DIM] CTDE value-only state
     ) -> dict:
         """One PPO-evaluate step given pre-encoded curr/nbr embeddings."""
         N, M, _ = curr_emb.shape
         B = N * M
+        vf = value_field.reshape(B, K)
         curr_emb_flat = curr_emb.reshape(B, self.d)
         actor_in = self._actor_in(curr_emb_flat, prev_action.reshape(B, K),
-                                  agent_scalars.reshape(B, self.n_agent_scalars))
+                                  agent_scalars.reshape(B, self.n_agent_scalars), vf)
         h_act_in = hidden_actor.reshape(B, self.d)
         h_act_out = self._step_actor(actor_in, h_act_in)
-        logits = self.pointer(h_act_out, nbr_embs.reshape(B, K, self.d),
-                              action_mask.reshape(B, K))
+        logits = self._actor_logits(h_act_out,
+                                    nbr_embs.reshape(B, K, self.d) if nbr_embs is not None else None,
+                                    action_mask.reshape(B, K), vf)
         # Guard: keep logits finite so Categorical never sees an all-(-inf)/NaN row.
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
         dist = Categorical(logits=logits)

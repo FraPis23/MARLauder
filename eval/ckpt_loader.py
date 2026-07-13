@@ -61,13 +61,16 @@ def load_model_from_ckpt(
     n_heads_final  = n_heads  if n_heads  is not None else int(cfg.get("n_heads", 4))
     n_agents_final = n_agents if n_agents is not None else det_agents
     use_gru = bool(cfg.get("use_gru", True))   # honor a GRU-ablation checkpoint
+    gat_actor = bool(cfg.get("gat_actor", True))   # honor a VF-only-ablation checkpoint
+    gat_critic = bool(cfg.get("gat_critic", True))  # honor a full --no-gat checkpoint
 
     if verbose:
         print(f"[ckpt] arch: n_layers={n_layers_final} d={d_hidden_final} n_heads={n_heads_final} "
               f"n_agents={n_agents_final} use_gru={use_gru} (detected layers={det_layers}, d={det_d})")
 
     model = MarlActorCritic(n_agents=n_agents_final, d=d_hidden_final, n_heads=n_heads_final,
-                            n_layers=n_layers_final, use_gru=use_gru).to(device)
+                            n_layers=n_layers_final, use_gru=use_gru, gat_actor=gat_actor,
+                            gat_critic=gat_critic).to(device)
     msd = model.state_dict()
     dropped = [k for k in sd if k in msd and msd[k].shape != sd[k].shape]
     if dropped and verbose:

@@ -80,6 +80,10 @@ class TrainCfg:
     n_hops: int = 6          # ego-centric encoder window radius; n_layers tied to this
     n_layers: int = 6        # GAT layers; default tied to n_hops in make_env_model (6 hops / 6 layers)
     use_gru: bool = False    # default OFF (feed-forward actor/critic, no temporal memory). Opt in via --gru
+    gat_actor: bool = True   # False = VF-only ablation: actor steers from the analytic value-field
+                             # (+ prev_action/scalars) only, GAT reserved for the critic. --no-gat-actor
+    gat_critic: bool = True  # False (with gat_actor False = --no-gat) = encoder never run; critic
+                             # falls back to raw-feature mean⊕max projection.
     lr_actor: float = 3e-4
     lr_critic: float = 5e-4   # faster than actor (non-stationary value) but below paper's 1e-3 (oscillation risk)
     device: str = "cuda:0"
@@ -186,7 +190,8 @@ def make_env_model(cfg: TrainCfg) -> tuple[Explorer, MarlActorCritic]:
         env = Explorer(split, cfg.env, seed=cfg.seed)
     model = MarlActorCritic(n_agents=cfg.n_agents, d=cfg.d_hidden,
                             n_heads=cfg.n_heads, n_layers=cfg.n_layers,
-                            use_gru=cfg.use_gru).to(cfg.device)
+                            use_gru=cfg.use_gru, gat_actor=cfg.gat_actor,
+                            gat_critic=cfg.gat_critic).to(cfg.device)
     if cfg.compile and torch.cuda.is_available():
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead", dynamic=False)

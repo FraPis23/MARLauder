@@ -1,0 +1,17 @@
+############ PHASE 1: EASY  (128-step episodes, 2M steps) ############
+Warp 1.14.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4080 Laptop GPU" (12 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.14.0
+Module env.world_warp e132c61 load on device 'cuda:0' took 0.57 ms  (cached)
+[train] iters=244  steps/iter=8192  total≈1,998,848
+[it    1/244] ep_end= 49.1%(ended= 32)  pg=-0.0038  v=0.5379  ent=1.621  kl=+0.0023  clip=2.6%  redun=0.87 stall=1% pair=0.14 sps=754(754avg)
+[it    2/244] ep_end= 58.5%(ended= 32)  pg=-0.0042  v=0.6115  ent=1.612  kl=+0.0016  clip=5.0%  redun=0.91 stall=1% pair=0.14 sps=751(753avg)
+[it    3/244] ep_end= 61.5%(ended= 32)  pg=-0.0023  v=0.7049  ent=1.584  kl=+0.0023  clip=2.6%  redun=0.86 stall=1% pair=0.14 sps=707(737avg)
+[it    4/244] ep_end= 62.2%(ended= 34)  pg=-0.0032  v=0.6721  ent=1.598  kl=+0.0022  clip=3.3%  redun=0.85 stall=1% pair=0.15 sps=673(720avg)
+[it    5/244] ep_end= 71.2%(ended= 34)  pg=-0.0020  v=0.4744  ent=1.616  kl=+0.0009  clip=1.5%  redun=0.91 stall=1% pair=0.13 sps=689(713avg)
+[it    6/244] ep_end= 59.7%(ended= 33)  pg=-0.0034  v=0.3886  ent=1.585  kl=+0.0019  clip=2.7%  redun=0.85 stall=1% pair=0.15 sps=689(709avg)
+[it    7/244] ep_end= 70.3%(ended= 36)  pg=-0.0026  v=0.4317  ent=1.554  kl=+0.0025  clip=3.3%  redun=0.84 stall=1% pair=0.16 sps=609(693avg)

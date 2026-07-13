@@ -98,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     g_target = ap.add_argument_group("Model ablations & warm-start")
     g_target.add_argument("--gru", action="store_true", help="Enable GRU temporal memory in actor+critic. Default OFF: the model runs feed-forward (both GRUCells bypassed)")
     g_target.add_argument("--no-gru", action="store_true", help="Force GRU OFF (redundant with the default; kept for back-compat / explicitness). Overrides --gru")
+    g_target.add_argument("--no-gat-actor", action="store_true",
+                    help="ABLATION: VF-only actor — steers from the analytic value-field (+prev_action/agent_scalars) only; curr_emb zeroed, pointer replaced by actor_head(h)+w_vf·vf. GAT still runs for the CTDE critic")
+    g_target.add_argument("--no-gat", action="store_true",
+                    help="ABLATION: NO GAT AT ALL — encoder never run. Actor as --no-gat-actor (VF-only); critic embedding = masked mean⊕max of raw window node features projected to d (+ critic_global). Big speed/VRAM win. Implies --no-gat-actor")
+    g_target.add_argument("--vf-gamma", type=float, default=0.97,
+                    help="Value-field per-hop discount: V_k = Σ γ^hops·utility over the BF branch leaving through neighbor k (max-normalized to [0,1], actor obs + pointer logit bias)")
     g_target.add_argument("--init-ckpt", default=None, help="Warm-start: load model + value-norm from this .pt at startup (optimizer stays fresh). Use to relaunch a new stage (easy→difficult) at a different --n-envs in a fresh process (avoids the in-process curriculum swap + CUDA-graph recapture)")
 
     g_score = ap.add_argument_group("Eval scoring weights")

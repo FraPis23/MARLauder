@@ -129,10 +129,17 @@ def ppo_update(
                 with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=use_amp):
                     # Slice chunk obs along T and N axes.
                     chunk_obs = _slice_chunk_obs(rollout.obs, c0, c1, env_idx)
-                    # ONE encoder pass for the whole chunk.
-                    enc = model.encode_chunk(chunk_obs)
-                    curr_emb_chunk = enc["curr_emb"]                       # [T_chunk, Nmb, M, d]
-                    nbr_embs_chunk = enc["nbr_embs"]                       # [T_chunk, Nmb, M, K, d]
+                    if model.use_encoder:
+                        # ONE encoder pass for the whole chunk.
+                        enc = model.encode_chunk(chunk_obs)
+                        curr_emb_chunk = enc["curr_emb"]                   # [T_chunk, Nmb, M, d]
+                        nbr_embs_chunk = enc["nbr_embs"]                   # [T_chunk, Nmb, M, K, d]
+                    else:
+                        # --no-gat: no encoder at all; the critic embedding is the cheap
+                        # raw-feature mean⊕max projection (actor side is VF-only anyway).
+                        curr_emb_chunk = model.critic_feat_emb(
+                            chunk_obs["node_feat"], chunk_obs["node_valid"])  # [T_chunk, Nmb, M, d]
+                        nbr_embs_chunk = None
 
                     chunk_pg = 0.0; chunk_vl = 0.0; chunk_ent = 0.0
                     chunk_clip = 0.0; chunk_kl = 0.0
@@ -153,13 +160,14 @@ def ppo_update(
 
                         ev = model.evaluate_step_from_enc(
                             curr_emb=curr_emb_chunk[tt],
-                            nbr_embs=nbr_embs_chunk[tt],
+                            nbr_embs=nbr_embs_chunk[tt] if nbr_embs_chunk is not None else None,
                             action_mask=action_mask_t,
                             action=action_t,
                             hidden_actor=last_h_act,
                             hidden_critic=last_h_crit,
                             prev_action=chunk_obs["prev_action"][tt],
                             agent_scalars=chunk_obs["agent_scalars"][tt],
+                            value_field=chunk_obs["value_field"][tt],
                             critic_global=chunk_obs["critic_global"][tt] if "critic_global" in chunk_obs else None,
                         )
                         new_logp = ev["logp"]
