@@ -128,6 +128,12 @@ class EnvCfg:
                                             # Ceiling ~0.15; >0.2 over-corrects (punishes legit backtrack
                                             # out of a dead-end room + the old both-agents ping-pong bug).
     revisit_window: int = 8                 # W: lookback window for revisit detection
+    # Cumulative revisit STREAK (v0.9 anti ping-pong lungo). Counts CONSECUTIVE steps landing on
+    # recently-visited nodes (age < W); the existing graduated revisit penalty is multiplied by
+    # 1 + β_rev·(streak−1), UNCAPPED — insisting inside the recency window grows linearly without
+    # limit. No per-node visit count: once outside the window there is no memory, so a legitimate
+    # future pass through old ground costs nothing. Reset on landing on a non-recent node.
+    revisit_streak_beta: float = 0.5        # β_rev: per-consecutive-revisit multiplier growth. 0 disables.
     # RADAR (feat[5/6]) travel-cost discount per hop beyond the ego-window horizon. Lower = more
     # myopic (only just-beyond mass matters); higher = far mass carries further. See build_radar.
     # Stall diagnosis 2026-07-09 (traces m240/m160): at 0.92 a frontier 45 hops beyond the horizon
@@ -142,6 +148,11 @@ class EnvCfg:
     # collision-revert holds AND invalid/curr-node picks. Pressures agents to reroute /
     # separate instead of deadlocking. δ_stall ≫ revisit so standing still is "heavily penalized".
     stall_penalty_coef: float = 0.1         # δ_stall
+    # Cumulative stall STREAK (v0.9): consecutive no-displacement steps multiply δ_stall by
+    # 1 + β·(streak−1), clamped to stall_streak_cap (unlike the revisit streak, capped: a hard
+    # physical block shouldn't nuke the return). Reset on the first real displacement.
+    stall_streak_beta: float = 0.5          # β: per-consecutive-stall multiplier growth. 0 disables.
+    stall_streak_cap: float = 4.0           # max multiplier on δ_stall
     # A2 — bypass distance / LOS check in comm: every step every agent communicates.
     force_full_comm: bool = False
     # Debug — persistent teammate-position awareness (positions only, not maps).
@@ -282,6 +293,9 @@ class Explorer:
         # telescoping reward. +inf = cold (first post-reset step → that step's rdv masked to 0).
         self._rdv_phi_prev = torch.full((self.N, self.M), float("inf"), dtype=torch.float32, device=self.dev)
         self._rdv_gate = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        # v0.9 cumulative-penalty streaks (consecutive stalls / consecutive recent-revisits).
+        self._stall_streak = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        self._revisit_streak = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         self._geo_curr_team = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
         # Precompute lattice→pixel flat index for fast node-level FREE extraction.
         nx = self.graph.node_xy[:, 0].long().clamp(0, self.W - 1)
@@ -306,6 +320,30 @@ class Explorer:
         assert action.shape == (self.N, self.M)
         # 1. Decode K-slot pick → global target node + world coords.
         chosen, tgt_xy = self._decode_action(action)
+
+        # 1b. SAME-TARGET-NODE arbitration (v0.9 anti-deadlock). When two agents decode the SAME
+        # global node, the sub-step physics used to freeze BOTH (winner-blocked revert). Resolve
+        # at the ACTION level instead: the agent with the SHORTER chosen edge wins (axial NR beats
+        # diagonal NR·√2 — it arrives first); a length tie breaks RANDOMLY PER-STEP (fair over
+        # time, unlike the per-episode _collision_key). The loser is forced to hold (target =
+        # own current node) → it takes the stall penalty, learning not to contest; the winner
+        # proceeds untouched.
+        if self.M > 1:
+            chosen_len = self.graph.edge_len[action]                       # [N, M] px of chosen edge
+            for i in range(self.M):
+                for j in range(i + 1, self.M):
+                    same = chosen[:, i] == chosen[:, j]                    # [N]
+                    if not bool(same.any()):
+                        continue
+                    li, lj = chosen_len[:, i], chosen_len[:, j]
+                    tie = (li - lj).abs() < 1e-3
+                    rnd = torch.rand(self.N, device=self.dev) < 0.5
+                    i_wins = torch.where(tie, rnd, li <= lj)               # shorter edge arrives first
+                    i_loses = (same & ~i_wins)
+                    j_loses = (same & i_wins)
+                    for a, loses in ((i, i_loses), (j, j_loses)):
+                        chosen[:, a] = torch.where(loses, self.curr_idx_global[:, a], chosen[:, a])
+                        tgt_xy[:, a] = torch.where(loses.unsqueeze(-1), self.pos[:, a], tgt_xy[:, a])
 
         # 2. Move agents toward the target (interp + collision resolution) and re-scan.
         #    Stall detection snapshots the pre-move position for the displacement check below.
@@ -390,6 +428,15 @@ class Explorer:
         age = (t_now_per_m - prev_visit_for_chosen).clamp(min=0)                            # [N, M]
         is_recent_revisit = (prev_visit_for_chosen >= 0) & (age < W_rev)
         revisit_pen = is_recent_revisit.float() * ((W_rev - age).clamp(min=0).float() / W_rev)
+        # v0.9 — cumulative revisit STREAK: consecutive steps landing on recent (age<W) nodes
+        # multiply the graduated penalty by 1 + β_rev·(streak−1), UNCAPPED. One isolated pass
+        # costs as before (mult=1); sustained ping-pong inside the window grows linearly.
+        # No per-node count: leaving the window fully clears the debt (legit future passes free).
+        self._revisit_streak = torch.where(is_recent_revisit, self._revisit_streak + 1.0,
+                                           torch.zeros_like(self._revisit_streak))
+        beta_rev = float(self.cfg.revisit_streak_beta)
+        revisit_mult = 1.0 + beta_rev * (self._revisit_streak - 1.0).clamp(min=0.0)
+        revisit_pen = revisit_pen * revisit_mult
 
         # Stall penalty — no net displacement this step (collision-revert hold or
         # invalid/curr-node pick). step_disp also feeds the coverage-efficiency metric.
@@ -403,6 +450,12 @@ class Explorer:
         # beyond-window blind spot is addressed in OBSERVATION (coarse global frontier channel),
         # not by bribing toward a target. revisit_pen remains the local anti-loop signal.
         stall_pen = (step_disp < float(self.cfg.nr) * 0.5).float()       # [N, M]
+        # v0.9 — cumulative stall STREAK: consecutive stalls multiply δ_stall by
+        # 1 + β·(streak−1), clamped to stall_streak_cap. Reset on first real displacement.
+        self._stall_streak = (self._stall_streak + 1.0) * stall_pen
+        stall_mult = (1.0 + float(self.cfg.stall_streak_beta)
+                      * (self._stall_streak - 1.0).clamp(min=0.0)).clamp(max=float(self.cfg.stall_streak_cap))
+        stall_pen = stall_pen * stall_mult
 
         # ---- 5. Assemble per-agent reward (weighted sum of the terms above) ----
         terminated_now = explored_rate >= self.cfg.done_explored_thresh
@@ -436,6 +489,10 @@ class Explorer:
             "revisit":       (-gamma * revisit_pen).mean(),
             "stall":         (-delta_stall * stall_pen).mean(),
             "step":          (-step_penalty).mean(),
+            # v0.9 streak diagnostics (not reward summands; the multipliers are already
+            # folded into revisit/stall above).
+            "stall_streak":   self._stall_streak.mean(),
+            "revisit_streak": self._revisit_streak.mean(),
         }
         # Per-agent signed reward components [N, M] for the step-through inspector (eval/trace only).
         if self.store_render_global:
@@ -557,11 +614,30 @@ class Explorer:
                         j_loser = (collide & i_wins).unsqueeze(-1)
                         sub_pos[:, i] = torch.where(i_loser, self.pos[:, i], sub_pos[:, i])
                         sub_pos[:, j] = torch.where(j_loser, self.pos[:, j], sub_pos[:, j])
-                        # Winner still blocked by loser's hold cell → revert winner too.
+                        # Winner still inside min_dist of the loser's hold cell: v0.9 — instead of
+                        # reverting BOTH (mutual freeze every step in corridors/swaps), the winner
+                        # advances PARTIALLY: pushed radially out of the loser's hold to exactly
+                        # min_dist. Progress is made every sub-step, the deadlock can't latch.
+                        # Degenerate d2≈0 (perfect overlap) → fall back to the winner's prev pos.
                         d2 = (sub_pos[:, i] - sub_pos[:, j]).norm(dim=-1)  # [N]
-                        still = (collide & (d2 < min_agent_dist)).unsqueeze(-1)
-                        sub_pos[:, i] = torch.where(still, self.pos[:, i], sub_pos[:, i])
-                        sub_pos[:, j] = torch.where(still, self.pos[:, j], sub_pos[:, j])
+                        still = collide & (d2 < min_agent_dist)            # [N]
+                        w_pos = torch.where(i_wins.unsqueeze(-1), sub_pos[:, i], sub_pos[:, j])
+                        l_pos = torch.where(i_wins.unsqueeze(-1), sub_pos[:, j], sub_pos[:, i])
+                        w_prev = torch.where(i_wins.unsqueeze(-1), self.pos[:, i], self.pos[:, j])
+                        delta = w_pos - l_pos
+                        safe_d = d2.clamp(min=1e-6).unsqueeze(-1)
+                        pushed = l_pos + delta / safe_d * min_agent_dist   # winner at ring min_dist
+                        pushed = torch.where((d2 > 1e-6).unsqueeze(-1), pushed, w_prev)
+                        # Never push into a wall: obstacle at the pushed pixel → winner holds prev.
+                        px = pushed[:, 0].clamp(0, self.W - 1).long()
+                        py = pushed[:, 1].clamp(0, self.H - 1).long()
+                        gt_p = self.world.gt_torch.view(self.N, -1).gather(
+                            1, (py * self.W + px).view(self.N, 1)).view(self.N)
+                        pushed = torch.where((gt_p != GT_OBST).unsqueeze(-1), pushed, w_prev)
+                        new_i = torch.where(i_wins.unsqueeze(-1), pushed, sub_pos[:, i])
+                        new_j = torch.where(i_wins.unsqueeze(-1), sub_pos[:, j], pushed)
+                        sub_pos[:, i] = torch.where(still.unsqueeze(-1), new_i, sub_pos[:, i])
+                        sub_pos[:, j] = torch.where(still.unsqueeze(-1), new_j, sub_pos[:, j])
             self.pos = sub_pos
             self.world.set_positions(self.pos)
             self.world.scan()
@@ -895,6 +971,8 @@ class Explorer:
         self.union_node_mask[idx_t]    = free_node.any(dim=1)
         self.novel_cells_ep[idx_t]     = 0.0
         self._rdv_phi_prev[idx_t]      = float("inf")
+        self._stall_streak[idx_t]      = 0.0
+        self._revisit_streak[idx_t]    = 0.0
         self._refresh_obs()
 
     def _reset_envs(self, idx: list[int]) -> None:
@@ -972,6 +1050,8 @@ class Explorer:
         self.union_node_mask[idx_t]    = free_node_reset.any(dim=1)
         self.novel_cells_ep[idx_t]     = 0.0
         self._rdv_phi_prev[idx_t]      = float("inf")
+        self._stall_streak[idx_t]      = 0.0
+        self._revisit_streak[idx_t]    = 0.0
         self._refresh_obs()
 
     # ---------------------------------------------------------------------- #

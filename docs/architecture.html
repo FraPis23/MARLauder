@@ -52,8 +52,8 @@
 </head>
 <body>
 <header>
-  <h1>MARLauder — Architettura (v0.8, policy appresa)</h1>
-  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO · GAT ego-centrico · nessun target analitico: la rete guida da sola dalle feature del grafo + 2 scalari di rendezvous</div>
+  <h1>MARLauder — Architettura (v0.9, policy appresa + value-field analitico)</h1>
+  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO · GAT ego-centrico · nessun target analitico: la rete guida dalle feature del grafo + 2 scalari di rendezvous + <b>value-field</b> (V_k per direzione: "quanto rende andare di là", sconto γ^hops — anti-loop tra frontiere)</div>
 </header>
 
 <div class="legend">
@@ -88,6 +88,11 @@ lattice 8-vicini · reachability</span></div>
 bf_from_teammate (grafo optim)
 wall-aware, warm-started</span></div>
       <span class="arrow">→</span>
+      <div class="box env"><b>value_field <span class="tag new">VF</span></b><span class="io">albero BF partizionato per PRIMO passo
+V_k = Σ γ^hops·utility del ramo k
+max-norm [0,1] · vicina-debole vs
+lontana-forte su un'unica scala</span></div>
+      <span class="arrow">→</span>
       <div class="box env"><b>build_radar <span class="tag new">RADAR</span></b><span class="io">massa oltre-finestra → nodi gateway
 feat[5] b_util · feat[6] b_teammate
 sostituisce il guidepost analitico</span></div>
@@ -106,7 +111,7 @@ in-window · cross-agent · M&gt;1</span></div>
   <div class="bus">
     <b>BUS #1 — obs dict [N, M, …]</b> (env → modello)
     <div class="io">node_feat[7] (0 x_rel · 1 y_rel · 2 utility · 3 age · 4 teammate_pot · 5 radar-util · 6 radar-teammate)
-edge_idx · node_valid · curr_idx · curr_nbr · action_mask · prev_action[8] · <span style="color:#3fb950">agent_scalars[2] = (∆M-gate, staleness)</span> · critic_global[7]</div>
+edge_idx · node_valid · curr_idx · curr_nbr · action_mask · prev_action[8] · <span style="color:#3fb950">agent_scalars[2] = (∆M-gate, staleness)</span> · <span style="color:#3fb950">value_field[8] = V_k per direzione</span> · critic_global[7]</div>
   </div>
 
   <div class="down">↓</div>
@@ -131,15 +136,16 @@ out: curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
     <div class="col actor">
       <h3>③a ACTOR — decentralizzato (vede solo il proprio grafo)</h3>
       <div class="stack">
-        <div class="pill">actor_pre (Linear)<div class="t">in: curr_emb ‖ prev_action[8] ‖ agent_scalars[2] → d</div></div>
+        <div class="pill">actor_pre (Linear)<div class="t">in: curr_emb ‖ prev_action[8] ‖ agent_scalars[2] ‖ value_field[8] → d</div></div>
         <div class="down" style="margin:0">↓</div>
         <div class="pill"><b>GRUCell (actor)</b><div class="t">memoria per-agente · stato [N,M,d] · <b>OFF di default</b> (feed-forward); abilita con <code>--gru</code></div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">PointerHead<div class="t">logit_k = (q·k_k)/√d · τ · keys=nbr_embs[8] · mask=action_mask → logits[8]</div></div>
+        <div class="pill">PointerHead<div class="t">logit_k = (q·k_k)/√d · τ + <b>w_vf·V_k</b> · keys=nbr_embs[8] · mask=action_mask → logits[8]<br>w_vf learnable (init 1): il campo guida da subito, la rete può amplificarlo o ignorarlo</div></div>
         <div class="down" style="margin:0">↓</div>
         <div class="pill"><b>Categorical → action [N,M]</b><div class="t">1 di 8 vicini · maschera finita + guardia NaN</div></div>
       </div>
-      <div class="note">Output: action, logp, entropy, hidden_actor. Il rendezvous entra qui via agent_scalars (urgenza) + feat[4]/[6] nei nbr_embs (direzione).</div>
+      <div class="note">Output: action, logp, entropy, hidden_actor. Il rendezvous entra qui via agent_scalars (urgenza) + feat[4]/[6] nei nbr_embs (direzione).<br>
+      Flag ablation: <code>--no-teammate-obs</code> (azzera agent_scalars/feat[4]/feat[6]) · <code>--no-gat-actor</code> (actor VF-only, GAT solo al critic) · <code>--no-gat</code> (encoder mai eseguito; critic = mean⊕max node_feat grezze → 4.5× sps, 2.1 vs 8.3 GB).</div>
     </div>
 
     <div class="col critic">
@@ -200,7 +206,7 @@ stesso g → agent_scalars (la policy decide)</span></div>
 </div>
 
 <footer>
-  Principi: (1) <b>policy appresa, non pianificata</b> — nessun target analitico né guidepost; la rete guida dalle feature del grafo (utility locale feat[2] + radar oltre-finestra feat[5]/[6]) e da 2 scalari di rendezvous;
+  Principi: (1) <b>policy appresa, non pianificata</b> — nessun target analitico né guidepost; la rete guida dalle feature del grafo (utility locale feat[2] + radar oltre-finestra feat[5]/[6]), da 2 scalari di rendezvous e dal value-field analitico V_k (input/bias confrontabile per direzione, MAI un target imposto);
   (2) encoder condiviso, due teste (actor decentralizzato / critic centralizzato CTDE count-invariant);
   (3) <code>act()</code> (rollout, sampling) ≟ <code>evaluate_step_from_enc()</code> (update, replay) — stesso calcolo, due regimi.
 </footer>

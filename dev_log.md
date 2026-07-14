@@ -4,6 +4,53 @@ Session-based log of design decisions, architectural understanding, observed pro
 
 ---
 
+## Session 2026-07-13/14 — value-field, ablation no-GAT, fix deadlock, penalità cumulative (v0.9)
+
+**Ablation pure-explore (chiusa).** `--rdv-weight 0` + nuovo `--no-teammate-obs` (azzera
+agent_scalars, feat[4] teammate_pot, feat[6] radar-teammate; fusione mappe e critic CTDE intatti):
+i loop PERSISTONO → causa = dithering tra frontiere (vicina-debole vs lontana-forte, window vs
+radar), non il rendezvous.
+
+**VALUE-FIELD (implementato).** `GraphLattice.value_field()`: albero BF-from-curr partizionato per
+PRIMO passo (label propagation sui parent), V_k = Σ γ^hops·utility del ramo k, max-norm [0,1].
+Riusa bf_dist/parent già calcolati (zero BF extra). `EnvCfg.vf_gamma=0.97` (`--vf-gamma`).
+obs["value_field"] [N,M,K] → actor_pre (trunk) + bias `w_vf·V_k` nel PointerHead (learnable,
+init 1). Plumbing: buffer, mappo, ckpt_loader. **Ckpt vecchi incompatibili** (actor_pre d+K+2+K).
+
+**Flag GAT.** `--no-gat-actor` (actor VF-only, GAT solo critic — nessuno speedup) e `--no-gat`
+(encoder MAI eseguito; critic = mean⊕max node_feat grezze → critic_feat_proj; mappo salta
+encode_chunk): **4.5× sps (754 vs 169), VRAM 2.1 vs 8.3 GB** a 32 env.
+
+**Run vfonly (no-GAT, rdv 0, blind)** easy 2M → difficult 4M: ep_end ~85% train, eval_best
+test/complex @512/32: best ckpt_080 score +0.031, succ 0%, idle ~0.75. Policy decisa (ent 0.20).
+**Decisione utente: la GAT resta**; prossimo train = modello completo (teammate obs + rdv 0.10)
+sopra GAT+VF.
+
+**Fix deadlock stesso-nodo (v0.9, `env/explorer.py`).** La priorità geometrica esisteva già in
+`_move_and_scan` (vince chi ha meno strada residua, pareggio → chiave random); il freeze veniva
+dal ramo "winner blocked" (revert di ENTRAMBI). Fix doppio:
+1. **Arbitraggio a livello azione** (step(), post-decode): stesso nodo target → vince l'edge più
+   corto (assiale NR batte diagonale NR·√2), pareggio → random PER-STEP; il perdente è forzato a
+   hold (prende la stall penalty — insegna a non contendere), il vincitore procede libero.
+2. **Ramo blocked**: il vincitore avanza parzialmente fino al ring min_dist attorno al perdente
+   (guard anti-muro, fallback prev pos) invece del revert totale di entrambi.
+Test: 35/35 contese assiale-vs-diagonale risolte al vincitore giusto, mai entrambi mossi/fermi,
+tie fairness 217/434 (50%).
+
+**Penalità cumulative (v0.9).** Due streak per-agente (reset con gli env):
+- **Stallo consecutivo**: δ_stall × (1+β·(streak−1)) clamp a cap. `--stall-streak-beta 0.5`,
+  `--stall-streak-cap 4`. Test: -0.1 → -0.4 in 7 step, cap tenuto, reset al movimento.
+- **Revisit recenti consecutivi**: la rampa graduata esistente × (1+β_rev·(streak−1)) SENZA cap e
+  SENZA conteggio per-nodo (fuori dalla finestra W=8 nessuna memoria → passaggi futuri legittimi
+  gratis). `--revisit-streak-beta 0.5`. Test ping-pong A↔B: streak 1→7, penalità ×4 lineare.
+Telemetria: reward_terms stall_streak/revisit_streak.
+
+**Docs.** `docs/architecture.html` → v0.9 (box value_field, BUS value_field[8], actor_pre,
+w_vf·V_k nel pointer, nota flag ablation). Nuove pipeline: `pipeline_noRdv.sh`,
+`pipeline_vfonly.sh` (--no-gat), `pipeline_v09.sh` (modello completo + eval_best in coda).
+
+---
+
 ## Session 2026-07-09 — perf: batched-agents env build + bf16 AMP (+41% sps)
 
 Two of the four proposed optimizations applied (user approved #1/#2; #3 checkpointing deferred
