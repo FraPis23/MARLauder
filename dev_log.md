@@ -4,6 +4,32 @@ Session-based log of design decisions, architectural understanding, observed pro
 
 ---
 
+## Session 2026-07-14/15 — comparison MARLauder vs IR2: lato IR2 COMPLETO
+
+**Protocollo congelato + baseline IR2 prodotta. TUTTO il necessario per riprendere da zero è in
+`eval/comparison/README.md`** (protocollo, metriche con definizioni esatte, baseline, repro,
+spec del lato MARLauder da costruire). Sintesi:
+
+- **Mappe fissate**: 100/test-set per NOME file in `eval/comparison/map_indices_{split}.json`
+  (pack_idx MARLauder + PNG IR2). Parity dataset verificata bit-a-bit (`parity_check.py`):
+  pack .npy = PNG DungeonMaps su tutti gli split.
+- **Protocollo**: metriche NATIVE IR2 (max_dist headline, success = per-robot ≥99% della PROPRIA
+  belief, connectivity = flock unico a fine episodio); M=2 e M=4 (MARLauder M=4 zero-shot);
+  cap nativi 196/384; confronto temporale a DISTANZA (step non confrontabili); mean±std per set
+  + Wilcoxon appaiato; mai medie tra set.
+- **Baseline IR2 stage2 DONE** (600 episodi, 0 skip, ~4h, container): hybrid_M2 3422±928 /
+  hybrid_M4 2413±467 / corridor_M2 7204±2297 / corridor_M4 5352±2276 / complex_M2 16966±4532 /
+  complex_M4 13403±5768 px (max_dist); success 1.00/1.00/0.76/0.93/0.72/0.80; connectivity
+  crolla con M (0.27 complex_M4). CSV: `IR2-.../comparison/results/ir2_{split}_M{M}.csv`.
+- **Setup IR2** in `IR2-.../comparison/` (originali intatti): varianti config con COPIA di
+  test_driver (symlink no: sys.path[0] li risolve), mappe fisse via dir di symlink relativi,
+  `compat/` per numpy 2.0 (sensor.itemset, np.lib.pad), NUM_META_AGENT=4, deps in
+  requirements_extra.txt (container ephemeral).
+- **Lato MARLauder: DA FARE quando l'utente sceglie il ckpt** (v0.9 in training sul PC potente).
+  Spec completa di `scripts/eval_comparison.py` + `analyze.py` nel README.
+
+---
+
 ## Session 2026-07-13/14 — value-field, ablation no-GAT, fix deadlock, penalità cumulative (v0.9)
 
 **Ablation pure-explore (chiusa).** `--rdv-weight 0` + nuovo `--no-teammate-obs` (azzera
@@ -44,6 +70,17 @@ tie fairness 217/434 (50%).
   SENZA conteggio per-nodo (fuori dalla finestra W=8 nessuna memoria → passaggi futuri legittimi
   gratis). `--revisit-streak-beta 0.5`. Test ping-pong A↔B: streak 1→7, penalità ×4 lineare.
 Telemetria: reward_terms stall_streak/revisit_streak.
+
+**v0.9.1 (2026-07-15) — post-train fix revisit.** Osservato dopo il train v0.9: stanze/corridoi
+lasciati a metà → scie di utility residua che riattirano gli agenti → loop. Due modifiche:
+(1) `revisit_window` 8→16 (la scia appena scansionata resta "calda" più a lungo);
+(2) streak revisit con **DECAY invece di reset**: atterraggio su nodo non-recente sottrae
+`revisit_streak_decay` (default 0.5) invece di azzerare — l'exploit A(recente)-B(vecchio)-A(recente)
+non lava più il debito; scontarlo richiede una corsa sostenuta su terreno nuovo. Sempre senza cap.
+Nuovo flag `--revisit-streak-decay`. Test deterministici (rng seedato, gotcha unseeded): ping-pong
+accumula, −0.5 su nodo nuovo, +1 al ritorno sul recente. Nota semantica emersa: il nodo di SPAWN
+non è mai marcato visitato (visited_step marca solo i nodi scelti) — primo ritorno gratis, trascurabile.
+Richiede retrain per avere effetto.
 
 **Docs.** `docs/architecture.html` → v0.9 (box value_field, BUS value_field[8], actor_pre,
 w_vf·V_k nel pointer, nota flag ablation). Nuove pipeline: `pipeline_noRdv.sh`,

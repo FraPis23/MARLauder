@@ -90,14 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
     g_reward.add_argument("--rdv-weight",      type=float, default=0.10, help="w: dense RENDEZVOUS reward = w·g·(φ_prev−φ_now), g=surplus gate. Rewards net geodesic approach toward the owed teammate. 0 disables. M>1 only")
     g_reward.add_argument("--rdv-offer-frac",  type=float, default=0.15, help="Rendezvous gate saturates (g→1) when the map gained since last sync reaches this fraction of the OWN map size AT that sync (relative growth, floored by scan_norm_nodes); also normalizes the ∆M actor obs")
     g_reward.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
-    g_reward.add_argument("--revisit-window",  type=int,   default=8,    help="W: revisit lookback steps")
+    g_reward.add_argument("--revisit-window",  type=int,   default=16,   help="W: revisit lookback steps (8→16 2026-07-15: freshly-scanned trail stays hot longer)")
     g_reward.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
     g_reward.add_argument("--stall-streak-beta", type=float, default=0.5,
                     help="v0.9 cumulative stall: consecutive stalls multiply δ_stall by 1+β·(streak−1), clamped to --stall-streak-cap. 0 disables")
     g_reward.add_argument("--stall-streak-cap",  type=float, default=4.0,
                     help="v0.9: max multiplier on δ_stall for consecutive stalls")
     g_reward.add_argument("--revisit-streak-beta", type=float, default=0.5,
-                    help="v0.9 cumulative revisit: consecutive landings on recent (age<W) nodes multiply the graduated revisit penalty by 1+β_rev·(streak−1), UNCAPPED. No per-node count — leaving the window clears the debt. 0 disables")
+                    help="v0.9 cumulative revisit: landings on recent (age<W) nodes multiply the graduated revisit penalty by 1+β_rev·(streak−1), UNCAPPED. 0 disables")
+    g_reward.add_argument("--revisit-streak-decay", type=float, default=0.5,
+                    help="v0.9.1: a NON-recent landing subtracts this from the revisit streak instead of zeroing it — one high-age hop can't launder the debt; working it off takes a sustained run on new/old ground")
     g_reward.add_argument("--radar-gamma",     type=float, default=0.92, help="RADAR feat[5/6] per-hop discount beyond the ego-window horizon. 0.92 mutes frontiers ~45+ hops out (0.4%%/node); 0.97 keeps them visible (~8%% with --radar-util-norm 3)")
     g_reward.add_argument("--radar-util-norm", type=float, default=8.0,  help="RADAR b_util normalization divisor (lower = far frontier mass squashed less)")
 

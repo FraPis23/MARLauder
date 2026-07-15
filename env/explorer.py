@@ -127,13 +127,20 @@ class EnvCfg:
                                             # so cycling is clearly worse than any explored-area shuffle.
                                             # Ceiling ~0.15; >0.2 over-corrects (punishes legit backtrack
                                             # out of a dead-end room + the old both-agents ping-pong bug).
-    revisit_window: int = 8                 # W: lookback window for revisit detection
-    # Cumulative revisit STREAK (v0.9 anti ping-pong lungo). Counts CONSECUTIVE steps landing on
+    revisit_window: int = 16                # W: lookback window for revisit detection. 8→16
+                                            # (2026-07-15): the freshly-scanned trail stays "hot"
+                                            # longer, so early returns onto it read as revisits.
+    # Cumulative revisit STREAK (v0.9 anti ping-pong lungo). Counts steps landing on
     # recently-visited nodes (age < W); the existing graduated revisit penalty is multiplied by
     # 1 + β_rev·(streak−1), UNCAPPED — insisting inside the recency window grows linearly without
     # limit. No per-node visit count: once outside the window there is no memory, so a legitimate
-    # future pass through old ground costs nothing. Reset on landing on a non-recent node.
+    # future pass through old ground costs nothing.
+    # DECAY not reset (2026-07-15): landing on a non-recent node DECAYS the streak by
+    # revisit_streak_decay instead of zeroing it — a single high-age hop between two recent nodes
+    # can no longer launder the whole streak (the A(recent)-B(old)-A(recent) exploit).
     revisit_streak_beta: float = 0.5        # β_rev: per-consecutive-revisit multiplier growth. 0 disables.
+    revisit_streak_decay: float = 0.5       # subtracted per NON-recent landing (0.5 → forgiving one
+                                            # accumulated revisit takes two genuinely-new steps).
     # RADAR (feat[5/6]) travel-cost discount per hop beyond the ego-window horizon. Lower = more
     # myopic (only just-beyond mass matters); higher = far mass carries further. See build_radar.
     # Stall diagnosis 2026-07-09 (traces m240/m160): at 0.92 a frontier 45 hops beyond the horizon
@@ -428,12 +435,16 @@ class Explorer:
         age = (t_now_per_m - prev_visit_for_chosen).clamp(min=0)                            # [N, M]
         is_recent_revisit = (prev_visit_for_chosen >= 0) & (age < W_rev)
         revisit_pen = is_recent_revisit.float() * ((W_rev - age).clamp(min=0).float() / W_rev)
-        # v0.9 — cumulative revisit STREAK: consecutive steps landing on recent (age<W) nodes
-        # multiply the graduated penalty by 1 + β_rev·(streak−1), UNCAPPED. One isolated pass
-        # costs as before (mult=1); sustained ping-pong inside the window grows linearly.
-        # No per-node count: leaving the window fully clears the debt (legit future passes free).
-        self._revisit_streak = torch.where(is_recent_revisit, self._revisit_streak + 1.0,
-                                           torch.zeros_like(self._revisit_streak))
+        # v0.9 — cumulative revisit STREAK: steps landing on recent (age<W) nodes multiply the
+        # graduated penalty by 1 + β_rev·(streak−1), UNCAPPED. One isolated pass costs as before
+        # (mult=1); sustained ping-pong inside the window grows linearly.
+        # DECAY not hard-reset (2026-07-15): a non-recent landing subtracts revisit_streak_decay —
+        # alternating one old node between recent ones no longer zeroes the debt; only a sustained
+        # run over genuinely old/new ground works it off.
+        self._revisit_streak = torch.where(
+            is_recent_revisit,
+            self._revisit_streak + 1.0,
+            (self._revisit_streak - float(self.cfg.revisit_streak_decay)).clamp(min=0.0))
         beta_rev = float(self.cfg.revisit_streak_beta)
         revisit_mult = 1.0 + beta_rev * (self._revisit_streak - 1.0).clamp(min=0.0)
         revisit_pen = revisit_pen * revisit_mult

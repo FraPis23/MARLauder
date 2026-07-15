@@ -194,6 +194,7 @@ def main() -> None:
             stall_streak_beta=args.stall_streak_beta,
             stall_streak_cap=args.stall_streak_cap,
             revisit_streak_beta=args.revisit_streak_beta,
+            revisit_streak_decay=args.revisit_streak_decay,
             radar_gamma=args.radar_gamma,
             radar_util_norm=args.radar_util_norm,
         ),
