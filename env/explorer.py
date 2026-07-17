@@ -104,9 +104,18 @@ class EnvCfg:
     # ---- Dense RENDEZVOUS term (IR2 r_s spirit). Rewards NET geodesic approach toward the teammate
     # I owe fresh map, gated by that surplus ∆M. NO separation term (privileged novel_scan already
     # zeroes redundant co-scanning → agents spread without a proximity penalty → no "fear the only
-    # path"). Telescoping toward the teammate's FIXED last-known pos between comms: oscillation
-    # cancels, and at comm ∆M→0 kills the gate so the lkp-jump is never paid → no flip/hover farming.
-    rdv_dense_weight: float = 0.10          # w: strength of g·(φ_prev−φ_now). 0 disables. M>1 only.
+    # path" — a single shared frontier keeps BOTH agents heading down it together, nothing here
+    # pushes them apart). Telescoping toward the teammate's FIXED last-known pos between comms:
+    # oscillation cancels, and at comm ∆M→0 kills the gate so the lkp-jump is never paid → no
+    # flip/hover farming.
+    # w calibrated against the OTHER dense terms, not picked in isolation: φ is normalized by
+    # nr·scan_norm_nodes (see _refresh_obs), so one real hop of approach is Δφ = 1/scan_norm_nodes
+    # = 0.02 — the SAME "one sensor-disk" unit novel/revisit/stall are already denominated in.
+    # w=2.5 → a full-gate (g=1) approach step pays 2.5·0.02=0.05, same order as
+    # revisit_penalty_coef/stall_penalty_coef (0.10) and the low end of novel (~0.04-0.1): a real
+    # consideration, not noise, but never bigger than a full novel-scan credit — exploration still
+    # wins a frontier-vs-teammate tug of war when both are on the table.
+    rdv_dense_weight: float = 2.5           # w: strength of g·(φ_prev−φ_now). 0 disables. M>1 only.
     # ABLATION — blind the ACTOR to teammates: zeroes agent_scalars [∆M-gate, staleness],
     # feat[4] (teammate-proximity potential) and feat[6] (radar teammate). Map fusion at comm,
     # the rdv reward gate and the privileged critic (geo_pair) are untouched. Pure-exploration
@@ -121,6 +130,22 @@ class EnvCfg:
     rdv_offer_frac: float = 0.15            # gate saturates (g→1) when the map gained since last sync
     #                                         reaches this fraction of the OWN map size AT that sync
     #                                         (relative growth, floored by scan_norm_nodes). Also the ∆M obs norm.
+    #                                         SUPERSEDED by rdv_frac_max/min/b0 below (kept only as the
+    #                                         ∆M obs norm / scan_norm_nodes floor reference).
+    # ---- Content-driven required-surplus fraction, itself decaying with the BASELINE size (how much
+    # map was already known/shared AT the last sync) — NOT with elapsed time or sync count. First
+    # rendezvous (baseline tiny, map barely known) demands rdv_frac_max surplus; once the shared
+    # baseline is already a big chunk of the map, the SAME relative fraction would mean an enormous
+    # absolute surplus, so the required fraction decays toward rdv_frac_min as baseline grows:
+    #   frac(b) = frac_min + (frac_max-frac_min)·exp(-b/b0),   b = baseline / (H·W)  (∈[0,1])
+    rdv_frac_max: float = 0.60              # required surplus fraction when baseline ≈ 0 (first sync)
+    rdv_frac_min: float = 0.10              # floor as baseline → whole map
+    rdv_frac_b0: float = 0.15               # decay scale in baseline-fraction-of-map units
+    # ---- Staleness URGENCY — secondary additive nudge on top of the content-driven gate above.
+    # Content (surplus vs the decaying frac) is what COMMANDS g; staleness just adds a small,
+    # capped push so a very long separation nudges toward meeting even with a modest surplus.
+    rdv_urgency_weight: float = 0.25        # max additive boost to g from pure staleness
+    rdv_urgency_T: float = 200.0            # steps of staleness to reach the full urgency boost
     revisit_penalty_coef: float = 0.10      # γ: penalty per step on a node visited in last W steps.
                                             # Raised 0.05→0.10 (2×): a tight 2-node ping-pong (age=2,
                                             # graduated ≈0.75 → 0.075/step) now costs ≈1.5× a novel step,
@@ -1269,8 +1294,16 @@ class Explorer:
             geo = d_at.min(dim=2).values                                                             # [N, M] nearest teammate
             geo = torch.where(torch.isfinite(geo), geo, torch.full_like(geo, diam))
             geo_pair = (geo.mean(dim=1) / max(1.0, diam)).clamp(0.0, 1.0)                            # [N]
-            # φ per agent = geodesic curr→nearest-teammate /diam. Drives the rendezvous term below.
-            self._geo_curr_team = (geo / max(1.0, diam)).clamp(0.0, 1.0)                             # [N, M]
+            # φ (reward-only) per agent = geodesic curr→nearest-teammate, normalized by
+            # nr·scan_norm_nodes — the SAME "one sensor-disk" physical unit every other dense reward
+            # term (novel/revisit/stall) is denominated in — NOT /diam. /diam is map-SIZE dependent
+            # (inversely: a bigger map crushes Δφ per step, a smaller map inflates it), the opposite
+            # of invariant. nr·scan_norm_nodes is a fixed physical constant (sensor/step scale), so
+            # one real hop of approach is always worth the same Δφ regardless of map size. geo_pair
+            # above (critic-only CTDE feature) intentionally keeps /diam — it wants "fraction of
+            # THIS map traversed", a different, legitimately map-relative quantity.
+            phi_norm_px = max(1.0, float(self.cfg.nr) * float(self.cfg.scan_norm_nodes))
+            self._geo_curr_team = (geo / phi_norm_px).clamp(0.0, 1.0)                                # [N, M]
         else:
             geo_pair = torch.zeros(self.N, device=self.dev)
             self._geo_curr_team = torch.zeros((self.N, self.M), device=self.dev)
@@ -1310,10 +1343,21 @@ class Explorer:
             # that teammate j_star lacks, so meeting is worth it. Floored by scan_norm_nodes (≈ one
             # sensor disk) so an early / near-empty baseline can't blow the ratio up.
             baseline = self._own_expl_at_comm.gather(2, j_star.unsqueeze(2)).squeeze(2)              # [N, M]
-            scale = (float(self.cfg.rdv_offer_frac) * baseline).clamp(min=float(self.cfg.scan_norm_nodes))
-            g = (offer_max / scale).clamp(0.0, 1.0)                                                  # [N, M] surplus gate
+            # Required surplus fraction DECAYS with the baseline itself (map already shared at the
+            # last sync), not with time/count — see EnvCfg.rdv_frac_max/min/b0 above.
+            total_cells = float(self.H * self.W)
+            b_frac = (baseline / total_cells).clamp(0.0, 1.0)
+            frac = float(self.cfg.rdv_frac_min) + (float(self.cfg.rdv_frac_max) - float(self.cfg.rdv_frac_min)) \
+                   * torch.exp(-b_frac / float(self.cfg.rdv_frac_b0))
+            scale = (frac * baseline).clamp(min=float(self.cfg.scan_norm_nodes))
+            g_content = (offer_max / scale).clamp(0.0, 1.0)                                          # [N, M] content-driven gate
             last_comm = self.t_last_comm.gather(2, j_star.unsqueeze(2)).squeeze(2).float()           # [N, M]
             staleness = ((self.t.view(self.N, 1).float() - last_comm).clamp(min=0.0) / T_max).clamp(0.0, 1.0)
+            # Secondary urgency nudge from raw staleness (steps, not the T_max-normalized one above) —
+            # small, capped, never overrides the content-driven gate on its own.
+            dt = (self.t.view(self.N, 1).float() - last_comm).clamp(min=0.0)                         # [N, M] steps
+            urgency = (dt / float(self.cfg.rdv_urgency_T)).clamp(0.0, 1.0)
+            g = (g_content + float(self.cfg.rdv_urgency_weight) * urgency).clamp(0.0, 1.0)
             self._rdv_gate = g
             # teammate_obs=False (ablation): gate g still feeds the rdv REWARD above, but the
             # actor's [∆M-gate, staleness] scalars are zeroed — no "when to rendezvous" signal.
