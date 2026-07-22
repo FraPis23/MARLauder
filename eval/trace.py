@@ -47,8 +47,15 @@ def _render_union_rgb(env) -> np.ndarray:
 
 @torch.no_grad()
 def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
-                  n_steps: int, out_root: Path, tag: str, device: str) -> dict:
-    """Run one deterministic episode, dump trace.json + frames under out_root/traces/<tag>/."""
+                  n_steps: int, out_root: Path, tag: str, device: str,
+                  action_fn=None) -> dict:
+    """Run one deterministic episode, dump trace.json + frames under out_root/traces/<tag>/.
+
+    action_fn: optional callable (env, obs) -> action[N,M] long. When given, it OVERRIDES the
+    model's chosen action for stepping the env, while the model still runs so the trace keeps real
+    logits/value/GAT attention. Used to drive a separation-inducing heuristic (agents spread out)
+    so the teammate belief goes out-of-range and its propagation is visible in the inspector even
+    when no well-trained policy is available to load."""
     env_cfg = EnvCfg.from_ckpt_dict(env_cfg_dict, n_envs=1, n_agents=n_agents,
                                     max_episode_steps=n_steps + 1)
     env = Explorer(split, env_cfg, seed=int(map_idx))
@@ -115,6 +122,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     has_contrib = False
     for t in range(n_steps):
         out = model.act(obs, h_act, h_crit, deterministic=True)
+        if action_fn is not None:
+            out["action"] = action_fn(env, obs)   # heuristic override (agents separate) — see docstring
         rg = env._render_global
         nf = rg["node_feat"][0].cpu().numpy()
         nv = rg["node_valid"][0].cpu().numpy()
@@ -193,13 +202,40 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         obs, reward, done, info = env.step(out["action"])
         dbg = env._dbg_reward or {}
 
+        # RAW teammate belief posterior per node (unmasked → includes UNKNOWN nodes the diffusion
+        # spreads onto, which feat[4]/"team" drops). Max over teammates, peak-normalized per agent
+        # for a readable ramp. This is the field that shows the belief PROPAGATING across the map.
+        bp = rg.get("belief_p")
+        if bp is not None:
+            bp0 = bp[0].cpu().numpy()                       # [M, M, N_max]
+            # RAW posterior p (max over teammates) — NOT peak-normalised, so the web renders it on a
+            # FIXED absolute scale (BEL_VMAX) and the frontier accumulation magnitude is comparable
+            # across frames. Σ p = 1 per teammate.
+            bel_disp = bp0.max(axis=1)                      # [M, N_max]
+        else:
+            bel_disp = None
+        # Pathfront TRANSIT dots (uniform 1.0 markers) — the travelling hypotheses BEFORE they bloom.
+        # Rendered as distinct points so the viewer sees each dot depart lkp→frontier (viz only).
+        bt_rg = rg.get("belief_transit")
+        bel_transit = bt_rg[0].cpu().numpy().max(axis=1) if bt_rg is not None else None   # [M, N_max]
+
         rec = {"t": t, "agents": []}
         for a in range(M):
-            vidx = np.nonzero(nv[a])[0]
+            belj = bel_disp[a] if bel_disp is not None else None
+            beltj = bel_transit[a] if bel_transit is not None else None
+            # Draw valid nodes PLUS any node carrying belief mass or a transit dot.
+            has_bel = (belj > 1e-4) if belj is not None else np.zeros(nv[a].shape, dtype=bool)
+            if beltj is not None:
+                has_bel = has_bel | (beltj > 0.5)
+            vidx = np.nonzero(nv[a] | has_bel)[0]
             nodes = [{
                 "i": int(n), "x": _r(node_xy[n, 0], 1), "y": _r(node_xy[n, 1], 1),
                 "util": _r(nf[a, n, 2], 4), "age": _r(nf[a, n, 3], 3),
                 "team": _r(nf[a, n, 4], 3),
+                # bel = RAW belief posterior (incl. unknown nodes) → the propagation field.
+                "bel": _r(float(belj[n]), 4) if belj is not None else 0.0,   # RAW p (fixed-scale in web)
+                # belt = 1 when a still-travelling transit dot sits on this node (pathfront, viz only).
+                "belt": 1 if (beltj is not None and beltj[n] > 0.5) else 0,
                 # RADAR boundary-summary channels (nonzero only on geodesic horizon nodes):
                 # bu = out-of-window utility mass, bt = out-of-window teammate direction.
                 "bu": _r(nf[a, n, 5], 3), "bt": _r(nf[a, n, 6], 3),

@@ -29,12 +29,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 
+import os
 import numpy as np
 import torch
 
+_PF_DEBUG = bool(os.environ.get("PF_DEBUG"))
+
 from env.frontier import compute_frontier
-from env.graph_lattice import GraphLattice
+from env.graph_lattice import GraphLattice, NBR_OFFSETS
 from env.maps import Split, sample_batch
+from env.teammate_belief import update_teammate_belief
+from env.teammate_belief_pathfront import advance_pathfront, freeze_hypotheses
 from env.world_warp import WarpWorld
 
 _UNKNOWN  = 0
@@ -198,6 +203,30 @@ class EnvCfg:
     # short-circuits _comm_check); this directly overrides the comm_mask used in fusion
     # and reward set ops, without changing what cand_max_comm_gap reports.
     force_full_occupancy_sharing: bool = False
+    # ---- TEAMMATE BELIEF (uniform geodesic wavefront — see env/teammate_belief.py). Replaces the
+    # static exp(-BF_dist/scale) teammate_pot (feat[4]) with a UNIFORM possible-location zone that
+    # grows one hop/step over the optimistic (FREE∪UNKNOWN) lattice from the last-known node — through
+    # the known map and into the unknown via frontiers — holes out in the agent's current sensor FOV
+    # (Feature A), and collapses to a delta on comm. feat[4] (plateau) and feat[6]/φ (aimed at the
+    # zone CENTROID) derive from it; critic geo_pair uses the teammate's true pos. See _refresh_obs.
+    use_teammate_belief: bool = True        # False → legacy exp(-d_min/scale) feat[4], lkp-based radar/φ
+    belief_expand_per_step: int = 1         # hops the zone grows per step (1 = "one node per step")
+    belief_gate_eps: float = 1e-6           # zone empty below this → teammate "lost" (radar feat[6]/φ off)
+    # belief_mode: "uniform" = the geodesic ball above; "pathfront" = two-phase hypothesis model
+    # (BF particles lkp→frontier clusters, weighted utility/dist, then per-frontier uniform bloom —
+    # see env/teammate_belief_pathfront.py). Frozen at comm-break, cap pf_max_frontiers clusters.
+    belief_mode: str = "uniform"
+    pf_max_frontiers: int = 6
+    # A pathfront belief FRONTIER node = free node with ≥ this many UNKNOWN 8-neighbours (and ≤7). ≥2 (the
+    # exploration-frontier default) floods thin corridors — every corridor cell borders the unknown behind
+    # its walls → the whole corridor is one connected "frontier" → 1 giant cluster whose centroid sits in
+    # the middle. Requiring more unknown neighbours keeps only genuine OPENINGS into large unknown regions,
+    # so distinct openings become distinct clusters and a point departs toward each.
+    pf_frontier_min_unknown: int = 4
+    # pathfront phase-2 absorbing-diffusion knobs (β_F = min(gain·utility(F), β_max) per-step lock rate).
+    belief_absorb_gain: float = 1.0
+    belief_beta_max: float = 0.9
+    belief_diffuse_lambda: float = 0.5
 
     @classmethod
     def from_ckpt_dict(cls, d: dict, **overrides) -> "EnvCfg":
@@ -299,6 +328,36 @@ class Explorer:
         self._dist_team_prev = torch.full(
             (self.N, self.M, self.M, self.N_max), float("inf"), dtype=torch.float32, device=self.dev,
         )
+        # ---- TEAMMATE BELIEF state (see EnvCfg.use_teammate_belief / env/teammate_belief.py).
+        # belief_reached = UNIFORM possible-location zone per (observer i, teammate j): a geodesic-ball
+        # mask that grows one hop/step over the optimistic graph from the last-known node, holes out in
+        # the current sensor FOV, and collapses to a delta on comm. Self slot j==i unused. Single tensor
+        # [N, M, M, N_max] (the old mobile/reservoir/cleared triple is gone with the diffusion model).
+        self.belief_reached = torch.zeros((self.N, self.M, self.M, self.N_max), dtype=torch.float32, device=self.dev)
+        # Orthogonal-neighbour mask over the K lattice slots (|dr|+|dc|==1). The known→unknown FRONTIER
+        # crossing is restricted to these ("archi generabili" — a diagonal free→unknown cuts a corner and
+        # is not a path a robot could generate); known-zone and unknown-interior stay fully 8-connected.
+        self._orth_k = torch.tensor([abs(dr) + abs(dc) == 1 for (dr, dc) in NBR_OFFSETS],
+                                    dtype=torch.bool, device=self.dev)         # [K]
+        # ---- PATHFRONT belief state (EnvCfg.belief_mode == "pathfront"; env/teammate_belief_pathfront.py).
+        # Per (observer i, teammate j) frozen at comm-break: up to Kf frontier-cluster hypotheses, each a
+        # BF particle lkp→frontier that then blooms. _comm_prev tracks last step's comm to detect the break.
+        Kf = int(self.cfg.pf_max_frontiers)
+        Lmax = int(self.graph.guidepost_path_max)
+        self._pf_Kf, self._pf_Lmax = Kf, Lmax
+        self.pf_front_node = torch.full((self.N, self.M, self.M, Kf), -1, dtype=torch.long, device=self.dev)
+        self.pf_weight     = torch.zeros((self.N, self.M, self.M, Kf), dtype=torch.float32, device=self.dev)
+        self.pf_dist       = torch.zeros((self.N, self.M, self.M, Kf), dtype=torch.long, device=self.dev)
+        self.pf_path       = torch.full((self.N, self.M, self.M, Kf, Lmax), -1, dtype=torch.long, device=self.dev)
+        # KNOWN-graph absorbing-diffusion fields: live (mobile) + acc (locked on frontiers) + per-hyp seeded.
+        self.pf_live       = torch.zeros((self.N, self.M, self.M, self.N_max), dtype=torch.float32, device=self.dev)
+        self.pf_acc        = torch.zeros((self.N, self.M, self.M, self.N_max), dtype=torch.float32, device=self.dev)
+        self.pf_seeded     = torch.zeros((self.N, self.M, self.M, Kf), dtype=torch.bool, device=self.dev)
+        self.pf_born       = torch.zeros((self.N, self.M, self.M), dtype=torch.bool, device=self.dev)
+        # step index at which the hypotheses froze (comm-break), so transit s = t - pf_t0 starts at 0 →
+        # the FIRST out-of-comm frame shows the dots AT lkp, then they visibly depart hop by hop.
+        self.pf_t0         = torch.zeros((self.N, self.M, self.M), dtype=torch.long, device=self.dev)
+        self._comm_prev    = torch.zeros((self.N, self.M, self.M), dtype=torch.bool, device=self.dev)
         # Static teammate table: _others_idx[a] = the M-1 indices j != a. Drives the batched
         # Pass-1 radar teammate_src + teammate BF (agents folded into the batch dim).
         self._others_idx = torch.tensor(
@@ -986,6 +1045,13 @@ class Explorer:
         self._dist_curr_prev[idx_t]                   = float("inf")
         self.t_last_comm[idx_t]                       = 0
         self._own_expl_at_comm[idx_t]                 = 0.0   # baseline reset → first comm re-snaps it
+        # Teammate belief zone — born fresh at first OOR (all-zero = "not yet born").
+        self.belief_reached[idx_t]                    = 0.0
+        self.pf_front_node[idx_t] = -1; self.pf_weight[idx_t] = 0.0; self.pf_dist[idx_t] = 0
+        self.pf_path[idx_t] = -1; self.pf_live[idx_t] = 0.0; self.pf_acc[idx_t] = 0.0
+        self.pf_seeded[idx_t] = False; self.pf_born[idx_t] = False
+        self.pf_t0[idx_t] = 0
+        self._comm_prev[idx_t] = False
         self.last_action[idx_t]                       = -1
         self._collision_key[idx_t]                    = torch.rand((1, self.M), device=self.dev)
         self._resample_ss_noise(idx_t)
@@ -1034,6 +1100,13 @@ class Explorer:
         # H.3 — reset BF-from-teammate cache.
         self._team_node_prev[idx_t]                   = -1
         self._dist_team_prev[idx_t]                   = float("inf")
+        # Teammate belief zone — born fresh at first OOR (all-zero = "not yet born").
+        self.belief_reached[idx_t]                    = 0.0
+        self.pf_front_node[idx_t] = -1; self.pf_weight[idx_t] = 0.0; self.pf_dist[idx_t] = 0
+        self.pf_path[idx_t] = -1; self.pf_live[idx_t] = 0.0; self.pf_acc[idx_t] = 0.0
+        self.pf_seeded[idx_t] = False; self.pf_born[idx_t] = False
+        self.pf_t0[idx_t] = 0
+        self._comm_prev[idx_t] = False
         # Reset comm-gap timer: at reset, last_known_pos is set to actual start positions
         # (see loop below), so all pairs are "freshly in comm" at t=0.
         self.t_last_comm[idx_t]                       = 0
@@ -1139,6 +1212,87 @@ class Explorer:
             bf_dist_team[b_arange, j_flat] = dist_j
         info["bf_dist_team"] = bf_dist_team                                         # [B, M, N_max]
 
+    def _pathfront_belief(self, B, info, team_node, comm_bm, frontier_node, edge_free, seen_nodes):
+        """PATHFRONT belief (EnvCfg.belief_mode=='pathfront'). Two phases on the KNOWN graph: BF particles
+        lkp→frontier (transit), then absorbing diffusion (diffuse inward + frontiers lock β=utility, with
+        release when a frontier is explored). Sets self._belief_p [B,M,N_max] / _belief_alive [B,M].
+        State in self.pf_* (reshaped [B,M,...], observer folded into B, dim1 = teammate j)."""
+        M, Kf, Lmax, N = self.M, self._pf_Kf, self._pf_Lmax, self.N_max
+        dev = self.dev
+        pf_front = self.pf_front_node.reshape(B, M, Kf)
+        pf_w     = self.pf_weight.reshape(B, M, Kf)
+        pf_d     = self.pf_dist.reshape(B, M, Kf)
+        pf_pth   = self.pf_path.reshape(B, M, Kf, Lmax)
+        pf_live  = self.pf_live.reshape(B, M, N)
+        pf_acc   = self.pf_acc.reshape(B, M, N)
+        pf_seed  = self.pf_seeded.reshape(B, M, Kf)
+        pf_born  = self.pf_born.reshape(B, M)
+        pf_t0    = self.pf_t0.reshape(B, M)
+        comm_prev = self._comm_prev.reshape(B, M)
+        utility = info["utility"]                                       # [B, N] live utility → absorb β
+        eidx = self.graph.edge_idx_static
+        NR = float(self.graph.NR)
+        t_b = self.t.repeat_interleave(M).view(B, 1)                    # env step per observer-row
+        observer_id = torch.arange(B, device=dev) % M                   # [B]
+        break_bm = comm_prev & ~comm_bm                                 # [B, M] comm just lost
+        self._belief_p = torch.zeros((B, M, N), dtype=torch.float32, device=dev)
+        self._belief_transit = torch.zeros((B, M, N), dtype=torch.float32, device=dev)
+        self._belief_alive = torch.zeros((B, M), dtype=torch.bool, device=dev)
+        for m in range(M):
+            active = (observer_id != m)                                 # skip self slot
+            lkp_m = team_node[:, m].clamp(0, N - 1)                     # [B]
+            frz = break_bm[:, m] & active
+            if bool(frz.any()):
+                # Transit BF over the KNOWN-FREE graph (edge_free), NOT the optimistic
+                # unknown-passable one: the geodesic lkp→frontier must stay in known space
+                # (frontier nodes are known-free, same component as lkp), so the transit point
+                # follows real corridors instead of shortcutting through unknown / across walls.
+                # Frontiers reachable only via unknown get dist=inf → discarded (known-only model).
+                dist_m, parent_m = self.graph.bf_from_target(
+                    info, target=lkp_m, edge_valid=edge_free)
+                fidx = frz.nonzero(as_tuple=True)[0]
+                fn, w, dh, pth = freeze_hypotheses(
+                    lkp_node=lkp_m[fidx], frontier_node=frontier_node[fidx],
+                    dist=dist_m[fidx], parent=parent_m[fidx], utility=utility[fidx],
+                    nbr_idx=eidx, edge_ok=edge_free[fidx], node_spacing=NR,
+                    node_xy=self.graph.node_xy, Kf=Kf, Lmax=Lmax)
+                pf_front[fidx, m] = fn; pf_w[fidx, m] = w; pf_d[fidx, m] = dh; pf_pth[fidx, m] = pth
+                pf_live[fidx, m] = 0.0; pf_acc[fidx, m] = 0.0; pf_seed[fidx, m] = False
+                pf_born[fidx, m] = True
+                pf_t0[fidx, m] = t_b[fidx, 0]                           # transit clock starts here → s=0 at lkp
+                if _PF_DEBUG:
+                    from env.teammate_belief_pathfront import cluster_frontiers as _cf
+                    for r, b0 in enumerate(fidx.tolist()):
+                        fn_b = frontier_node[b0]; nfr = int(fn_b.sum())
+                        lab = _cf(fn_b.unsqueeze(0), eidx, edge_free[b0].unsqueeze(0))[0]
+                        ncomp = int(torch.unique(lab[fn_b]).numel()) if nfr else 0
+                        print(f"[PF] obs{b0//self.M} tm{m} t={int(t_b[b0,0])}: frontier={nfr}n/{ncomp}c "
+                              f"used={int((fn[r]>=0).sum())} dist_h={dh[r][fn[r]>=0].tolist()}")
+            s_m = (t_b[:, 0] - pf_t0[:, m]).clamp(min=0)                # [B] hops since THIS freeze (s=0 at lkp)
+            live_m, acc_m, seed_m, p_m, alive_m, tviz_m, w_m = advance_pathfront(
+                pf_live[:, m], pf_acc[:, m], pf_seed[:, m],
+                front_node=pf_front[:, m], weight=pf_w[:, m], dist_h=pf_d[:, m], path=pf_pth[:, m],
+                step=s_m, frontier_node=frontier_node, utility=utility, edge_free=edge_free,
+                nbr_idx=eidx, absorb_gain=float(self.cfg.belief_absorb_gain),
+                beta_max=float(self.cfg.belief_beta_max),
+                diffuse_lambda=float(self.cfg.belief_diffuse_lambda),
+                seen=seen_nodes)
+            pf_live[:, m] = live_m; pf_acc[:, m] = acc_m; pf_seed[:, m] = seed_m; pf_w[:, m] = w_m
+            use = pf_born[:, m] & active & ~comm_bm[:, m]
+            self._belief_p[:, m] = torch.where(use.view(B, 1), p_m, self._belief_p[:, m])
+            self._belief_transit[:, m] = torch.where(use.view(B, 1), tviz_m, self._belief_transit[:, m])
+            self._belief_alive[:, m] = use & alive_m
+            collapse = comm_bm[:, m] & active
+            if bool(collapse.any()):
+                delta = torch.zeros((B, N), device=dev)
+                delta.scatter_(1, lkp_m.view(B, 1), 1.0)
+                self._belief_p[:, m] = torch.where(collapse.view(B, 1), delta, self._belief_p[:, m])
+                self._belief_alive[:, m] = self._belief_alive[:, m] | collapse
+                cidx = collapse.nonzero(as_tuple=True)[0]
+                pf_born[cidx, m] = False; pf_w[cidx, m] = 0.0; pf_front[cidx, m] = -1
+                pf_live[cidx, m] = 0.0; pf_acc[cidx, m] = 0.0; pf_seed[cidx, m] = False
+        comm_prev.copy_(comm_bm)                                        # remember for next-step break test
+
     def _refresh_obs(self, comm_mask: torch.Tensor | None = None) -> None:
         """Build per-agent obs from current per-agent occupancy + positions.
 
@@ -1180,17 +1334,85 @@ class Explorer:
         # ---- VALUE-FIELD [B, K]: discounted utility mass per first-step branch (see EnvCfg.vf_gamma).
         vf = self.graph.value_field(info, gamma_vf=float(self.cfg.vf_gamma))
         self._vf = vf.view(self.N, self.M, self.K)
-        # ---- RADAR (feat[5] b_util, feat[6] b_teammate): compress the world BEYOND the ego
-        # window onto the geodesic receptive-horizon nodes so the feed-forward policy gets a
-        # heading toward far exploration mass / teammates (anti-loop without recurrence). Uses
-        # the FREE-graph BF just computed. teammate_src = each OTHER agent's last-known node.
-        # teammate_obs=False (ablation) → src None → b_team stays zero (actor blind to teammates).
+        # ---- TEAMMATE BELIEF FILTER (Pass 1.5): advance the graph-native Bayesian estimate of
+        # each teammate's node, then DERIVE feat[4] (potential) and the radar teammate_src from it.
+        # team_node[B,M] = observer's belief of each teammate's node (= truth on comm). Reused by
+        # the belief filter, _bf_from_teammates and (below) the geo/φ terms.
+        lkp_all = self.last_known_pos.reshape(B, self.M, 2)                     # [B, M, 2]
+        _lx = (lkp_all[..., 0] / float(self.graph.NR)).long().clamp(0, self.graph.LW - 1)
+        _ly = (lkp_all[..., 1] / float(self.graph.NR)).long().clamp(0, self.graph.LH - 1)
+        team_node = (_ly * self.graph.LW + _lx)                                 # [B, M] long
+        self._belief_p = None       # [B, M, N_max] uniform posterior (set below when the filter runs)
+        self._belief_transit = None # [B, M, N_max] pathfront transit-dot markers (viz only)
+        self._belief_alive = None   # [B, M] bool
+        belief_on = (self.M > 1 and self.cfg.use_teammate_belief
+                     and info.get("edge_valid_optim") is not None)
+        if belief_on:
+            comm_bm = (comm_mask if comm_mask is not None else torch.eye(
+                self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M).expand(self.N, -1, -1)
+            ).reshape(B, self.M)                                               # observer i ↔ teammate j
+            # HYBRID expansion graph = KNOWN-FREE edges (edge_free: both endpoints known-free, no robot-
+            # reachability gate — the belief BFS's from the SEED, so it must also fill known-free pockets
+            # that are disconnected from the robot in the free graph yet re-entered from the unknown) ∪
+            # OPTIMISTIC edges touching an unknown node, split by zone: the known→unknown FRONTIER crossing
+            # (exactly one endpoint unknown) uses ONLY orthogonal edges ("archi generabili" — a diagonal
+            # free→unknown cuts a corner, not a generatable path), while the unknown INTERIOR (both endpoints
+            # unknown) stays 8-connected (walls invisible → all neighbours reachable). So: known respects
+            # walls, exit only through real frontier edges, spread freely in the unknown, AND re-enter known
+            # pockets from the far side.
+            occ_nodes = self.world.occupancy_torch.view(B, -1)[:, self._node_flat_idx]   # [B, N_max]
+            node_unknown = (occ_nodes == _UNKNOWN)                             # [B, N_max]
+            nbr_unknown = torch.gather(
+                node_unknown, 1, self.graph.edge_idx_static.clamp(min=0).view(1, -1).expand(B, -1)
+            ).view(B, self.N_max, -1)                                          # [B, N_max, K]
+            src_unknown = node_unknown.unsqueeze(-1)                          # [B, N_max, 1]
+            crossing    = src_unknown ^ nbr_unknown                          # [B, N_max, K] free↔unknown
+            internal_u  = src_unknown & nbr_unknown                          # [B, N_max, K] unknown↔unknown
+            optim_ok    = internal_u | (crossing & self._orth_k.view(1, 1, -1))
+            known_free  = info["edge_free"] if info.get("edge_free") is not None else info["edge_valid"]
+            expand_edge = known_free | (info["edge_valid_optim"] & optim_ok)
+            if self.cfg.belief_mode == "pathfront":
+                # frontier NODES = known-FREE nodes that are genuine OPENINGS into the unknown: FREE with
+                # ≥ pf_frontier_min_unknown UNKNOWN 8-neighbours (and ≤7). MUST be FREE (a wall touching
+                # unknown is not a frontier). The ≥min_unknown gate (vs the ≥1-orthogonal default) drops
+                # thin-corridor interior cells — which border the unknown behind their walls and would
+                # otherwise chain the whole corridor into ONE cluster whose centroid lands mid-map — so
+                # distinct openings stay distinct clusters and a transit point departs toward each.
+                node_free = (occ_nodes == _FREE)                               # [B, N_max]
+                n_unk = nbr_unknown.sum(-1)                                     # [B, N_max] unknown 8-nbrs
+                min_unk = int(self.cfg.pf_frontier_min_unknown)
+                frontier_node = node_free & (n_unk >= min_unk) & (n_unk <= 7)  # [B, N_max] openings only
+                # NEGATIVE-EVIDENCE footprint: nodes the observer can currently SEE = known-free nodes
+                # within sensor_range GEODESICALLY (bf_dist_from_curr over the free graph → around walls,
+                # not through them). If the teammate were here comm would fire; it didn't, so these nodes
+                # are "checked empty" → the belief there is zeroed and pushed onto the unseen frontiers.
+                seen_nodes = node_free & (info["bf_dist_from_curr"] <= float(self.cfg.sensor_range_px))
+                self._pathfront_belief(B, info, team_node, comm_bm, frontier_node, known_free.bool(),
+                                       seen_nodes)
+            else:
+                reached_new, p_bel, alive = update_teammate_belief(
+                    self.belief_reached.reshape(B, self.M, self.N_max),
+                    comm_mask=comm_bm,
+                    team_node=team_node,
+                    nbr_idx=self.graph.edge_idx_static,
+                    edge_valid_optim=expand_edge,   # hybrid: strict in known map, optimistic touching unknown
+                    expand_per_step=int(self.cfg.belief_expand_per_step),
+                    gate_eps=float(self.cfg.belief_gate_eps),
+                )
+                self.belief_reached.copy_(reached_new.view(self.N, self.M, self.M, self.N_max))
+                self._belief_p = p_bel               # [B, M, N_max] uniform Σ=1 over the expanding zone
+                self._belief_alive = alive           # [B, M]
+
+        # ---- RADAR (feat[5] b_util, feat[6] b_teammate): compress the world BEYOND the ego window
+        # onto the geodesic receptive-horizon nodes. teammate_src = each OTHER agent's last-known node
+        # (legacy, lkp-based — v3 belief drives ONLY feat[4], radar/φ/geo_pair stay on the lkp path).
+        # teammate_obs=False (ablation) → src None → b_team all-zero (actor blind to teammates).
         if self.M > 1 and self.cfg.teammate_obs:
-            ar = torch.arange(self.M, device=self.dev).view(self.M, 1)
-            lkp = self.last_known_pos[:, ar, self._others_idx, :]               # [N, M, M-1, 2]
+            lkp = self.last_known_pos[:, torch.arange(self.M, device=self.dev).view(self.M, 1),
+                                      self._others_idx, :]                     # [N, M, M-1, 2]
             lx = (lkp[..., 0] / float(self.graph.NR)).long().clamp(0, self.graph.LW - 1)
             ly = (lkp[..., 1] / float(self.graph.NR)).long().clamp(0, self.graph.LH - 1)
-            teammate_src = (ly * self.graph.LW + lx).reshape(B, self.M - 1)     # [B, M-1]
+            teammate_src = (ly * self.graph.LW + lx).reshape(B, self.M - 1)
         else:
             teammate_src = None
         b_util, b_team = self.graph.build_radar(
@@ -1200,23 +1422,26 @@ class Explorer:
         info["node_feat"][..., 5] = b_util
         info["node_feat"][..., 6] = b_team
         # H.3 — BF from each teammate's last-known position → info["bf_dist_team"] [B, M, N_max].
+        # Still built: legacy feat[4]/φ/geo_pair fall back to it when the belief filter is off.
         if self.M > 1:
             self._bf_from_teammates(info)
 
-        # ---- Pass 2: cross-agent feat[4] = teammate-proximity POTENTIAL on GLOBAL node_feat ----
-        # DENSE field exp(-d / scale) of the BF geodesic distance from the teammate's last-known
-        # position to each node (info["bf_dist_team"], built in Pass 1 over the optimistic
-        # FREE∪UNKNOWN graph so it stays finite when the teammate is in unexplored space).
-        # Gradient-rich, wall-aware, and pointing toward the teammate.
-        # teammate_obs=False (ablation) → skip the write, feat[4] stays zero (node_feat is
-        # zero-alloc'd every build). bf_dist_team itself is still built: critic geo_pair +
-        # rdv φ need it and both are reward/critic-side, not actor obs.
+        # ---- Pass 2: feat[4] teammate-proximity POTENTIAL on GLOBAL node_feat ----
+        # With the belief ON: feat[4] = max over teammates of the per-teammate UNIFORM zone,
+        # peak-normalized → a flat 0/1 PLATEAU over the possible-location set (masked to node_valid,
+        # so only the known part shows to the actor; the unknown part lives in the raw `bel` viz).
+        # With the belief OFF (legacy): dense exp(-d_min/scale) of the BF geodesic to the nearest
+        # teammate's last-known node.
+        # teammate_obs=False (ablation) → skip the write, feat[4] stays zero.
         if self.M > 1 and self.cfg.teammate_obs:
-            scale_px = max(1.0, 4.0 * float(self.cfg.nr))
-            # min over teammates (self slot left at +inf in Pass 1) → nearest teammate.
-            d_min = info["bf_dist_team"].min(dim=1).values                    # [B, N_max]
-            pot = torch.exp(-d_min / scale_px)                                # +inf → 0
-            pot = torch.nan_to_num(pot, nan=0.0, posinf=0.0, neginf=0.0)
+            if belief_on:
+                # feat[4] = the UNIFORM Σ=1 belief (max over teammates), masked to known-free nodes.
+                pot = self._belief_p.amax(dim=1)                                  # [B, N_max] Σ=1 per teammate
+            else:
+                scale_px = max(1.0, 4.0 * float(self.cfg.nr))
+                d_min = info["bf_dist_team"].min(dim=1).values                    # [B, N_max]
+                pot = torch.exp(-d_min / scale_px)
+                pot = torch.nan_to_num(pot, nan=0.0, posinf=0.0, neginf=0.0)
             info["node_feat"][..., 4] = pot * info["node_valid"].float()
 
         # ---- Render-global stash (eval/debug only) — full-graph utility/validity for the GIF,
@@ -1248,6 +1473,16 @@ class Explorer:
                 "comm_mask":      cm_stash.clone(),                                              # [N, M, M] bool
                 # Inspector: per-first-step value-field (what the actor sees as obs["value_field"]).
                 "value_field":    self._vf.clone(),                                              # [N, M, K]
+                # Teammate belief posterior p[N, a, j, N_max] (Σ=1 per (a,j) where alive) + alive
+                # mask — for the belief heatmap viz (scripts/viz_belief.py). None when filter off.
+                "belief_p": (self._belief_p.view(self.N, self.M, self.M, self.N_max).clone()
+                             if self._belief_p is not None else None),
+                # Pathfront transit dots (uniform 1.0 markers, viz only) — all Kf travelling hypotheses,
+                # so the viewer sees every dot depart lkp→frontier even when weights concentrate on one.
+                "belief_transit": (self._belief_transit.view(self.N, self.M, self.M, self.N_max).clone()
+                                   if self._belief_transit is not None else None),
+                "belief_alive": (self._belief_alive.view(self.N, self.M, self.M).clone()
+                                 if self._belief_alive is not None else None),
             }
 
         # ---- Pass 3: extract local windows — ONE batched call, unfold [B, ...] → [N, M, ...] ----
@@ -1286,23 +1521,17 @@ class Explorer:
         union_free = (self.world.occupancy_torch == _FREE).any(dim=1).view(self.N, -1).sum(-1).float()
         explored_frac = (union_free / self.free_total.clamp(min=1.0)).clamp(0.0, 1.0)               # [N]
         t_frac = (self.t.float() / T_max).clamp(0.0, 1.0)                                            # [N]
-        # geo_pair: nearest-teammate geodesic, mean over agents, /diam. REUSES Pass-1 bf_dist_team.
+        # geo_pair (CTDE critic) + φ (reward): nearest-teammate GEODESIC from each agent's curr to the
+        # teammate's last-known node, over the optimistic BF (info["bf_dist_team"]). Legacy lkp-based —
+        # v3 belief drives ONLY feat[4]; radar/φ/geo_pair stay on this path for now.
+        phi_norm_px = max(1.0, float(self.cfg.nr) * float(self.cfg.scan_norm_nodes))
         if self.M > 1:
             bt = info["bf_dist_team"].view(self.N, self.M, self.M, self.N_max)                       # [N, a, j, N_max]
             ca = info["curr_idx"].view(self.N, self.M)                                               # [N, a]
-            d_at = bt.gather(3, ca.view(self.N, self.M, 1, 1).expand(-1, -1, self.M, 1)).squeeze(-1) # [N, a, j] teammate j → a's node
-            geo = d_at.min(dim=2).values                                                             # [N, M] nearest teammate
+            d_at = bt.gather(3, ca.view(self.N, self.M, 1, 1).expand(-1, -1, self.M, 1)).squeeze(-1) # [N, a, j]
+            geo = d_at.min(dim=2).values                                                             # [N, a] nearest teammate
             geo = torch.where(torch.isfinite(geo), geo, torch.full_like(geo, diam))
             geo_pair = (geo.mean(dim=1) / max(1.0, diam)).clamp(0.0, 1.0)                            # [N]
-            # φ (reward-only) per agent = geodesic curr→nearest-teammate, normalized by
-            # nr·scan_norm_nodes — the SAME "one sensor-disk" physical unit every other dense reward
-            # term (novel/revisit/stall) is denominated in — NOT /diam. /diam is map-SIZE dependent
-            # (inversely: a bigger map crushes Δφ per step, a smaller map inflates it), the opposite
-            # of invariant. nr·scan_norm_nodes is a fixed physical constant (sensor/step scale), so
-            # one real hop of approach is always worth the same Δφ regardless of map size. geo_pair
-            # above (critic-only CTDE feature) intentionally keeps /diam — it wants "fraction of
-            # THIS map traversed", a different, legitimately map-relative quantity.
-            phi_norm_px = max(1.0, float(self.cfg.nr) * float(self.cfg.scan_norm_nodes))
             self._geo_curr_team = (geo / phi_norm_px).clamp(0.0, 1.0)                                # [N, M]
         else:
             geo_pair = torch.zeros(self.N, device=self.dev)

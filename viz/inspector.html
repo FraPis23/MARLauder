@@ -92,6 +92,7 @@
       <option value="uv">util · detectable vol</option>
       <option value="age">age</option>
       <option value="team">teammate_pot</option>
+      <option value="bel">belief p (pathfront, fixed 0→0.03: black→yellow→red; cyan○ = transit dots)</option>
       <option value="bu">radar · utility (out-of-window)</option>
       <option value="bt">radar · teammate (out-of-window)</option>
     </select></label>
@@ -236,9 +237,16 @@ function ramp(t){ // 0..1 -> dim blue -> amber
 // glance: utility (util/ub/uv/bu) = amber/gold, teammate (team/bt) = magenta. Radar channels
 // (bu/bt) share their base field's hue so "radar utility" looks like utility and "radar teammate"
 // like teammate — you can tell what you're looking at from the color alone.
+const BEL_VMAX = 0.03;   // FIXED probability scale for the pathfront belief field (match the gif)
 function rampField(f,t){
   t=Math.max(0,Math.min(1,t));
   const mix=(lo,hi)=>`rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*t)).join(",")})`;
+  if(f==="bel"){                                                   // pathfront belief: black→yellow→red heat
+    if(t<=0.0) return "rgb(18,18,26)";
+    if(t<0.15){ const u=t/0.15; return `rgb(${Math.round(18+237*u)},${Math.round(18+224*u)},${Math.round(26+134*u)})`; }
+    const u=(t-0.15)/0.85, lo=[255,242,160], hi=[200,20,10];
+    return `rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*u)).join(",")})`;
+  }
   if(f==="team"||f==="bt") return mix([50,30,70],[255,90,235]);   // teammate → magenta
   if(f==="util"||f==="ub"||f==="uv"||f==="bu") return mix([46,64,120],[255,210,60]); // utility → amber
   return ramp(t);                                                 // age/gp/bf → default blue→amber
@@ -361,12 +369,22 @@ function drawNodes(){
       }
     } else {
       const v=fieldVal(n,A.field);
-      col = v===null? "#33405a" : rampField(A.field,(v-lo)/(hi-lo));
+      // belief uses a FIXED absolute scale (0→BEL_VMAX) so the accumulation on frontiers is comparable
+      // across frames (not per-frame min/max like the other fields).
+      const tt = A.field==="bel" ? v/BEL_VMAX : (v-lo)/(hi-lo);
+      col = v===null? "#33405a" : rampField(A.field, tt);
       rad = A.sel&&A.sel===n.i?5:3;
     }
     ctx.fillStyle=col;
     ctx.beginPath(); ctx.arc(n.x,n.y, rad, 0, 6.283); ctx.fill();
     ctx.lineWidth=0.6; ctx.strokeStyle="#000"; ctx.stroke();
+  }
+  // PATHFRONT transit dots: when viewing the belief field, ring every node holding a travelling
+  // hypothesis (belt===1) in cyan — uniform brightness so ALL dots are visible departing lkp→frontier
+  // even when the utility/distance weights concentrate the probability mass on one cluster.
+  if(A.field==="bel"){
+    ctx.strokeStyle="#25f0ff"; ctx.lineWidth=2.2;
+    for(const n of ag.nodes){ if(n.belt===1){ ctx.beginPath(); ctx.arc(n.x,n.y,6.5,0,6.283); ctx.stroke(); } }
   }
   // curr disc (filled, at actual current position) + chosen-action arrow
   const cur = ag.nodes.find(n=>n.i===ag.curr) || {x:ag.pos[0],y:ag.pos[1]};

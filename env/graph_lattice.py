@@ -273,6 +273,12 @@ class GraphLattice:
         edge_valid = endpoints_valid & collision_free_known
         edge_idx = torch.where(edge_valid, edge_idx, torch.full_like(edge_idx, -1))
 
+        # Ungated known-free edge set: both endpoints known-FREE + segment all-known-free + geom, WITHOUT
+        # the robot-rooted node_valid gate. The teammate belief BFS's from the SEED (not the robot), so it
+        # must be able to fill known-free pockets disconnected from the robot in the free graph yet reached
+        # by re-entering from the unknown. Still blocks known walls and unknown-gap jumps (collision_free_known).
+        edge_free = is_free_node.unsqueeze(-1) & is_free_nbr & nbr_valid_geom & collision_free_known
+
         # 3b) OPTIMISTIC traversable graph (UNKNOWN treated passable) — for teammate-
         # distance BF ONLY. A teammate that has split off usually sits in THIS agent's
         # UNKNOWN region; on the FREE graph above its node is invalid/disconnected and
@@ -403,6 +409,7 @@ class GraphLattice:
             "node_feat": node_feat,
             "edge_idx": edge_idx,
             "edge_valid": edge_valid,
+            "edge_free": edge_free,                               # [N,N_max,K] known-free, NO robot gate (belief)
             "edge_len": self.edge_len,                            # static [K]
             "curr_idx": curr_idx,
             "curr_nbr": curr_nbr,

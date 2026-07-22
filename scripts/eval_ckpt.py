@@ -43,6 +43,10 @@ def main() -> None:
     ap.add_argument("--n-layers", type=int, default=None, help="default: from ckpt (encoder depth)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, required=True, help="run dir to write GIFs + traces into")
+    ap.add_argument("--comm-range", type=float, default=None,
+                    help="override comm_range_px (LOS model) for the trace/GIF — lower forces the "
+                         "teammate belief out-of-range so it diffuses, visible in the inspector's "
+                         "teammate_pot field even when the policy keeps agents close.")
     args = ap.parse_args()
 
     model, env_peek = load_model_from_ckpt(args.ckpt, args.device, n_agents=args.n_agents,
@@ -56,7 +60,15 @@ def main() -> None:
     short = args.split.split("/")[-1]
     stem = args.ckpt.stem
 
-    env_cfg = EnvCfg.from_ckpt_dict(env_peek or {}, n_envs=1, n_agents=args.n_agents,
+    # Trace/GIF env cfg. Optional comm-range override (LOS) makes the teammate belief go
+    # out-of-range → diffuse, so the inspector's teammate_pot field shows the propagation.
+    trace_env_peek = dict(env_peek or {})
+    trace_env_peek["use_teammate_belief"] = True
+    if args.comm_range is not None:
+        trace_env_peek["comm_model"] = "los"
+        trace_env_peek["comm_range_px"] = float(args.comm_range)
+
+    env_cfg = EnvCfg.from_ckpt_dict(trace_env_peek, n_envs=1, n_agents=args.n_agents,
                                     max_episode_steps=args.steps + 1)
     env = Explorer(split, env_cfg, seed=0)
 
@@ -79,7 +91,7 @@ def main() -> None:
             print(f"[eval_ckpt] gif {tag} skipped ({exc})")
         # Inspector trace (viewer itself is served canonically by web_server.py)
         try:
-            capture_trace(model, split, env_peek or {}, args.n_agents,
+            capture_trace(model, split, trace_env_peek, args.n_agents,
                           int(midx), args.steps, args.out, tag, args.device)
         except Exception as exc:
             print(f"[eval_ckpt] trace {tag} skipped ({exc})")
