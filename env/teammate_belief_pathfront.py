@@ -154,6 +154,10 @@ def advance_pathfront(
     beta_max: float = 0.9,
     diffuse_lambda: float = 0.5,   # fraction of a node's live mass that hops out per step
     seen: torch.Tensor | None = None,   # [P, N] bool — nodes the observer has checked empty THIS step
+    just_frozen: torch.Tensor | None = None,  # [P] bool — hypothesis (re)frozen THIS call, s already
+                                               # backdated by the caller to look one hop travelled; skip
+                                               # the current-point negative-evidence test for these rows
+                                               # ONLY on this call (trivially near lkp, not new evidence)
     gate_eps: float = 1e-9,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One step of the absorbing diffusion. Returns (live, acc, seeded, p, alive, transit_viz). Σ p = 1,
@@ -169,6 +173,14 @@ def advance_pathfront(
     used = front_node >= 0                                        # [P, Kf]
     s = step.view(P, 1)                                          # [P, 1]
 
+    # Transit-point node for hypotheses still travelling (one hop/step lkp→front_node). Computed once,
+    # up front, so BOTH the negative-evidence kill test below AND the viz/mass placement at step 5 agree
+    # on where each dot actually is THIS step — otherwise a dot can be tested against `seen` at its
+    # frontier target while being drawn somewhere else entirely.
+    s_idx = (dist_h - step.view(P, 1)).clamp(0, Lmax - 1)
+    pnode = torch.gather(path, 2, s_idx.unsqueeze(-1)).squeeze(-1)                # [P, Kf]
+    pnode = torch.where(pnode >= 0, pnode, front_node)
+
     # 0) NEGATIVE EVIDENCE: the observer checked `seen` nodes this step and the teammate was NOT there
     #    (else comm would have collapsed the belief). Zero the belief mass on those nodes, then PUSH the
     #    removed mass back onto the SURVIVING hypotheses (∝ their expected utility) — NOT straight onto
@@ -181,42 +193,83 @@ def advance_pathfront(
         removed = (live + acc) * seen_f                          # mass sitting on checked nodes
         live = live * keep
         acc = acc * keep
-        # transit hypotheses whose TARGET frontier is already checked → falsified: stop them injecting
-        # and recycle their carried weight into the redistribution pool.
+        # A hypothesis is falsified either when its TARGET frontier is already checked, OR the moment
+        # its CURRENT transit point enters `seen` — the observer's own advance can check the exact
+        # corridor cell a dot is passing through well before it ever reaches the frontier. Without the
+        # latter test the dot visibly TRAVELS THROUGH checked-empty ground instead of vanishing there.
+        # Excludes rows frozen THIS call: their point is trivially near lkp (comm only just broke
+        # there) — testing it would kill every hypothesis at birth regardless of which way it departs.
+        jf = (torch.zeros((P, 1), dtype=torch.bool, device=dev) if just_frozen is None
+              else just_frozen.view(P, 1))
         tgt_seen = used & torch.gather(seen, 1, front_node.clamp(min=0))          # [P, Kf]
-        kill = tgt_seen & (~seeded)
+        cur_seen = used & (s < dist_h) & (~jf) & torch.gather(seen, 1, pnode.clamp(min=0))
+        falsified = tgt_seen | cur_seen
+        kill = falsified & (~seeded)
         dM = removed.sum(dim=1) + (kill.float() * weight).sum(dim=1)              # [P] mass to re-place
         seeded = seeded | kill
-        # split dM over the survivors ∝ expected utility at their representative frontier.
+        # split dM over the survivors ∝ expected utility at their representative frontier — falling
+        # back to a UNIFORM split over the same (real, still-alive) survivors when their utility-weight
+        # is degenerate (e.g. every survivor's target frontier currently has ~0 utility). Utility being
+        # low is not the same as having no survivor: the freed mass must stay with the hypotheses that
+        # are actually still alive, never skip past them onto some unrelated frontier elsewhere on the
+        # map just because this local direction scores low on utility right now.
         u_h = torch.gather(utility, 1, front_node.clamp(min=0))                   # [P, Kf]
-        moving = used & (s < dist_h) & (~seeded) & (~tgt_seen)                    # survivors travelling
-        arrived = used & (s >= dist_h) & (~tgt_seen)                              # survivors expanding (frontier unseen)
+        moving = used & (s < dist_h) & (~seeded) & (~falsified)                   # survivors travelling
+        arrived = used & (s >= dist_h) & (~falsified)                             # survivors expanding (frontier unseen)
         survivor = moving | arrived
+        n_surv = survivor.float().sum(dim=1, keepdim=True)                        # [P, 1]
         U = (u_h * survivor.float()).sum(dim=1, keepdim=True)                     # [P, 1]
-        share = torch.where(U > gate_eps, u_h * survivor.float() / U.clamp(min=gate_eps),
-                            torch.zeros_like(u_h))
+        share = torch.where(
+            U > gate_eps, u_h * survivor.float() / U.clamp(min=gate_eps),
+            torch.where(n_surv > gate_eps, survivor.float() / n_surv.clamp(min=gate_eps),
+                        torch.zeros_like(u_h)))
         add_h = dM.unsqueeze(1) * share                                           # [P, Kf] per-hyp mass
         weight = weight + torch.where(moving, add_h, torch.zeros_like(add_h))     # travelling → weight
         live = live.scatter_add(1, front_node.clamp(min=0),
                                 torch.where(arrived, add_h, torch.zeros_like(add_h)))  # arrived → live
-        # fallback (no surviving hypothesis with utility): place dM via a cascade that is guaranteed
-        # non-empty, so mass is NEVER lost and Σ stays 1. Priority: unseen frontiers ∝ utility → unseen
-        # frontiers uniform → any frontier uniform → any known-free node uniform (always non-empty while
-        # the belief is alive).
-        no_surv = (U <= gate_eps).squeeze(1)                                      # [P]
+        # fallback (truly NO surviving hypothesis left, not merely a low-utility one): put dM back
+        # EXACTLY where it just evaporated from — nodes `removed` just zeroed (real live/acc positions),
+        # plus the CURRENT transit point `pnode` of whichever hypothesis was `kill`ed this call (where
+        # its dot actually IS right now) — NOT its target `front_node` (the distant frontier it was still
+        # travelling toward). Scattering onto `front_node` teleports mass onto a node that may have zero
+        # neighbouring precursor (a real, confirmed regression: belief appeared on nodes with no adjacent
+        # probability the step before). `pnode` is real-world-consistent — it moved one hop/step same as
+        # every other hypothesis, so mass re-entering there is adjacent to where it was a moment ago.
+        # The ordinary DIFFUSE (step 4) / ABSORB (step 3) machinery below already runs every step and
+        # will carry this back out one hop at a time, same pacing every other hypothesis obeys — so it
+        # can never skip a node or show probability on ground the diffusion hasn't actually reached yet.
+        # `origin` sums to exactly dM by construction (removed.sum() + kill·weight.sum()), so it's a
+        # valid non-empty distribution whenever dM>0 — no separate empty-map fallback needed.
+        no_surv = (n_surv <= gate_eps).squeeze(1)                                 # [P]
         if bool(no_surv.any()):
-            unseen_front = (frontier_node & (~seen)).float()
-            cands = (utility * unseen_front, unseen_front, frontier_node.float(),
-                     edge_free.any(dim=-1).float())
-            dest = torch.zeros_like(live)
-            filled = torch.zeros((P, 1), dtype=torch.bool, device=dev)
-            for c in cands:
-                cs = c.sum(dim=1, keepdim=True)
-                ok = cs > gate_eps
-                take = ok & (~filled)
-                dest = torch.where(take, c / cs.clamp(min=gate_eps), dest)
-                filled = filled | ok
-            live = live + (dM * no_surv.float()).unsqueeze(1) * dest
+            origin = removed + torch.zeros_like(removed).scatter_add(
+                1, pnode.clamp(min=0), kill.float() * weight)
+            add_back = (dM * no_surv.float()).unsqueeze(1) * (
+                origin / origin.sum(dim=1, keepdim=True).clamp(min=gate_eps))
+            # `origin` can itself BE the node that just got proven seen (the degenerate case: the last
+            # hypothesis's only real mass was sitting exactly where negative evidence just fired — e.g.
+            # an arrived hypothesis's frontier gets checked the same step every rival hypothesis also
+            # dies). Depositing straight back there would re-violate "never show mass on proven-empty
+            # ground" the instant it lands (confirmed via full-episode scan: node showing live mass with
+            # seen=True, sourced from exactly this line). Relay that portion ONE hop onto its unseen
+            # neighbours instead — same single-hop-per-step rule as section 4's diffuse, never a forced
+            # multi-hop escape.
+            if seen is not None:
+                stuck = add_back * seen_f
+                add_back = add_back * keep
+                nbr_flat_o = nbr_idx.clamp(min=0).view(1, N * K).expand(P, -1)
+                nbr_seen_o = torch.gather(seen, 1, nbr_flat_o).view(P, N, K)
+                route_o = edge_free & (~nbr_seen_o)
+                deg_o = route_o.float().sum(-1)
+                has_o = deg_o > gate_eps
+                share_o = torch.where(
+                    has_o.unsqueeze(-1),
+                    stuck.unsqueeze(-1) * route_o.float() / deg_o.clamp(min=1.0).unsqueeze(-1),
+                    torch.zeros((P, N, K), dtype=torch.float32, device=dev))
+                relay = torch.zeros_like(live)
+                relay.scatter_add_(1, nbr_flat_o, share_o.reshape(P, N * K))
+                add_back = add_back + relay + stuck * (~has_o).float()  # fully-boxed-in node: stays put
+            live = live + add_back
 
     # 1) INJECT newly-arrived hypotheses: add w_i onto frontier node F_i (once).
     arrived = used & (s >= dist_h)
@@ -237,25 +290,50 @@ def advance_pathfront(
     acc = acc + lock
     live = live - lock
 
-    # 4) DIFFUSE live mass one hop INWARD over the known-free graph (mass-conserving push).
-    ef = edge_free.float()                                       # [P, N, K]
-    deg_raw = ef.sum(-1)                                         # [P, N]
+    # 4) DIFFUSE live mass one hop INWARD over the known-free graph (mass-conserving push). Never routes
+    #    onto a neighbour the observer has already proven empty THIS step (`seen`) — a node simply keeps
+    #    its share instead of being forced onto checked ground. The negative evidence in section 0 is
+    #    what actually zeroes a node's mass, and it only fires once THAT node itself becomes seen — which
+    #    happens one hop later, as diffusion naturally carries the mass forward. This keeps propagation
+    #    at exactly one hop per real step in both directions: outward via this masked diffuse, and
+    #    "backward" (off proven-empty ground) via section 0 next call — never a multi-hop jump forced
+    #    within a single step.
+    #
+    #    The out-mask and in-mask are NOT the same tensor, on purpose. `edge_free` is a pairwise
+    #    (direction-independent) predicate, so the original unmasked code could reuse one `ef` for both
+    #    the per-source degree/share AND the gather-based inflow sum — a node's own row doubled as its
+    #    reciprocal edge's validity. `seen` breaks that: "is my neighbour seen" (out-mask, gates what a
+    #    SENDER will route to) and "am I seen" (in-mask, gates what a RECEIVER may accept) are different
+    #    single-node predicates, not a shared pairwise one. Reusing the out-mask for inflow gathering
+    #    checks the wrong endpoint — it blocks "my neighbour is seen" instead of "I am seen", which lets
+    #    mass keep flowing INTO seen nodes from any not-yet-seen sender (a confirmed leak: verified via
+    #    instrumentation, small live mass accumulating step over step on nodes marked `seen`, sourced
+    #    purely from ordinary diffuse inflow). Two separate masks fixes it while staying exactly
+    #    conservative (per-edge: out-mask at the sender's slot and in-mask at the receiver's reciprocal
+    #    slot are provably equal, since both reduce to `edge_free[i,k] & ~seen[receiver]`).
+    ef_out = edge_free.float()                                    # [P, N, K] — sender-side: don't route to a seen neighbour
+    if seen is not None:
+        nbr_flat_d = nbr_idx.clamp(min=0).view(1, N * K).expand(P, -1)
+        nbr_seen_d = torch.gather(seen, 1, nbr_flat_d).view(P, N, K)
+        ef_out = ef_out * (~nbr_seen_d).float()
+    deg_raw = ef_out.sum(-1)                                      # [P, N]
     has_nbr = deg_raw > 0
-    share = diffuse_lambda * live / deg_raw.clamp(min=1.0)       # amount sent to EACH known-free nbr
+    share = diffuse_lambda * live / deg_raw.clamp(min=1.0)       # amount sent to EACH known-free, unseen-target nbr
     nbr = nbr_idx.clamp(min=0).view(1, N * K).expand(P, -1)
-    inflow = (torch.gather(share, 1, nbr).view(P, N, K) * ef).sum(-1)             # [P, N]
+    ef_in = edge_free.float()                                     # [P, N, K] — receiver-side: don't accept mass if I'm seen
+    if seen is not None:
+        ef_in = ef_in * (~seen).float().unsqueeze(-1)
+    inflow = (torch.gather(share, 1, nbr).view(P, N, K) * ef_in).sum(-1)          # [P, N]
     outflow = torch.where(has_nbr, diffuse_lambda * live, torch.zeros_like(live))
     live = live - outflow + inflow
 
     # 5) TRANSIT point masses for hypotheses still travelling (s < dist_h). Killed hypotheses (target
-    #    already checked empty) are marked seeded → excluded so they neither render nor inject.
+    #    or current point already checked empty) are marked seeded → excluded so they neither render
+    #    nor inject. `pnode` computed up top so this agrees exactly with the kill test in step 0.
     transit = used & (s < dist_h) & (~seeded)
     p = live + acc
     transit_viz = torch.zeros((P, N), dtype=torch.float32, device=dev)   # uniform dots (viz only)
     if transit.any():
-        s_idx = (dist_h - step.view(P, 1)).clamp(0, Lmax - 1)
-        pnode = torch.gather(path, 2, s_idx.unsqueeze(-1)).squeeze(-1)            # [P, Kf]
-        pnode = torch.where(pnode >= 0, pnode, front_node)
         add = torch.zeros((P, N), dtype=torch.float32, device=dev)
         add.scatter_add_(1, pnode.clamp(min=0), transit.float() * weight)
         p = p + add

@@ -258,7 +258,10 @@ function curAgent(){ return curStep().agents[A.agent]; }
 
 async function loadTrace(url){
   resetGifCache();                                 // free decoded frames from the previous episode
-  const r = await fetch(url); A.trace = await r.json();
+  // cache-bust: a re-run can overwrite trace.json under the SAME tag (same URL) — without this the
+  // browser (or a same-tag no-op in loadIndex) would keep serving the stale in-memory/HTTP-cached copy.
+  const r = await fetch(url + (url.includes("?") ? "&" : "?") + "v=" + Date.now());
+  A.trace = await r.json();
   A.dir = url.substring(0, url.lastIndexOf("/")+1) || "./";
   $("slider").max = A.trace.steps.length-1;
   $("agent").innerHTML = "";
@@ -972,7 +975,9 @@ async function loadIndex(auto){
       o.text=`${e.completed?'✓ ':''}${e.tag}  (expl ${e.final_explored!=null?Math.round(e.final_explored*100)+'%':'?'}, ${e.n_steps} steps)`; sel.add(o); }
     if(idx.length){
       const stillThere=[...sel.options].some(o=>o.value===prevVal);
-      if(stillThere) sel.value=prevVal;
+      // same tag re-selected → still reload trace.json: a manual ⟳ click means the user expects
+      // fresh data, and a re-run can overwrite the file under this exact tag (no new option added).
+      if(stillThere){ sel.value=prevVal; if(!auto) await loadTrace(`traces/${prevVal}/trace.json`); }
       else{ sel.value=idx[idx.length-1].tag; await loadTrace(`traces/${sel.value}/trace.json`); }
     }
     const grew=idx.length-prevCount;

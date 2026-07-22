@@ -1259,7 +1259,10 @@ class Explorer:
                 pf_front[fidx, m] = fn; pf_w[fidx, m] = w; pf_d[fidx, m] = dh; pf_pth[fidx, m] = pth
                 pf_live[fidx, m] = 0.0; pf_acc[fidx, m] = 0.0; pf_seed[fidx, m] = False
                 pf_born[fidx, m] = True
-                pf_t0[fidx, m] = t_b[fidx, 0]                           # transit clock starts here → s=0 at lkp
+                # backdated by one hop: by the time comm is OBSERVED lost this step, the teammate has
+                # already taken the step that broke it → s=1 (one hop off lkp) at the freeze step itself,
+                # not s=0 (sitting on lkp, indistinguishable from the marker until the step after).
+                pf_t0[fidx, m] = t_b[fidx, 0] - 1
                 if _PF_DEBUG:
                     from env.teammate_belief_pathfront import cluster_frontiers as _cf
                     for r, b0 in enumerate(fidx.tolist()):
@@ -1276,7 +1279,7 @@ class Explorer:
                 nbr_idx=eidx, absorb_gain=float(self.cfg.belief_absorb_gain),
                 beta_max=float(self.cfg.belief_beta_max),
                 diffuse_lambda=float(self.cfg.belief_diffuse_lambda),
-                seen=seen_nodes)
+                seen=seen_nodes, just_frozen=frz)
             pf_live[:, m] = live_m; pf_acc[:, m] = acc_m; pf_seed[:, m] = seed_m; pf_w[:, m] = w_m
             use = pf_born[:, m] & active & ~comm_bm[:, m]
             self._belief_p[:, m] = torch.where(use.view(B, 1), p_m, self._belief_p[:, m])
@@ -1382,11 +1385,45 @@ class Explorer:
                 n_unk = nbr_unknown.sum(-1)                                     # [B, N_max] unknown 8-nbrs
                 min_unk = int(self.cfg.pf_frontier_min_unknown)
                 frontier_node = node_free & (n_unk >= min_unk) & (n_unk <= 7)  # [B, N_max] openings only
-                # NEGATIVE-EVIDENCE footprint: nodes the observer can currently SEE = known-free nodes
-                # within sensor_range GEODESICALLY (bf_dist_from_curr over the free graph → around walls,
-                # not through them). If the teammate were here comm would fire; it didn't, so these nodes
-                # are "checked empty" → the belief there is zeroed and pushed onto the unseen frontiers.
-                seen_nodes = node_free & (info["bf_dist_from_curr"] <= float(self.cfg.sensor_range_px))
+                # NEGATIVE-EVIDENCE footprint: nodes where, if the teammate stood there, COMM WOULD HAVE
+                # FIRED — the exact same criterion _comm_check applies to the true teammate position,
+                # now evaluated against every known-free node. Previously this used the MAPPING lidar's
+                # geodesic reachability within sensor_range_px: a different radius (80px vs comm's own
+                # comm_range_px, 40px in this trace) AND a different model (walking distance around
+                # corners vs straight-line sight) — a node just behind a nearby wall is a short walk
+                # away (lidar → "seen") but comm-blind (LOS blocked), so a correct nearby hypothesis got
+                # killed as "checked empty" when comm could never have detected it there at all.
+                own_xy = self.pos.reshape(B, 2)                                     # [B, 2]
+                node_xy = self.graph.node_xy                                       # [N_max, 2]
+                diff = node_xy.view(1, self.N_max, 2) - own_xy.view(B, 1, 2)        # [B, N_max, 2]
+                eucl = diff.pow(2).sum(-1).sqrt()                                   # [B, N_max]
+                Sl = int(self.cfg.comm_los_samples)
+                t_vals = torch.linspace(0.0, 1.0, Sl, device=self.dev)             # [Sl]
+                pts = (own_xy.view(B, 1, 1, 2)
+                       + t_vals.view(1, 1, Sl, 1) * diff.view(B, self.N_max, 1, 2))  # [B, N_max, Sl, 2]
+                ix = pts[..., 0].clamp(0, self.W - 1).long()
+                iy = pts[..., 1].clamp(0, self.H - 1).long()
+                e_idx = (torch.arange(B, device=self.dev) // self.M).view(B, 1, 1).expand(B, self.N_max, Sl)
+                obst = self.world.gt_torch[e_idx, iy, ix] == GT_OBST               # [B, N_max, Sl]
+                if self.cfg.comm_model == "signal_strength":
+                    c = self.cfg
+                    frac_obst = obst.float().mean(dim=-1)                          # [B, N_max]
+                    d_obst = frac_obst * eucl
+                    d_free = (eucl - d_obst).clamp(min=0.0)
+                    ss_xg = self._ss_xg.repeat_interleave(self.M).view(B, 1)        # env→row (b=env·M+agent)
+                    ss_k  = self._ss_k.repeat_interleave(self.M).view(B, 1)
+                    pl = eucl.new_full((B, self.N_max), c.ss_pl_o)
+                    has_obst = d_obst > 0.0
+                    pl = pl + torch.where(has_obst, 10.0 * c.ss_gamma_obst
+                                          * torch.log10(d_obst.clamp(min=1.0)) + ss_k, torch.zeros_like(pl))
+                    far_free = d_free >= c.ss_dist_o
+                    pl = pl + torch.where(far_free, 10.0 * c.ss_gamma
+                                          * torch.log10((d_free / c.ss_dist_o).clamp(min=1.0)) + ss_xg,
+                                          torch.zeros_like(pl))
+                    would_comm = (c.ss_p_t - pl) > c.ss_thresh
+                else:
+                    would_comm = (eucl < float(self.cfg.comm_range_px)) & ~obst.any(dim=-1)
+                seen_nodes = node_free & would_comm
                 self._pathfront_belief(B, info, team_node, comm_bm, frontier_node, known_free.bool(),
                                        seen_nodes)
             else:
