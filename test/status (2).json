@@ -1,0 +1,1 @@
+{"state": "done", "pid": 937, "host": "6f482775e7ae", "start_time": 1784227226.4331827, "total_iters": 488, "split": "train/difficult", "n_agents": 2, "n_envs": 32, "iter": 488, "progress_pct": 100.0, "last_ckpt": "ckpt_100", "ep_end_pct": 90.0, "timestamp": 1784281717.0706613, "env_steps": 3997696, "sps": 106}

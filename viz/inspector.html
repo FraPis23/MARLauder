@@ -260,7 +260,8 @@ async function loadTrace(url){
   resetGifCache();                                 // free decoded frames from the previous episode
   // cache-bust: a re-run can overwrite trace.json under the SAME tag (same URL) — without this the
   // browser (or a same-tag no-op in loadIndex) would keep serving the stale in-memory/HTTP-cached copy.
-  const r = await fetch(url + (url.includes("?") ? "&" : "?") + "v=" + Date.now());
+  A.stamp = Date.now();                 // one stamp per trace load, shared by trace.json/GIF/gat fetches
+  const r = await fetch(url + (url.includes("?") ? "&" : "?") + "v=" + A.stamp);
   A.trace = await r.json();
   A.dir = url.substring(0, url.lastIndexOf("/")+1) || "./";
   $("slider").max = A.trace.steps.length-1;
@@ -594,7 +595,10 @@ async function frameImage(url, fi){
   if(!url.endsWith(".gif")){ const im=new Image(); im.src=A.dir+url; await im.decode(); return im; }
   let g=GIF[url];
   if(!g){ g=GIF[url]={frames:{}, lastDrawn:-1, prev:null};
-    g.ready=fetch(A.dir+url).then(r=>r.arrayBuffer()).then(b=>{
+    // cache-bust like trace.json: re-running a trace overwrites frames/aN.gif under the SAME url, and
+    // without this the browser keeps the OLD map image while the node overlay comes from the fresh
+    // trace.json — the two then disagree, most visibly at a rendezvous (graph merges, map does not).
+    g.ready=fetch(A.dir+url+(url.includes("?")?"&":"?")+"v="+A.stamp).then(r=>r.arrayBuffer()).then(b=>{
       g.parsed=parseGIF(b);
       g.off=document.createElement("canvas"); g.off.width=g.parsed.width; g.off.height=g.parsed.height;
       g.octx=g.off.getContext("2d",{willReadFrequently:true});

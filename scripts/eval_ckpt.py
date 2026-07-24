@@ -43,6 +43,9 @@ def main() -> None:
     ap.add_argument("--n-layers", type=int, default=None, help="default: from ckpt (encoder depth)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, required=True, help="run dir to write GIFs + traces into")
+    ap.add_argument("--belief-mode", choices=["uniform", "pathfront", "ckpt"], default="ckpt",
+                    help="teammate-belief model for the trace/GIF; 'ckpt' keeps whatever the checkpoint "
+                         "was trained with (old checkpoints predate 'pathfront')")
     ap.add_argument("--comm-range", type=float, default=None,
                     help="override comm_range_px (LOS model) for the trace/GIF — lower forces the "
                          "teammate belief out-of-range so it diffuses, visible in the inspector's "
@@ -64,6 +67,8 @@ def main() -> None:
     # out-of-range → diffuse, so the inspector's teammate_pot field shows the propagation.
     trace_env_peek = dict(env_peek or {})
     trace_env_peek["use_teammate_belief"] = True
+    if args.belief_mode != "ckpt":
+        trace_env_peek["belief_mode"] = args.belief_mode
     if args.comm_range is not None:
         trace_env_peek["comm_model"] = "los"
         trace_env_peek["comm_range_px"] = float(args.comm_range)

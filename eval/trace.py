@@ -216,6 +216,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             bel_disp = None
         # Pathfront TRANSIT dots (uniform 1.0 markers) — the travelling hypotheses BEFORE they bloom.
         # Rendered as distinct points so the viewer sees each dot depart lkp→frontier (viz only).
+        seen_rg = rg.get("belief_seen")
+        seen_np = seen_rg[0].cpu().numpy() if seen_rg is not None else None      # [M, N_max] observer POV
         bt_rg = rg.get("belief_transit")
         bel_transit = bt_rg[0].cpu().numpy().max(axis=1) if bt_rg is not None else None   # [M, N_max]
 
@@ -236,6 +238,12 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "bel": _r(float(belj[n]), 4) if belj is not None else 0.0,   # RAW p (fixed-scale in web)
                 # belt = 1 when a still-travelling transit dot sits on this node (pathfront, viz only).
                 "belt": 1 if (beltj is not None and beltj[n] > 0.5) else 0,
+                # sn = the observer can see this node right now (comm would have fired) → belief here
+                # would be belief on ground already proven empty.
+                "sn": 1 if (seen_np is not None and seen_np[a, n]) else 0,
+                # v = the node is VALID (known ground in this observer's map). A drawn node with v=0 is
+                # only on screen because it carries belief — i.e. belief outside the known zone.
+                "v": 1 if nv[a, n] else 0,
                 # RADAR boundary-summary channels (nonzero only on geodesic horizon nodes):
                 # bu = out-of-window utility mass, bt = out-of-window teammate direction.
                 "bu": _r(nf[a, n, 5], 3), "bt": _r(nf[a, n, 6], 3),

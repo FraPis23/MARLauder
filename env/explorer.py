@@ -224,9 +224,30 @@ class EnvCfg:
     # so distinct openings become distinct clusters and a point departs toward each.
     pf_frontier_min_unknown: int = 4
     # pathfront phase-2 absorbing-diffusion knobs (β_F = min(gain·utility(F), β_max) per-step lock rate).
-    belief_absorb_gain: float = 1.0
-    belief_beta_max: float = 0.9
+    # Absorption rate at an opening: β = min(gain·utility, β_max) of the live mass locked per step. Full
+    # strength pins essentially the whole belief on the frontier ring; keeping it partial leaves a tail
+    # that propagates back into the mapped area, which is where the teammate may also be.
+    belief_absorb_gain: float = 0.45
+    belief_beta_max: float = 0.45
+    # Fraction of a node's live mass that flows out per step, one hop, split over its known-free
+    # neighbours ∝ their utility (never onto ground the observer can see). The utility bias is what makes
+    # this carry the belief ALONG the frontier and toward what is still unexplored instead of smearing it
+    # evenly — plain isotropic diffusion both leaked mass backwards into already-swept corridor and never
+    # managed to move it to the next opening over.
     belief_diffuse_lambda: float = 0.5
+    # A node counts as a "way out" (belief mass on it means "the teammate is somewhere BEYOND here", and is
+    # therefore exempt from the comm-range deletion) only while at least this much utility is left behind
+    # it. A whisker of unreachable unknown is not a way out: without the gate, a node with utility 0.004
+    # keeps its mass even with the observer standing ON it, so a ghost trail survives behind the agent and
+    # the redistribution keeps feeding it (confirmed: m50/agent1 t=114-118).
+    belief_door_min_util: float = 0.05
+    # PLAUSIBILITY PRUNING (pathfront only, 0.0 = OFF): a frontier whose utility has decayed below
+    # belief_prune_util is a "closed door" — an explored pocket with a residual sliver of unknown that
+    # nobody would travel to. Its locked belief mass is dropped (Σp < 1 → feat[4] fades = "teammate
+    # lost") instead of being kept as a confident wrong peak, and no hypothesis is frozen toward it.
+    # belief_prune_min_cluster drops openings made of fewer than this many frontier nodes at freeze time.
+    belief_prune_util: float = 0.0
+    belief_prune_min_cluster: int = 0
 
     @classmethod
     def from_ckpt_dict(cls, d: dict, **overrides) -> "EnvCfg":
@@ -357,6 +378,9 @@ class Explorer:
         # step index at which the hypotheses froze (comm-break), so transit s = t - pf_t0 starts at 0 →
         # the FIRST out-of-comm frame shows the dots AT lkp, then they visibly depart hop by hop.
         self.pf_t0         = torch.zeros((self.N, self.M, self.M), dtype=torch.long, device=self.dev)
+        # Known-free footprint of the PREVIOUS step, per observer row → the nodes revealed THIS step are
+        # node_free & ~pf_known_prev. Belief mass sitting on a frontier is pushed onto exactly those.
+        self.pf_known_prev = torch.zeros((self.N, self.M, self.N_max), dtype=torch.bool, device=self.dev)
         self._comm_prev    = torch.zeros((self.N, self.M, self.M), dtype=torch.bool, device=self.dev)
         # Static teammate table: _others_idx[a] = the M-1 indices j != a. Drives the batched
         # Pass-1 radar teammate_src + teammate BF (agents folded into the batch dim).
@@ -1050,6 +1074,7 @@ class Explorer:
         self.pf_front_node[idx_t] = -1; self.pf_weight[idx_t] = 0.0; self.pf_dist[idx_t] = 0
         self.pf_path[idx_t] = -1; self.pf_live[idx_t] = 0.0; self.pf_acc[idx_t] = 0.0
         self.pf_seeded[idx_t] = False; self.pf_born[idx_t] = False
+        self.pf_known_prev[idx_t] = False
         self.pf_t0[idx_t] = 0
         self._comm_prev[idx_t] = False
         self.last_action[idx_t]                       = -1
@@ -1105,6 +1130,7 @@ class Explorer:
         self.pf_front_node[idx_t] = -1; self.pf_weight[idx_t] = 0.0; self.pf_dist[idx_t] = 0
         self.pf_path[idx_t] = -1; self.pf_live[idx_t] = 0.0; self.pf_acc[idx_t] = 0.0
         self.pf_seeded[idx_t] = False; self.pf_born[idx_t] = False
+        self.pf_known_prev[idx_t] = False
         self.pf_t0[idx_t] = 0
         self._comm_prev[idx_t] = False
         # Reset comm-gap timer: at reset, last_known_pos is set to actual start positions
@@ -1212,7 +1238,8 @@ class Explorer:
             bf_dist_team[b_arange, j_flat] = dist_j
         info["bf_dist_team"] = bf_dist_team                                         # [B, M, N_max]
 
-    def _pathfront_belief(self, B, info, team_node, comm_bm, frontier_node, edge_free, seen_nodes):
+    def _pathfront_belief(self, B, info, team_node, comm_bm, frontier_node, edge_free, seen_nodes,
+                          escape_node=None, newly_free=None):
         """PATHFRONT belief (EnvCfg.belief_mode=='pathfront'). Two phases on the KNOWN graph: BF particles
         lkp→frontier (transit), then absorbing diffusion (diffuse inward + frontiers lock β=utility, with
         release when a frontier is explored). Sets self._belief_p [B,M,N_max] / _belief_alive [B,M].
@@ -1255,7 +1282,9 @@ class Explorer:
                     lkp_node=lkp_m[fidx], frontier_node=frontier_node[fidx],
                     dist=dist_m[fidx], parent=parent_m[fidx], utility=utility[fidx],
                     nbr_idx=eidx, edge_ok=edge_free[fidx], node_spacing=NR,
-                    node_xy=self.graph.node_xy, Kf=Kf, Lmax=Lmax)
+                    node_xy=self.graph.node_xy, Kf=Kf, Lmax=Lmax,
+                    min_util=float(self.cfg.belief_prune_util),
+                    min_cluster=int(self.cfg.belief_prune_min_cluster))
                 pf_front[fidx, m] = fn; pf_w[fidx, m] = w; pf_d[fidx, m] = dh; pf_pth[fidx, m] = pth
                 pf_live[fidx, m] = 0.0; pf_acc[fidx, m] = 0.0; pf_seed[fidx, m] = False
                 pf_born[fidx, m] = True
@@ -1279,6 +1308,9 @@ class Explorer:
                 nbr_idx=eidx, absorb_gain=float(self.cfg.belief_absorb_gain),
                 beta_max=float(self.cfg.belief_beta_max),
                 diffuse_lambda=float(self.cfg.belief_diffuse_lambda),
+                prune_util=float(self.cfg.belief_prune_util),
+                door_min_util=float(self.cfg.belief_door_min_util),
+                escape_node=escape_node, newly_free=newly_free,
                 seen=seen_nodes, just_frozen=frz)
             pf_live[:, m] = live_m; pf_acc[:, m] = acc_m; pf_seed[:, m] = seed_m; pf_w[:, m] = w_m
             use = pf_born[:, m] & active & ~comm_bm[:, m]
@@ -1385,6 +1417,22 @@ class Explorer:
                 n_unk = nbr_unknown.sum(-1)                                     # [B, N_max] unknown 8-nbrs
                 min_unk = int(self.cfg.pf_frontier_min_unknown)
                 frontier_node = node_free & (n_unk >= min_unk) & (n_unk <= 7)  # [B, N_max] openings only
+                # SPREAD edges = generatable edges whose DESTINATION is still unknown. Belief that means
+                # "he is somewhere past the explored boundary" is held on those unknown nodes, never on the
+                # visible frontier node in front of the observer — the observer can see that node, so
+                # nothing may sit there. known→unknown must be orthogonal ("archi generabili": a diagonal
+                # into the unknown cuts a corner), unknown→unknown stays 8-connected.
+                # ESCAPE nodes = known-free nodes with at least one GENERATABLE orthogonal edge into the
+                # unknown: real ground the teammate could have left the known map through. Deliberately
+                # LAXER than `frontier_node` (whose ≥min_unk gate exists to keep hypothesis CLUSTERS
+                # distinct) so the leading edge of a thin corridor counts too — otherwise, the moment the
+                # observer walks up a corridor and the strict opening disappears, that mass has nowhere to
+                # go, is dumped into the corridor the observer is standing in and erased on the spot
+                # (m50/agent1 t=96: the whole west hypothesis gone in one step while the corridor kept
+                # going for another 20 nodes). Unknown behind a wall does not qualify — not a generatable
+                # edge, so not an escape route.
+                escape_node = node_free & (
+                    info["edge_valid_optim"] & crossing & self._orth_k.view(1, 1, -1)).any(-1)
                 # NEGATIVE-EVIDENCE footprint: nodes where, if the teammate stood there, COMM WOULD HAVE
                 # FIRED — the exact same criterion _comm_check applies to the true teammate position,
                 # now evaluated against every known-free node. Previously this used the MAPPING lidar's
@@ -1424,8 +1472,13 @@ class Explorer:
                 else:
                     would_comm = (eucl < float(self.cfg.comm_range_px)) & ~obst.any(dim=-1)
                 seen_nodes = node_free & would_comm
+                # Nodes revealed THIS step (per observer row): what the push hands frontier mass to.
+                known_prev = self.pf_known_prev.reshape(B, self.N_max)
+                newly_free = node_free & (~known_prev)                           # [B, N_max]
+                known_prev.copy_(node_free)
+                self._pf_seen = seen_nodes                                       # [B, N_max] for the trace
                 self._pathfront_belief(B, info, team_node, comm_bm, frontier_node, known_free.bool(),
-                                       seen_nodes)
+                                       seen_nodes, escape_node, newly_free)
             else:
                 reached_new, p_bel, alive = update_teammate_belief(
                     self.belief_reached.reshape(B, self.M, self.N_max),
@@ -1472,7 +1525,7 @@ class Explorer:
         # teammate_obs=False (ablation) → skip the write, feat[4] stays zero.
         if self.M > 1 and self.cfg.teammate_obs:
             if belief_on:
-                # feat[4] = the UNIFORM Σ=1 belief (max over teammates), masked to known-free nodes.
+                # feat[4] = the Σ=1 belief (max over teammates), masked to known-free nodes.
                 pot = self._belief_p.amax(dim=1)                                  # [B, N_max] Σ=1 per teammate
             else:
                 scale_px = max(1.0, 4.0 * float(self.cfg.nr))
@@ -1493,6 +1546,10 @@ class Explorer:
                 "edge_idx":   self.graph.edge_idx_static,                                      # [N_max, K] static
                 "window_idx_table": self.graph.window_idx_table,                               # [N_max, W²] global idx (-1 pad)
                 "utility":    info["utility"].view(self.N, self.M, self.N_max),                # [N, M, N_max]
+                # nodes where comm WOULD have fired this step = ground the observer has proven empty.
+                # No belief may sit here; dumped so the trace/inspector can check it directly.
+                "belief_seen": (self._pf_seen.view(self.N, self.M, self.N_max).clone()
+                                if getattr(self, "_pf_seen", None) is not None else None),
                 # Utility decomposition (boundary-pixel ribbon vs revealable-volume) per node.
                 "util_boundary": info["util_boundary"].view(self.N, self.M, self.N_max),       # [N, M, N_max]
                 "util_volume":   info["util_volume"].view(self.N, self.M, self.N_max),         # [N, M, N_max]
@@ -1544,6 +1601,24 @@ class Explorer:
             comm_mask = torch.eye(
                 self.M, dtype=torch.bool, device=self.dev
             ).view(1, self.M, self.M).expand(self.N, -1, -1)
+
+        # ---- A KNOWN TEAMMATE'S CELL IS AN OBSTACLE ----------------------------------------------
+        # A move onto the node a teammate is standing on is masked out of the action space, exactly like
+        # a wall. Only while comm holds: out of contact the observer does not know where he is and has
+        # nothing to mask against. This removes the same-node collision at the source instead of leaving
+        # it to the step-time arbitration, and stops the policy spending probability on a cell it cannot
+        # take. Guarded: if this would leave an agent with no legal move at all (a teammate plugging the
+        # only way out of a dead end), the mask is left alone for that agent — being stuck is worse.
+        if self.M > 1:
+            others = self._others_idx                                          # [M, M-1] j != i
+            tm_node = curr_idx_global.unsqueeze(1).expand(-1, self.M, -1)      # [N, M, M] j's node
+            tm_node = torch.gather(tm_node, 2, others.unsqueeze(0).expand(self.N, -1, -1))
+            tm_known = torch.gather(comm_mask, 2, others.unsqueeze(0).expand(self.N, -1, -1))
+            blocked = ((curr_nbr_global.unsqueeze(2) == tm_node.unsqueeze(-1))  # [N, M, M-1, K]
+                       & tm_known.unsqueeze(-1)).any(dim=2)                     # [N, M, K]
+            masked = curr_nbr_valid & (~blocked)
+            keep_old = ~masked.any(dim=-1, keepdim=True)                        # would strand the agent
+            curr_nbr_valid = torch.where(keep_old, curr_nbr_valid, masked)
 
         # ---- CTDE critic-only global state [N, 7] (value head only; actors never see it) ----
         #   [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance]

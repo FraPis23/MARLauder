@@ -396,6 +396,15 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(RUNS_DIR), **kwargs)
 
+    def end_headers(self):
+        # Trace assets are REWRITTEN in place: re-running an eval overwrites trace.json and frames/aN.gif
+        # under the same URL. A cached GIF next to a fresh trace.json is what makes the node overlay and
+        # the map underneath disagree (most visibly at a rendezvous: the graph merges, the map does not).
+        # The browser cannot know the bytes changed, so never let it keep them.
+        if "/traces/" in urlparse(self.path).path:
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/runs":

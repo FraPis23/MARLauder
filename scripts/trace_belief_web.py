@@ -62,8 +62,15 @@ def main() -> None:
     ap.add_argument("--map-idx", type=int, default=50)
     ap.add_argument("--steps", type=int, default=160)
     ap.add_argument("--comm-range", type=float, default=40.0)
+    ap.add_argument("--comm-model", choices=["los", "signal_strength", "ckpt"], default="los",
+                    help="'ckpt' keeps the checkpoint's own comm model/range (as trained)")
     ap.add_argument("--belief-mode", choices=["uniform", "pathfront"], default="pathfront",
                     help="which teammate-belief model to record (bel field)")
+    ap.add_argument("--prune-util", type=float, default=0.0,
+                    help="plausibility pruning (fix C): drop belief mass locked behind frontiers whose "
+                         "utility is below this (0 = off). Sum(p) then falls below 1 = 'teammate lost'.")
+    ap.add_argument("--prune-min-cluster", type=int, default=0,
+                    help="fix C: ignore frontier openings made of fewer than this many nodes at freeze")
     ap.add_argument("--use-policy", action="store_true",
                     help="drive with the TRAINED policy (agents explore & separate on their own) "
                          "instead of the scripted agent1-holds/agent0-walks-away override")
@@ -78,8 +85,11 @@ def main() -> None:
     trace_env = dict(env_peek or {})
     trace_env["use_teammate_belief"] = True
     trace_env["belief_mode"] = args.belief_mode
-    trace_env["comm_model"] = "los"
-    trace_env["comm_range_px"] = float(args.comm_range)
+    trace_env["belief_prune_util"] = float(args.prune_util)
+    trace_env["belief_prune_min_cluster"] = int(args.prune_min_cluster)
+    if args.comm_model != "ckpt":                 # 'ckpt' → leave the trained comm model/range alone
+        trace_env["comm_model"] = args.comm_model
+        trace_env["comm_range_px"] = float(args.comm_range)
 
     if args.use_policy:
         action_fn = None                 # let the TRAINED policy drive → agents explore & separate on their own
@@ -92,6 +102,8 @@ def main() -> None:
         action_fn = build_action_fn(probe)
 
     tag = f"belief_{args.belief_mode}_{'policy' if args.use_policy else 'scripted'}_{args.ckpt.stem}_m{args.map_idx}"
+    if args.prune_util > 0.0 or args.prune_min_cluster > 0:
+        tag += f"_prune{args.prune_util:g}-{args.prune_min_cluster}"
     capture_trace(model, split, trace_env, 2, int(args.map_idx), int(args.steps),
                   args.out, tag, args.device, action_fn=action_fn)
     print(f"[trace] wrote {args.out}/traces/{tag}  → open the inspector and pick the '{tag}' episode")
