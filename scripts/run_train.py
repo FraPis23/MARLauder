@@ -197,6 +197,8 @@ def main() -> None:
             revisit_streak_decay=args.revisit_streak_decay,
             radar_gamma=args.radar_gamma,
             radar_util_norm=args.radar_util_norm,
+            belief_mode=args.belief_mode,
+            radar_team_source=args.radar_team_source,
         ),
         ppo=MAPPOCfg(
             ent_coef=args.ent_coef,

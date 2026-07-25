@@ -102,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="v0.9.1: a NON-recent landing subtracts this from the revisit streak instead of zeroing it — one high-age hop can't launder the debt; working it off takes a sustained run on new/old ground")
     g_reward.add_argument("--radar-gamma",     type=float, default=0.92, help="RADAR feat[5/6] per-hop discount beyond the ego-window horizon. 0.92 mutes frontiers ~45+ hops out (0.4%%/node); 0.97 keeps them visible (~8%% with --radar-util-norm 3)")
     g_reward.add_argument("--radar-util-norm", type=float, default=8.0,  help="RADAR b_util normalization divisor (lower = far frontier mass squashed less)")
+    g_reward.add_argument("--belief-mode",     choices=["uniform", "pathfront"], default="uniform",
+                    help="teammate-position belief model used post-comm-break: 'uniform' geodesic ball (old default) vs 'pathfront' two-phase hypothesis model")
+    g_reward.add_argument("--radar-team-source", choices=["lkp", "belief"], default="lkp",
+                    help="feat[6] RADAR teammate source beyond the ego window: 'lkp' (old default) decays "
+                         "a point at each teammate's last-known node; 'belief' mass-transports the belief "
+                         "FIELD itself (same gamma_r travel-cost decay as feat[5] b_util) so a belief that "
+                         "moved off the lkp (e.g. --belief-mode pathfront) still shows up correctly. "
+                         "Silently falls back to lkp when use_teammate_belief is off")
 
     g_target = ap.add_argument_group("Model ablations & warm-start")
     g_target.add_argument("--gru", action="store_true", help="Enable GRU temporal memory in actor+critic. Default OFF: the model runs feed-forward (both GRUCells bypassed)")

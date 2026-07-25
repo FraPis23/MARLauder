@@ -568,7 +568,8 @@ class GraphLattice:
     def build_radar(
         self,
         info: dict[str, torch.Tensor],
-        teammate_src: torch.Tensor | None = None,   # [N, T] long: teammate last-known node idxs (-1 = none)
+        teammate_src: torch.Tensor | None = None,     # [N, T] long: teammate last-known node idxs (-1 = none)
+        teammate_belief: torch.Tensor | None = None,   # [N, T, N_max]: Σ=1-per-teammate belief mass field
         gamma_r: float = 0.92,
         util_norm: float = 8.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -584,6 +585,13 @@ class GraphLattice:
             walls; never a straight-line projection through a wall;
           - weight = gamma_r ** (hops beyond horizon) — a travel-cost discount, so nearer-beyond
             mass dominates. Normalised by a FIXED constant (stationary — no per-env max).
+
+        teammate_belief (radar_team_source="belief"), when given, REPLACES the point-source
+        teammate_src path for b_teammate: instead of decaying a single distance from each
+        teammate's last-known node, every beyond-horizon node's own belief mass is routed to its
+        gateway via the SAME parent-chain `g` / travel-cost weight `w` used for b_util — so a
+        belief field that has moved off the lkp (e.g. pathfront, bloomed toward a frontier) still
+        shows up correctly discounted at the horizon, instead of radiating from a stale point.
 
         Returns (b_util, b_teammate), each [N, N_max], nonzero only on horizon gateway nodes.
         """
@@ -622,7 +630,16 @@ class GraphLattice:
         b_util = (b_util / float(util_norm)).clamp(0.0, 1.0)
 
         b_team = torch.zeros((N, self.N_max), device=dev)
-        if teammate_src is not None and teammate_src.numel() > 0:
+        if teammate_belief is not None and teammate_belief.numel() > 0:
+            # Mass-transport path: sum each teammate's belief field, keep only the mass sitting
+            # BEYOND the horizon (the rest is already visible to the GAT window directly via
+            # feat[4]), discount it by the same w used for b_util, and drain it to the SAME
+            # gateway node g — one scatter_add over the combined mass, no per-teammate BF lookup
+            # needed since g/w/beyond don't depend on which teammate the mass belongs to.
+            mass = teammate_belief.sum(dim=1)                                         # [N, N_max]
+            src_w = torch.where(beyond, mass * w, torch.zeros_like(mass))
+            b_team.scatter_add_(1, g, src_w)
+        elif teammate_src is not None and teammate_src.numel() > 0:
             T = teammate_src.shape[1]
             for t in range(T):
                 src = teammate_src[:, t]                                              # [N], -1 = none

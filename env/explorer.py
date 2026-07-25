@@ -248,6 +248,17 @@ class EnvCfg:
     # belief_prune_min_cluster drops openings made of fewer than this many frontier nodes at freeze time.
     belief_prune_util: float = 0.0
     belief_prune_min_cluster: int = 0
+    # radar_team_source: what feat[6] (b_team, teammate RADAR) sources beyond the ego window.
+    # "lkp" (default, legacy) = point-source at each teammate's LAST-KNOWN node, decayed by hops
+    # beyond the horizon — independent of belief_mode, blind to where the belief filter thinks the
+    # teammate actually is once it has moved off the lkp. "belief" = mass-transport of the belief
+    # FIELD itself (self._belief_p, Σ=1 per teammate — works with either belief_mode, but only
+    # "pathfront" gives it structure beyond a symmetric ball): every beyond-horizon node's belief
+    # mass is routed down its BF-parent chain to its horizon gateway node and discounted by the same
+    # gamma_r**hops travel-cost decay as feat[5] b_util, so distant belief mass fades exactly like
+    # distant utility mass. Requires use_teammate_belief=True; silently falls back to "lkp" otherwise
+    # (see _refresh_obs).
+    radar_team_source: str = "lkp"
 
     @classmethod
     def from_ckpt_dict(cls, d: dict, **overrides) -> "EnvCfg":
@@ -1495,8 +1506,8 @@ class Explorer:
 
         # ---- RADAR (feat[5] b_util, feat[6] b_teammate): compress the world BEYOND the ego window
         # onto the geodesic receptive-horizon nodes. teammate_src = each OTHER agent's last-known node
-        # (legacy, lkp-based — v3 belief drives ONLY feat[4], radar/φ/geo_pair stay on the lkp path).
-        # teammate_obs=False (ablation) → src None → b_team all-zero (actor blind to teammates).
+        # (legacy, lkp-based — radar_team_source="lkp", the default; φ/geo_pair always stay on this
+        # path regardless). teammate_obs=False (ablation) → src None → b_team all-zero (actor blind).
         if self.M > 1 and self.cfg.teammate_obs:
             lkp = self.last_known_pos[:, torch.arange(self.M, device=self.dev).view(self.M, 1),
                                       self._others_idx, :]                     # [N, M, M-1, 2]
@@ -1505,9 +1516,20 @@ class Explorer:
             teammate_src = (ly * self.graph.LW + lx).reshape(B, self.M - 1)
         else:
             teammate_src = None
+        # radar_team_source="belief": swap the point-source lkp for the belief FIELD itself
+        # (self._belief_p, set above by either belief_mode). Falls back to the lkp path above
+        # when the belief filter didn't run this step (belief_on False — teammate_belief stays
+        # None and build_radar takes the teammate_src branch), so this never blinds feat[6].
+        teammate_belief = None
+        if (self.M > 1 and self.cfg.teammate_obs
+                and self.cfg.radar_team_source == "belief" and belief_on):
+            observer_id = torch.arange(B, device=self.dev) % self.M
+            others = self._others_idx[observer_id]                            # [B, M-1]
+            teammate_belief = torch.gather(
+                self._belief_p, 1, others.unsqueeze(-1).expand(-1, -1, self.N_max))  # [B, M-1, N_max]
         b_util, b_team = self.graph.build_radar(
-            info, teammate_src=teammate_src, gamma_r=float(self.cfg.radar_gamma),
-            util_norm=float(self.cfg.radar_util_norm),
+            info, teammate_src=teammate_src, teammate_belief=teammate_belief,
+            gamma_r=float(self.cfg.radar_gamma), util_norm=float(self.cfg.radar_util_norm),
         )
         info["node_feat"][..., 5] = b_util
         info["node_feat"][..., 6] = b_team
