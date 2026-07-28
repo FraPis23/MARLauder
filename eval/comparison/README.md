@@ -17,7 +17,12 @@ quando l'utente sceglie il checkpoint** (in training: pipeline_v09 sul PC potent
 - **Metriche = quelle NATIVE IR2** (scelta utente), CSV con colonne
   `eps,num_robots,max_dist,steps,explored,success,connectivity`:
   - `max_dist` (headline): max tra i robot della distanza percorsa cumulata (px) a fine episodio.
-  - `explored`: explored rate a fine episodio (unione team, come IR2 evaluate_team_exploration_rate).
+  - `explored`: **NON è l'unione** (il testo precedente diceva "unione team" ed era sbagliato —
+    corretto 2026-07-28). `evaluate_team_exploration_rate` (IR2 env.py:624-630) fa la **media sugli
+    agenti** di `evaluate_exploration_rate(a)`, che legge `all_robot_belief[a][a]`, cioè la mappa
+    **propria** di ciascun robot. Pesa: v10 ha own media ≈0.70 contro unione 0.76-0.82, quindi
+    riportare l'unione ci regalerebbe ~8 punti inesistenti. L'unione resta come colonna extra
+    `explored_union`, in appendice, mai al posto di `explored`.
   - `success`: criterio IR2 — OGNI robot ha ≥99% della mappa nella PROPRIA belief
     (IR2 env.py:600-603). NON è l'unione: la condivisione è parte del task.
   - `connectivity`: booleano di fine episodio — tutti i robot in un unico "flock" connesso nel
@@ -55,9 +60,35 @@ Tutto in `IR2-.../comparison/` — file originali IR2 INTATTI:
 - Run: `docker exec marlauder bash /workspace/IR2-Multi-Robot-RL-Exploration/comparison/run_ir2_comparison.sh`
   (~4h, NUM_META_AGENT=4). Log: `comparison/run_full.log`.
 
-## Lato MARLauder — DA FARE quando l'utente indica il checkpoint
+## Lato MARLauder — FATTO 2026-07-28
 
-Costruire `MARLauder/scripts/eval_comparison.py`:
+`scripts/eval_comparison.py` + `analyze.py` (questa dir) sono scritti. Uso:
+
+```bash
+docker exec marlauder bash -lc 'cd /workspace/MARLauder && \
+  python scripts/eval_comparison.py --ckpt runs/<run>/ckpt_best.pt --tag <nome>'
+docker exec marlauder bash -lc 'cd /workspace/MARLauder && \
+  python eval/comparison/analyze.py --tag <nome>'
+```
+
+**Allineamento della terminazione (`EnvCfg.done_mode`, aggiunto 2026-07-28).** MARLauder termina
+sull'**unione** ≥99%; IR2 su **ogni robot** ≥99% nella propria belief (`env.check_done`), e la loro
+colonna `success` È quel flag (`test_multi_robot_worker.py:122`). Sotto la regola union lo scambio è
+facoltativo — l'unione è completa che la mappa sia arrivata all'altro robot o no — quindi valutare
+MARLauder così risponderebbe a una domanda più facile. `eval_comparison.py` forza `done_mode="own"`.
+Il default resta `"union"`: le run esistenti non cambiano di una virgola.
+Il flag `--done-mode own` esiste anche per il training, ma **non è una modifica neutra**: con la
+regola own il `completion_bonus=10` non scatta quasi mai sulle mappe difficili (v10 arriva a own
+min 0.68 in 512 step), e `novel_scan` paga celle nuove all'**unione**, quindi l'agente non guadagna
+nulla per l'ultimo tratto della *propria* mappa — episodi più lunghi, gradiente zero. Allineare il
+training richiede di rendere own-based anche la reward, non solo lo stop.
+
+**Già identico, niente da correggere**: sensore 80 px su entrambi; modello radio identico
+(path-loss log-distance, `P_T=-20`, `thresh=-70`, `γ=2/4`, `d₀=35`, `PL₀=31`, `X_g,K ~ U[0,13]`
+ricampionati per episodio — `PROXIMITY_COMMS_RANGE 30-150` in IR2 è codice morto sotto
+`USE_SIGNAL_STRENGTH_NOT_PROXIMITY=True`); denominatore coverage = px liberi del ground truth.
+
+Spec implementata (per riferimento):
 1. Carica il ckpt con `eval/ckpt_loader.load_model_from_ckpt` (auto-arch: n_layers/gru/gat dal ckpt).
 2. Per ogni split e M∈{2,4}: env sui 100 `pack_idx` di `map_indices_{split}.json`
    (`Explorer.reload_map(env_idx, map_idx)` resetta TUTTO lo stato), `max_episode_steps` =

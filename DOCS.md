@@ -4,8 +4,9 @@ GPU-vectorized graph MAPPO for cooperative exploration. Multi-agent with intermi
 signal-strength communication. A genuinely **learned** policy: no analytic guidepost, no
 hand-picked target, no strategic candidate head — the actor steers purely from the ego-window
 GAT features (local frontier utility + the beyond-window "radar" channels) plus two rendezvous
-scalars, through a GRU and a pointer action head. Per-agent privileged novel-scan reward + dense
-rendezvous economy; count-invariant CTDE critic (mean⊕max pooling).
+scalars, through a feed-forward trunk (`--gru` re-enables the recurrent cell) and a pointer action
+head. Per-agent privileged novel-scan reward + a rendezvous economy: dense approach shaping plus a
+sync-event payoff for the map actually exchanged; count-invariant CTDE critic (mean⊕max pooling).
 
 ---
 
@@ -33,7 +34,7 @@ MARLauder/
 | `maps.py` | Load preprocessed `data/<split>/maps.npy` + `meta.npz`; sample N maps to GPU. `MultiSplit` (weighted union of splits, curriculum). |
 | `frontier.py` | Torch conv2d frontier detector. `compute_frontier(occupancy)` → bool [N,H,W]. Frontier = FREE cell with 2..7 UNKNOWN neighbors. |
 | `graph_lattice.py` | Core graph manager. 8-neighbor lattice on free cells, reachability flood-fill, collision-checked edges, integral-image utility. `bf_from_target(info, target, dist_init)` — overwrite-mode warm-startable Bellman-Ford from any source (BF-from-curr, BF-from-teammate). `build_radar(info, teammate_src, gamma_r)` — compresses the known world BEYOND the ego window onto the geodesic horizon gateway nodes → `b_util` (feat[5]) + `b_teammate` (feat[6]). `extract_local_window(info)` — slices the `(2·n_hops+3)²` ego window per agent. `curr_idx` from O(1) floor-divide. |
-| `explorer.py` | Vectorized environment. Per-agent occupancy + positions + `last_known_pos[N,M,M,2]` + `t_last_comm` (staleness timer) + `visited_step` + `_own_expl_at_comm` (surplus baseline) + BF warm-start caches + `_rdv_phi_prev`/`_rdv_gate`. `step(action)`: sub-step LiDAR move, wall revert + **asymmetric agent-agent collision** (lower-priority agent yields via per-episode `_collision_key`), `_comm_check` (signal-strength or LOS), `fuse_maps`, reward assembly, `_refresh_obs`, then the dense `rdv_dense` term (needs the post-refresh geodesic-to-teammate field). `_refresh_obs` (3-pass, agents batched into B=N·M): build graph + BF-from-curr + BF-from-teammate + `build_radar`; cross-agent feat[4] teammate potential; `extract_local_window`; also builds `critic_global[7]` and `agent_scalars[N,M,2]`. `reload_map` for eval. `EnvCfg.from_ckpt_dict(d, **overrides)` rebuilds cfg from a checkpoint (filters unknown keys → old ckpts load). |
+| `explorer.py` | Vectorized environment. Per-agent occupancy + positions + `last_known_pos[N,M,M,2]` + `t_last_comm` (staleness timer) + `visited_step` + `_own_expl_at_comm` (surplus baseline) + BF warm-start caches + `_rdv_phi_prev`/`_rdv_gate`. `step(action)`: sub-step LiDAR move, wall revert + **asymmetric agent-agent collision** (lower-priority agent yields via per-episode `_collision_key`), `_comm_check` (signal-strength or LOS), `_sync_rewards` (PRE-fusion map set difference — must run before the maps are merged), `fuse_maps`, reward assembly, `_refresh_obs`, then the dense `rdv_dense` term (needs the post-refresh geodesic-to-teammate field). `_refresh_obs` (3-pass, agents batched into B=N·M): build graph + BF-from-curr + BF-from-teammate + `build_radar`; cross-agent feat[4] teammate potential; `extract_local_window`; also builds `critic_global[7]` = [explored, t/T, geo_pair, cov_rate, redundancy, sync_surplus, sync_staleness] and `agent_scalars[N,M,2]`. Occupancy reductions for the whole step come from one `_count_occupancy()` pass cached in `self._occ_counts`. `reload_map` for eval. `EnvCfg.from_ckpt_dict(d, **overrides)` rebuilds cfg from a checkpoint (filters unknown keys → old ckpts load). |
 | `teammate_belief.py` | Teammate-state belief scaffold (last-known pos + staleness σ-inflation). |
 
 ### models/
@@ -86,7 +87,8 @@ WarpWorld.gt_torch  +  occupancy_logodds_torch  +  occupancy_torch
    │   1. decode action (K=8 slot) via curr_nbr_global → target node world coord
    │   2. path-follow K_sub sub-steps: Warp LiDAR per sub-step (+ asymmetric collision)
    │   3. _comm_check + fuse_maps + update last_known_pos / t_last_comm
-   │   4. per-agent reward: novel_scan − revisit − stall + completion − step
+   │   3b. _sync_rewards (PRE-fusion set difference, rising-edge + min-gap gated)
+   │   4. per-agent reward: novel_scan − revisit − stall + sync + completion − step
    ▼
    │ _refresh_obs (agents batched into B = N·M):
    │   compute_frontier(occupancy)                        (torch conv2d)
@@ -96,7 +98,8 @@ WarpWorld.gt_torch  +  occupancy_logodds_torch  +  occupancy_torch
    │   build_radar(teammate_src) → feat[5] b_util, feat[6] b_teammate
    │   feat[4] teammate potential (cross-agent, global)
    │   extract_local_window → ego window (2·n_hops+3)²
-   │   critic_global[7] + agent_scalars[N,M,2]=[∆M gate, staleness]
+   │   critic_global[7]=[explored, t/T, geo_pair, cov_rate, redundancy,
+   │                       sync_surplus, sync_staleness] + agent_scalars[N,M,2]
    │   5. rdv_dense = w · g · (φ_prev − φ_now)   (added to reward, post-refresh)
    ▼
 obs dict [N, M, ...] → MarlActorCritic.act(obs, h_act, h_crit)
@@ -151,16 +154,24 @@ g              = clamp(∆M / (rdv_offer_frac · own_map_at_last_sync), 0, 1)   
 φ              = geodesic(curr → owed-teammate lkp) / diam
 rdv_dense[a]   = w · g · (φ_prev − φ_now)                                    # NET geodesic approach
 
+# SYNC EVENT (v11, M>1, computed on the PRE-fusion maps):
+give_ij        = |M_i \ M_j| / scan_norm_nodes                               # map I hand over
+paid_ij        = rising_edge(comm_ij) AND (t − t_last_paid_sync_ij ≥ sync_min_gap)
+sync[a]        = ζ_g · Σ_j paid_aj · (give_aj + ρ · give_ja)
+
 # Final reward:
 reward[a] = α · novel_scan[a]
           − γ · revisit_pen[a]
           − δ_stall · stall_pen[a]
+          + sync[a]
           + 1{explored ≥ 0.99} · completion_bonus
           − step_penalty
           + rdv_dense[a]
 ```
 
-Defaults: `α=1.0`, `γ=0.10`, `δ_stall=0.1`, `completion_bonus=10.0`, `step_penalty_coef=0.015`, `w(rdv)=0.10`, `rdv_offer_frac=0.15`, `W=8`.
+Defaults: `α=1.0`, `γ=0.10`, `δ_stall=0.1`, `completion_bonus=10.0`, `step_penalty_coef=0.015`, `w(rdv)=1.0`, `rdv_offer_frac=0.15`, `W=16`, `ζ_g=0` (OFF; 0.25 is the calibrated value), `ρ=0.5`, `sync_min_gap=32`.
+
+**Sync-event reward (`sync`, v11)** — the OBJECTIVE term for rendezvous. `rdv_dense` is telescoping shaping: the net payoff of a whole separate→approach→meet cycle is only `w·g·φ_sep` (measured 0.045 at `w=0.10`, and still just 1.13 at `w=2.5`) against a measured 1.7-1.9 detour cost, so no dense weight can make meeting worth it — past `w≈2` it turns into a chase term. What pays for a rendezvous has to be the exchange itself. Two guards make it farm-proof: payment only on the **rising edge** of comm (a permanent comm-boundary tether — continuous comm with disjoint sensing, which the signal-strength model makes physically possible — earns exactly zero), and `sync_min_gap` (a re-contact sooner than that still FUSES, only the payment is suppressed). Frequency-farming is impossible by conservation: `give` is a set difference over monotone maps, so syncing at t1 then t2 pays exactly what syncing only at t2 pays. Calibration at `ζ_g=0.25, ρ=0.5`: 2.55 per sync after ~200 steps apart, per-episode ceiling 6.5 vs `novel` 17.3 — "meeting is worth 37.5% of everything you found since you parted". `ρ<1` keeps `give` dominant while still paying the map-poor agent for showing up. Properties are pinned by `scripts/14_test_sync_reward.py`.
 
 **Privileged novel-scan credit (IR2-style `r_f`)**: pays only cells **new to the team union** — a follower scanning a leader's wake earns 0, so splitting up is the highest-paying policy by construction. Privileged (training-only, CTDE; the deployed actor never sees the union). Both-scan-same-cell ties credit both (simultaneous discovery). `scan_self_delta` remains as the logged diagnostic `reward/scan_self_diag`. **There is deliberately NO separation / proximity penalty** — the design constraint is that novel-scan does the spreading, so agents never "fear the only path".
 

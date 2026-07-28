@@ -4,6 +4,176 @@ Session-based log of design decisions, architectural understanding, observed pro
 
 ---
 
+## Session 2026-07-28 — allineamento env a IR2 per la comparison (nessuna run lanciata)
+
+Solo allineamento: gli strumenti sono pronti, la comparison **non è stata eseguita** (richiesta
+utente). Nessun numero MARLauder-vs-IR2 in questa sessione.
+
+### Disallineamenti trovati
+
+1. **Terminazione.** MARLauder ferma l'episodio quando l'**unione** della squadra è al 99%; IR2
+   quando **ogni robot** ha il 99% nella *propria* belief (`env.check_done`, loop sui robot), e la
+   loro colonna `success` **è** quel flag (`test_multi_robot_worker.py:122`). Sotto la regola union
+   lo scambio è facoltativo — l'unione è completa che la mappa sia arrivata all'altro robot o no —
+   quindi valutare MARLauder così risponde a una domanda più facile.
+2. **`explored` non è l'unione, e il README diceva il contrario.**
+   `evaluate_team_exploration_rate` (IR2 `env.py:624-630`) fa la **media sugli agenti** di
+   `all_robot_belief[a][a]`, cioè la mappa propria. v10 ha own media ≈0.70 contro unione 0.76-0.82:
+   riportare l'unione ci avrebbe dato ~8 punti inesistenti.
+
+**Già identici, niente da toccare**: sensore 80 px su entrambi; modello radio identico (tutte e 11
+le costanti path-loss coincidono — `PROXIMITY_COMMS_RANGE` in IR2 è codice morto sotto
+`USE_SIGNAL_STRENGTH_NOT_PROXIMITY=True`); denominatore coverage = px liberi del ground truth;
+parity del dataset già verificata bit-a-bit.
+
+### Modifiche
+
+- **`EnvCfg.done_mode: "union" | "own"`** + `--done-mode`. `done_frac` calcolato una volta accanto a
+  `own_cov` e usato da entrambi i siti di terminazione (reward `terminated_now` e `terminated`).
+  Default `"union"` → il ramo esistente è `done_frac = explored_rate`, quindi **nessuna run storica
+  cambia**. `"own"` = `own_cov.amin(dim=1)`, la regola IR2.
+  **Non è neutro in training**: con `"own"` il `completion_bonus=10` non scatta quasi mai sulle
+  mappe difficili (v10 arriva a own min 0.68 in 512 step) e `novel_scan` paga celle nuove
+  all'**unione**, quindi l'agente non guadagna nulla per l'ultimo tratto della *propria* mappa —
+  episodi più lunghi, gradiente zero. Allineare il training richiede una reward own-based, non solo
+  lo stop.
+- **`info["comm_mask"]`** `[N, M, M]` pre-auto-reset: `comm_any` collassa la maschera a un bool,
+  mentre la connectivity IR2 è transitiva (relay multi-hop) e a M=4 serve il grafo.
+- **`scripts/eval_comparison.py`** (nuovo): forza `done_mode="own"`, cap nativi IR2 (196/196/384),
+  emette il CSV IR2 esatto (`eps,num_robots,max_dist,steps,explored,success,connectivity`) più
+  `explored_union` in appendice, sulle 100 mappe fisse di `map_indices_{split}.json`, M∈{2,4}
+  (M=4 zero-shot: nessun parametro del modello è dimensionato su `n_agents` — verificato).
+- **`eval/comparison/analyze.py`** (nuovo): tabella affiancata per cella + Wilcoxon appaiato per
+  mappa. Nessun test su `steps` (unità diverse tra i due sistemi: un p-value lì inviterebbe a una
+  lettura falsa). Mai medie tra split.
+- **README della comparison** corretto sul punto 2 + sezione d'uso.
+
+### Due bug di riproducibilità trovati scrivendo lo script
+
+- `reseed_channel_noise` va chiamato **prima** dei `reload_map`: il rumore di shadowing si estrae
+  durante il reset, quindi chiamarlo dopo pinnava uno stream da cui nessuno pescava più.
+- Il seed della **formazione di partenza** non era pinnato (`_spread_starts_graph` pesca da
+  `env.rng`, e i ckpt pre-v11 hanno `map_seed=None`): due run dello stesso ckpt sulle stesse mappe
+  davano max_dist 2021 vs 2016. Ora `env.rng` è ri-chiavato **per indice mappa**, quindi il
+  risultato non dipende nemmeno da `--batch`.
+
+---
+
+## Session 2026-07-27 — v11: perché il rendezvous non poteva emergere + pulizia
+
+### Diagnosi (misurata su `runs/v10_difficult_20260724_073601/ckpt_best.pt`)
+
+Baseline `eval_best.py`, test/complex, 512 step, 32 mappe:
+`score +0.283 · auc 0.605 · succ 0.31 · idle 0.67 · imbN 0.214 · ownAUC 0.442 · syncGap 0.087 ·
+nSync 2.6 · duty 0.10 · maxGap 327 · scoreOwn +0.120`. Mappa peggiore: union 0.990 con il robot
+più debole a 0.508. Cross-check su codice v10 intatto (worktree separato, probe sequenziale):
+auc 0.589, ownAUC 0.447, syncGap 0.125, nSync 4.1, duty 0.112 — coerente.
+
+**Tre cause indipendenti, tutte verificate nel codice:**
+
+1. **Nessun termine di obiettivo per lo scambio.** `rdv_dense = w·g·(φ_prev−φ_now)` è shaping
+   telescopico: il payoff netto di un ciclo separazione→avvicinamento→incontro è solo `w·g·φ_sep`.
+   Con φ_sep≈0.45 misurato: **0.045** a w=0.10, e **1.13** anche a w=2.5 — contro un costo di
+   detour misurato di **1.7–1.9**. Nessun peso lo risolve; sopra w≈2 diventa un termine di
+   inseguimento (0.05–0.08/step, sopra il novel per step produttivo). Il commento in EnvCfg
+   calibrava il valore PER STEP e non guardava l'integrale per ciclo.
+2. **L'obiettivo non ha mai avuto bisogno dello scambio.** `novel_scan`, la terminazione e
+   `eval/score` sono tutti sull'UNIONE della squadra → le celle ricevute per fusione pagano zero.
+3. **L'attore quasi non vedeva il compagno.** feat[4] era la belief Σ=1 **senza** peak
+   normalization (il docstring la prometteva da sempre): l'ampiezza cala al crescere della zona di
+   incertezza, cioè è più debole proprio quando i due sono separati da più tempo. Misure in-window
+   su v10: picco 0.07–0.26 e canale **assente nel 39–43% degli step**, contro utility 0.44–0.48
+   presente nel ~90%. feat[6] aveva lo stesso problema di scala (scatter di massa Σ=1 contro
+   `b_util` che scatter-a `utility/util_norm`, con lo stesso clamp condiviso).
+
+### Fix applicati (tutti arch-compatibili: `F_IN`=7 e `CRITIC_GLOBAL_DIM`=7 invariati)
+
+- **`Explorer._sync_rewards`** — premio sull'EVENTO di sync: `ζ_g·(give + ρ·recv)/scan_norm`, con
+  `give_ij = |M_i \ M_j|` sulle mappe PRE-fusione. Pagato solo sul **fronte di salita** della comm
+  e solo ≥ `sync_min_gap` step dopo l'ultimo sync pagato. Non farmabile per frequenza: `give` è una
+  differenza insiemistica su mappe monotone, quindi sync a t1 (A) + t2 (B) paga |A|+|B|, identico a
+  sincronizzare solo a t2. Il baseline `last_meeting_node_mask` del vecchio `_setop_rewards`
+  (cancellato in `26ed8eb`) non serve: essendo l'unione post-fusione e le mappe monotone,
+  `(M_i\baseline)\M_j == M_i\M_j`. Niente tensore persistente, niente doppio loop Python su M².
+  Calibrazione: ζ_g=0.25, ρ=0.5 → 2.55 per un sync dopo ~200 step separati (margine ~1.4×);
+  tetto per episodio 6.5 contro novel 17.3 → lo scambio vale il 37.5% di quanto trovato dalla
+  separazione in poi. Il vecchio ζ_give=0.06 avrebbe pagato 0.41 = 0.22× il costo.
+- **`--rdv-weight` 0.10 → 1.0**: un hop di avvicinamento a gate pieno paga 0.020 contro 0.015–0.021
+  di step penalty, cioè **rimborsa esattamente il viaggio** e lascia la decisione al premio di sync.
+- **feat[4] peak-normalizzata**, **feat[6] row-normalizzata** (distribuzione direzionale, stessa
+  scala per `--radar-team-source lkp` e `belief`), **`b_util` con squash morbido** `m/(m+util_norm)`
+  invece di `m/util_norm` + clamp: a util_norm=3 il clamp mordeva sul 10–25% dei gateway ATTIVI,
+  appiattendo a 1.0 proprio i più forti.
+- **`critic_global`: `idle_frac`/`imbalance` → `sync_surplus`/`sync_staleness`**, in place (dim
+  resta 7 → nessun cambio di state_dict, il warm-start continua a funzionare). Motivo: il vettore
+  deve contenere ciò che predice il RETURN; `imbalance` compare solo in `eval/score` (che non è una
+  reward) e `idle_frac` è già coperto da `cov_rate`+`redundancy`. Senza la coppia sync, V(s) non
+  può rappresentare "stiamo per guadagnare molto incontrandoci" e l'advantage dell'avvicinamento
+  resta ≈0.
+- **Bug: gate a 1.0 al primo step.** `_reset_envs` azzerava `_own_expl_at_comm` prima del primo
+  `_refresh_obs` → `offer = own_expl − 0`, `scale = clamp(0, min=50)` → `g=1.0`, "urgenza massima
+  di rendezvous" con i due su nodi adiacenti. Ora seminato con la mappa post-primo-scan.
+- **`revisit_streak_cap`** (default `inf` = comportamento legacy), `--map-seed`, generatore dedicato
+  per il rumore SS + `reseed_channel_noise()`, `--init-ckpt` shape-safe (prima un cambio di
+  larghezza sollevava `RuntimeError` a metà pipeline).
+- **Metriche nuove**, additive, `eval/score` intoccato: `own_coverage_auc/final`, `sync_gap`,
+  `n_syncs`, `max_comm_gap`, `score_own` — in ENTRAMBE le copie dello score (`driver` e
+  `eval_best`). Guardie coperte da `scripts/14_test_sync_reward.py` (tether, sync reale, min-gap,
+  conservazione, integrazione).
+
+### GOTCHA — il punteggio di v10 è un numero su mappe di TRAINING
+
+`--eval-split` redirige solo la GIF/trace di milestone. La eval suite in-training gira su
+`train_eval_name = cfg.split` (`train/driver.py`), quindi `eval/score=+0.369` e `auc=0.739` di v10
+sono su `train/difficult`, e la selezione del best-ckpt è avvenuta su mappe viste. Lo stesso
+checkpoint fa `auc 0.605` su test/complex. `pipeline_v11_R2.sh` passa `--eval-suite-splits
+test/complex`.
+
+### BUG APERTO (non corretto: R2 è in training, correggerlo cambierebbe i risultati)
+
+**feat[3] `age` è morto per la maggior parte degli env.** `_refresh_obs` chiama
+`graph.build(..., current_step=int(self.t.max().item()))` — uno SCALARE, il massimo su tutti gli
+env — mentre `visited_step` è per-env. `age = clamp((t_max − visited_step)/visit_age_window, 0, 1)`,
+quindi ogni env più indietro di `visit_age_window`=16 step rispetto al leader legge age=1 ovunque:
+il suo agente **non vede la propria scia fresca**, mentre la penalità revisit continua a punirlo se
+ci ritorna sopra.
+
+Verificato empiricamente:
+- env0 fermo a t=8, env1 portato a t=500 → i nodi in-window di env0 con recency passano da **5 a 0**
+  senza che env0 sia stato toccato.
+- Con terminazioni anticipate a desincronizzare i clock (come nel training vero, succ 0.31–0.69):
+  lag medio 16.7 step, **42.8% delle coppie (step, env) con canale age completamente morto**.
+
+Fix: passare `self.t` per-env (con `repeat_interleave(M)` per le righe B=N·M) invece dello scalare.
+Candidato forte per la prossima run — plausibilmente legato al problema dei loop.
+
+### Pulizia (verificata bit-per-bit: 692 tensori, 0 differenze)
+
+Harness di equivalenza su CPU (stesso seed, stesse azioni, confronto di ogni reward/metrica/obs su
+12 step × 3 env) usato dopo ogni modifica. Nota metodologica: `_collision_key` è estratto dal RNG
+GLOBALE di torch in `Explorer.__init__`; senza `torch.manual_seed` due run divergono al primo
+contatto fra agenti — sembrava una regressione a t10 ed era l'harness.
+
+- **Dedup delle riduzioni full-canvas**: `(occ == _FREE)` / `(occ != _UNKNOWN)` erano ricalcolate in
+  3 punti (step, `_update_last_known_pos`, `_refresh_obs`) → 4 confronti e 5 riduzioni su
+  `[N, M, H, W]` per step invece di 2 e 3. Ora un solo passaggio in `_count_occupancy()`, cache in
+  `self._occ_counts`, consumata e azzerata da `_refresh_obs` (i path di reset ricalcolano). A N=32
+  sono ~130M confronti di elementi risparmiati per step.
+- **Footprint LOS della belief**: `pts = own + t·diff` a `[B, N_max, Sl, 2]` erano **81 MB di float
+  allocati ogni step** (B=64, N_max=3969, Sl=40), più due tensori int64 da 81 MB. Ora x e y sono
+  costruiti separatamente: stessa aritmetica per elemento, intermedio eliminato.
+- `torch.linspace` dei campioni LOS ora costruito una volta (`self._los_t`) invece che per step, in
+  entrambi i punti d'uso.
+- Import morti rimossi (6), `sensor_range_px` default di `GraphLattice` riallineato a 80 px (mai
+  usato: Explorer lo passa sempre — era rimasto a 60, il LiDAR pre-2026-06).
+- Commenti obsoleti corretti: riferimenti a `cand_max_comm_gap` e alla StrategicHead (cancellata
+  2026-06-29), "σ-inflation timer" (predittore gaussiano v0.6, rimosso), docstring che descrivono
+  la GRU come attiva (`use_gru` è False di default dal 2026-07-15), `guidepost_iters` /
+  `guidepost_path_max` (nome storico: ora sono puri limiti di iterazione BF — i nomi dei campi
+  EnvCfg restano perché persistiti nei checkpoint).
+
+---
+
 ## Session 2026-07-14/15 — comparison MARLauder vs IR2: lato IR2 COMPLETO
 
 **Protocollo congelato + baseline IR2 prodotta. TUTTO il necessario per riprendere da zero è in

@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from env.explorer import EnvCfg, Explorer
-from env.maps import load_split, sample_batch
+from env.maps import load_split
 from eval.rollout import EvalCfg, EvalRollout
 from models.actor_critic import MarlActorCritic
 
@@ -52,6 +52,14 @@ def main() -> None:
     print(f"       n_agents={n_agents}  d={d_hidden}  heads={n_heads}  layers={n_layers}")
 
     model = MarlActorCritic(n_agents=n_agents, d=d_hidden, n_heads=n_heads, n_layers=n_layers).to(args.device)
+    # Pre-drop shape-mismatched keys: strict=False only forgives missing/unexpected KEYS, a width
+    # change (F_IN, CRITIC_GLOBAL_DIM, ...) still raises. Report it — a silently random submodule
+    # turns every number this script prints into fiction.
+    _msd = model.state_dict()
+    _bad = [k for k, v in sd.items() if k in _msd and _msd[k].shape != v.shape]
+    if _bad:
+        print(f"[load] WARNING: {len(_bad)} shape-mismatched key(s) DROPPED (randomly initialized): {_bad[:5]}")
+        sd = {k: v for k, v in sd.items() if k not in _bad}
     model.load_state_dict(sd, strict=False)
     model.use_gru = bool(cfg_dict.get("use_gru", True))   # honor a GRU-ablation checkpoint
     _env_d = cfg_dict.get("env", {}) if isinstance(cfg_dict, dict) else {}

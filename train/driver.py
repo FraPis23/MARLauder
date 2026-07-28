@@ -297,8 +297,6 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
                    split_name: str | None = None) -> None:
     """Run a deterministic episode on (split_name|eval_split, map_idx) and save a GIF."""
     import imageio.v2 as imageio
-    import numpy as np
-    from env.maps import sample_batch
     from eval.rollout import EvalCfg, EvalRollout
     from env.explorer import EnvCfg as _EnvCfg, Explorer as _Explorer
     from env.maps import load_split as _load
@@ -364,12 +362,19 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
     aucs, succ, imbs, ovs, duties, s90s = [], [], [], [], [], []
     fairs, score_maps = [], []          # D2: Jain fairness + per-map score (map-luck/noise)
     concs, idles = [], []               # temporal co-activity + per-agent idle rate
+    # v11 coordination block: what each robot actually ends up holding, and whether they met.
+    own_aucs, own_finals, sync_gaps = [], [], []
+    n_sync_list, max_gaps, score_own_maps = [], [], []
     imb_denom = (1.0 - 1.0 / M) if M > 1 else 1.0   # max possible imbalance → normalize to [0,1]
     # Concurrency window: an agent is "active" if it found ≥1 union-new cell in the last
     # W_CONC steps. concurrency_map = fraction of (post-warmup) steps where ALL agents are
     # active-in-window. Jain fairness catches one agent idle the WHOLE episode; concurrency
     # catches agents that ALTERNATE (Jain-fair but never working at the same time).
     W_CONC = 10
+    # Pin the radio-shadowing stream: without this the per-episode comm range depends on how many
+    # actions the policy sampled earlier, so eval/comm_duty (the tether detector) drifts ~30%
+    # between two evaluations of the SAME checkpoint.
+    eval_env.reseed_channel_noise(cfg.seed + 777)
     for midx in eval_map_idx:
         eval_env.reload_map(env_idx=0, map_idx=int(midx))
         h_act, h_crit = model.init_hidden(1, cfg.device)
@@ -377,6 +382,9 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
         er_curve: list[float] = []
         ov_sum = 0.0
         duty_sum = 0.0
+        own_curve: list[float] = []      # min-over-agents own-map coverage per step
+        n_syncs = 0
+        gap_now, gap_max = 0, 0
         novel_final = None
         novel_prev = torch.zeros(M, device=cfg.device)   # per-agent cumulative at t-1
         active_hist: list[torch.Tensor] = []             # per step: [M] bool, found novel this step
@@ -390,7 +398,14 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
             er = float(info["explored_rate"][0].item())
             er_curve.append(er)
             ov_sum += float(info["metrics"]["sensing_overlap"].item())
-            duty_sum += float(info["metrics"]["comm_duty_cycle"].item())
+            duty = float(info["metrics"]["comm_duty_cycle"].item())
+            duty_sum += duty
+            # Coordination trace: what the WEAKEST robot actually holds, how many PAID syncs
+            # happened, and the longest stretch with no contact at all.
+            own_curve.append(float(info["own_cov"][0].min().item()))
+            n_syncs += int(info["sync_paid"][0].max().item() > 0.0)
+            gap_now = 0 if duty > 0.0 else gap_now + 1
+            gap_max = max(gap_max, gap_now)
             novel_final = info["novel_cells_ep"][0]
             # Per-step per-agent novel = Δ cumulative; "active" this step if it found anything.
             novel_step = (novel_final - novel_prev).clamp(min=0.0)
@@ -407,6 +422,12 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
         ovs.append(ov_sum / max(1, steps))
         duties.append(duty_sum / max(1, steps))
         s90s.append(s90)
+        # Own-map AUC, padded exactly like coverage_auc so an early finish still scores higher.
+        own_aucs.append((sum(own_curve) + own_curve[-1] * (T - steps)) / T)
+        own_finals.append(own_curve[-1])
+        sync_gaps.append(max(0.0, er_curve[-1] - own_curve[-1]))
+        n_sync_list.append(float(n_syncs))
+        max_gaps.append(float(gap_max))
         total_novel = float(novel_final.sum().item())
         if total_novel > 0:
             imb_m = float(novel_final.max().item()) / total_novel - 1.0 / M
@@ -435,10 +456,15 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
         idles.append(idle_m)
         # D2: per-map score on the NORMALIZED imbalance so equity is on the same [0,1]
         # footing as coverage_auc (raw imb spans only ~[0, 1−1/M] → was a near-free rider).
-        score_maps.append(aucs[-1]
-                          - cfg.score_w_imbalance * (imb_m / imb_denom)
-                          - cfg.score_w_overlap * ovs[-1]
-                          - cfg.score_w_idle * idle_m)
+        penalty = (cfg.score_w_imbalance * (imb_m / imb_denom)
+                   + cfg.score_w_overlap * ovs[-1]
+                   + cfg.score_w_idle * idle_m)
+        score_maps.append(aucs[-1] - penalty)
+        # score_own: the SAME score with the union coverage swapped for what the weakest robot
+        # actually holds. Emitted alongside, never in place of, eval/score — best-ckpt selection,
+        # the curriculum gate and every historical run keep their meaning. Because the penalty is
+        # identical, (score − score_own) is exactly the AUC of the sync gap.
+        score_own_maps.append(own_aucs[-1] - penalty)
     if was_training:
         model.train()
     n = float(len(eval_map_idx))
@@ -447,6 +473,13 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
     var_score = sum((s - mean_score) ** 2 for s in score_maps) / n
     out = {
         "eval/coverage_auc":      sum(aucs) / n,
+        # ---- v11 coordination block (diagnostic; does NOT feed eval/score) ----
+        "eval/own_coverage_auc":  sum(own_aucs) / n,      # AUC of min-over-agents own-map coverage
+        "eval/own_coverage_final": sum(own_finals) / n,
+        "eval/sync_gap":          sum(sync_gaps) / n,     # union − weakest robot's own map at the end
+        "eval/n_syncs":           sum(n_sync_list) / n,   # PAID sync events per episode
+        "eval/max_comm_gap":      sum(max_gaps) / n,      # longest stretch with no contact (steps)
+        "eval/score_own":         sum(score_own_maps) / n,
         "eval/contrib_imbalance": mean_imb,                       # raw (kept for continuity)
         "eval/contrib_imbalance_norm": mean_imb / imb_denom,      # [0,1] — drives the score
         "eval/fairness":          sum(fairs) / n,                 # Jain index, 1 = equal (idle catcher)
@@ -469,8 +502,9 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     cfg.out_dir = Path(cfg.out_dir)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(cfg.seed)
-    # Eval RNG always fresh entropy → eval-on-ckpt maps random each run, independent of cfg.seed.
-    eval_rng = np.random.default_rng()
+    # Eval RNG: fresh entropy by default (eval-on-ckpt GIF maps differ run to run). --map-seed pins
+    # it too, so an A/B renders the same maps and the qualitative comparison is like-for-like.
+    eval_rng = np.random.default_rng(cfg.env.map_seed)
     if torch.cuda.is_available():
         # TF32 fastpath for f32 matmuls (Ampere+); inductor warning is silenced by this.
         torch.set_float32_matmul_precision("high")
@@ -492,6 +526,33 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                      for k, v in ck_sd.items()}
         elif not tgt_has_om and ck_has_om:
             ck_sd = {k.replace("._orig_mod.", ".", 1): v for k, v in ck_sd.items()}
+        # SHAPE-SAFE load. strict=False tolerates missing/unexpected KEYS but NOT shape mismatches:
+        # torch collects "size mismatch for <k>" unconditionally and raises outside the `if strict`
+        # guard. So any width change (F_IN, CRITIC_GLOBAL_DIM, n_agent_scalars) used to blow up here
+        # — mid-pipeline, after the easy stage had already burned its hours. Two tiers:
+        #  1) a trailing-dim GROWTH on a 2-D weight is copied into the leading columns and the rest
+        #     left at init, so the trained part survives and the new inputs start as ~no-ops;
+        #  2) anything else mismatched is dropped and reported LOUDLY — a silent drop here means
+        #     training from a randomly-initialized submodule while the log says "warm-started".
+        tgt = model.state_dict()
+        partial, dropped = [], []
+        for k, v in list(ck_sd.items()):
+            if k not in tgt or tgt[k].shape == v.shape:
+                continue
+            tv = tgt[k]
+            if (v.dim() == tv.dim() == 2 and v.shape[0] == tv.shape[0] and v.shape[1] < tv.shape[1]):
+                new = tv.clone()
+                new[:, :v.shape[1]] = v.to(tv.device, tv.dtype)
+                ck_sd[k] = new
+                partial.append(f"{k} {tuple(v.shape)}→{tuple(tv.shape)}")
+            else:
+                del ck_sd[k]
+                dropped.append(f"{k} ckpt{tuple(v.shape)} vs model{tuple(tv.shape)}")
+        if partial:
+            print(f"[init-ckpt] WIDENED {len(partial)} weight(s), new columns left at init: {partial}")
+        if dropped:
+            print(f"[init-ckpt] *** WARNING: {len(dropped)} shape-mismatched key(s) DROPPED — those "
+                  f"modules are RANDOMLY INITIALIZED despite the warm start: {dropped}")
         missing, unexpected = model.load_state_dict(ck_sd, strict=False)
         if isinstance(ck, dict) and "vnorm" in ck:
             vnorm.load_state_dict(ck["vnorm"])
@@ -742,6 +803,11 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"clip={stats['clipfrac']*100:.1f}%  "
                   f"redun={redundancy:.2f} stall={stall_rate*100:.0f}% "
                   f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
+                  # v11 coordination at a glance: reward paid for map exchange, syncs per 1k
+                  # agent-steps, and the union-vs-weakest-robot coverage gap this rollout.
+                  f"sync={agg.get('reward/sync', 0.0):+.4f}"
+                  f"({agg.get('metric/sync_rate', 0.0)*1000:.1f}/k) "
+                  f"ownGap={agg.get('metric/own_cov_gap', 0.0):.3f} "
                   f"sps={sps_iter:.0f}({sps_all:.0f}avg)")
         # Live heartbeat for the web dashboard: refresh iter/progress/sps EVERY iter (status.json
         # is a tiny atomic write; iters are seconds apart so this is free). Previously written only
@@ -795,7 +861,13 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"ov={eval_stats['eval/sensing_overlap']:.2f}  "
                   f"duty={eval_stats['eval/comm_duty']:.2f}  "
                   f"succ={eval_stats['eval/success_rate']:.2f}  "
-                  f"s90={eval_stats['eval/steps_to_90']:.0f}{split_str}")
+                  f"s90={eval_stats['eval/steps_to_90']:.0f}  "
+                  # v11 coordination: paid syncs per episode, the union-vs-weakest-robot coverage
+                  # gap, and the same score computed on own-map coverage instead of the union.
+                  f"nSync={eval_stats.get('eval/n_syncs', float('nan')):.1f}  "
+                  f"syncGap={eval_stats.get('eval/sync_gap', float('nan')):.3f}  "
+                  f"ownAUC={eval_stats.get('eval/own_coverage_auc', float('nan')):.3f}  "
+                  f"scoreOwn={eval_stats.get('eval/score_own', float('nan')):+.3f}{split_str}")
             # Best-checkpoint selection: overwrite ckpt_best.pt whenever this eval beats the peak.
             if eval_stats["eval/score"] > best_eval_score:
                 best_eval_score = eval_stats["eval/score"]

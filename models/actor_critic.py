@@ -33,7 +33,12 @@ from models.init_utils import apply_orthogonal, orthogonal_
 F_IN = 7   # 0 x_rel, 1 y_rel, 2 utility, 3 age, 4 teammate_pot, 5 radar-util, 6 radar-teammate
 K = 8
 # CTDE critic-only global state (value head, never seen by actors → no execution leak):
-#   [explored_frac, t/max_steps, geo_pair, coverage_rate, redundancy, idle_frac, imbalance].
+#   [explored_frac, t/max_steps, geo_pair, coverage_rate, redundancy, sync_surplus, sync_staleness].
+# v11 swapped idle_frac/imbalance out for the sync pair IN PLACE (dim unchanged → old checkpoints
+# still load; the two columns just relearn). sync_surplus = map pending exchange between the agents
+# (0 = everyone holds the union, 1 = disjoint maps), sync_staleness = steps since the most stale
+# paid sync /T. Together they let V(s) price a rendezvous, which geo_pair alone cannot: distance
+# says how far the teammate is, not whether meeting is worth anything.
 # The pooled per-agent embeddings (mean⊕max, see _critic_in) are EGO-RELATIVE, so aggregating them
 # keeps per-agent exploration CONTENT but not the team geometry — the RELATIONAL geometry the value
 # head needs lives here as geo_pair (nearest-teammate GEODESIC distance /diam, translation-invariant,
@@ -123,7 +128,8 @@ class MarlActorCritic(nn.Module):
         # when to rendezvous. Beyond-window spatial context still reaches the actor through the
         # GAT-processed node features (utility feat[2] + radar feat[5]/feat[6]).
         self.n_agent_scalars = 2
-        # + K: the value-field [B, K] enters the actor trunk too (context for the GRU/MLP),
+        # + K: the value-field [B, K] enters the actor trunk too (context for the trunk, which is
+        # a plain Linear unless --gru re-enables the recurrent cell),
         # in addition to its per-neighbor logit bias in the pointer / actor_head.
         self.actor_pre = nn.Linear(d + K + self.n_agent_scalars + K, d)
         self.gru_actor = nn.GRUCell(d, d)
@@ -224,7 +230,8 @@ class MarlActorCritic(nn.Module):
         agent_scalars: torch.Tensor,        # [B, 2] [∆M-gate, staleness]
         vf: torch.Tensor,                   # [B, K] value-field ∈[0,1]
     ) -> torch.Tensor:
-        """Build the actor GRU input: curr_emb || prev_action || agent_scalars || value_field.
+        """Build the actor trunk input: curr_emb || prev_action || agent_scalars || value_field.
+        (Feeds the GRUCell only under --gru; feed-forward otherwise — see _step_actor.)
         gat_actor=False → curr_emb slot zeroed (VF-only actor)."""
         if not self.gat_actor or curr_emb is None:
             curr_emb = vf.new_zeros(vf.shape[0], self.d)

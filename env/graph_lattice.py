@@ -25,7 +25,7 @@ plus a from-curr Bellman-Ford feeding the radar. All ops batched over n_envs.
 
 Public API
 ----------
-    GraphLattice(canvas, nr=8, sensor_range_px=60, utility_range_px=30,
+    GraphLattice(canvas, nr=8, sensor_range_px=80, utility_range_px=30,
                  collision_samples=5, device=...)
     graph.build(occupancy, frontier, robot_xy_world, visited_step, current_step)
         -> info dict (see return at end of build)
@@ -59,7 +59,10 @@ class GraphLattice:
         self,
         canvas: tuple[int, int],
         nr: int = 8,
-        sensor_range_px: float = 60.0,
+        # Explorer (the only construction site) always passes cfg.sensor_range_px, so this default
+        # is never exercised; kept in sync with EnvCfg.sensor_range_px so a future direct caller
+        # does not silently get the pre-2026-06 60 px LiDAR.
+        sensor_range_px: float = 80.0,
         utility_range_px: int = 30,
         collision_samples: int = 5,
         flood_max_iters: int = 200,
@@ -87,19 +90,24 @@ class GraphLattice:
         # ramps from 0 (just left) back to 1 (cold / re-explorable). Stationary, unlike the
         # old last_visit/current_step.
         self.visit_age_window = max(1, int(visit_age_window))
-        # Bellman-Ford iteration upper bound. The OLD bound (Manhattan diameter ~LH+LW) is only
-        # valid in open maps: in a corridor/maze the geodesic hop count from agent→target winds
-        # far past LH+LW, so BF-from-target never propagated back to curr → parent[curr]<0 →
-        # next_hop=curr → the guidepost (and bf_dist used for scoring/progress) silently broke and
-        # the global target "disappeared". The true upper bound on a simple path is N_max hops, so
-        # use that. bf_from_target early-exits the instant dist stops changing (every-8-iter check),
-        # so on open maps the cost is unchanged (~diameter iters); the higher cap only spends extra
-        # iters on the long maze geodesics that actually need them. Reachable targets always converge.
+        # NAME IS HISTORICAL: the analytic "guidepost" (a committed global target plus a rendered
+        # route to it) was removed in v0.8. These two are now plain Bellman-Ford loop bounds, still
+        # very much live — guidepost_iters caps every BF flood (bf_from_target, value_field's label
+        # propagation, build_radar's gateway walk). The EnvCfg field names are kept because they are
+        # persisted in checkpoints; renaming them would silently reset old runs to the defaults.
+        #
+        # Iteration upper bound. The OLD bound (Manhattan diameter ~LH+LW) is only valid in open
+        # maps: in a corridor/maze the geodesic hop count winds far past LH+LW, so BF never
+        # propagated back to curr → parent[curr]<0 → the distance field silently broke. The true
+        # upper bound on a simple path is N_max hops, so use that. bf_from_target early-exits the
+        # instant dist stops changing (every-8-iter check), so on open maps the cost is unchanged
+        # (~diameter iters); the higher cap only spends extra iters on the long maze geodesics that
+        # actually need them. Reachable targets always converge.
         self.guidepost_iters = int(guidepost_iters) if guidepost_iters else int(self.N_max)
-        # Path-reconstruction length cap (number of edges on a path). Drives a Python loop +
-        # the rendered guidepost line / feat[5] mask (NOT next_hop, which reads parent[curr]
-        # directly), so it can stay bounded well below N_max. Doubled vs the old LH+LW+4 so long
-        # corridor paths render without truncation, capped so the loop never blows up on big maps.
+        # Path-reconstruction length cap (number of edges on a path). Drives a Python loop, so it
+        # stays bounded well below N_max. Only consumer left is the pathfront belief's particle
+        # paths (env/teammate_belief_pathfront.py, via scripts/viz_belief_pathfront.py's Lmax).
+        # Doubled vs the old LH+LW+4 so long corridor paths are not truncated.
         self.guidepost_path_max = (
             int(guidepost_path_max) if guidepost_path_max
             else int(min(self.N_max, 2 * (self.LH + self.LW) + 8))
@@ -627,7 +635,15 @@ class GraphLattice:
         b_util = torch.zeros((N, self.N_max), device=dev)
         src_w = torch.where(beyond, utility * w, torch.zeros_like(utility))           # only beyond mass
         b_util.scatter_add_(1, g, src_w)
-        b_util = (b_util / float(util_norm)).clamp(0.0, 1.0)
+        # SOFT squash instead of m/util_norm then clamp(0,1) (v11). Measured on v10 at util_norm=3:
+        # only ~4% of in-window valid nodes are gateways carrying any mass at all, and 0.4-1.0% of
+        # all nodes sit AT the clamp — i.e. 10-25% of the ACTIVE gateways are flattened to the same
+        # 1.0, losing exactly the magnitude that says which way is richer, on the strongest ones.
+        # m/(m+util_norm) is monotone over the whole range and never saturates; util_norm keeps a
+        # clear meaning as the half-value scale (b_util = 0.5 at m = util_norm), so the flag stays
+        # interpretable. Amplitude in the working range drops ~2× vs the old ramp, which puts feat[5]
+        # on par with feat[2] utility instead of above it.
+        b_util = b_util / (b_util + float(util_norm))
 
         b_team = torch.zeros((N, self.N_max), device=dev)
         if teammate_belief is not None and teammate_belief.numel() > 0:
@@ -649,7 +665,13 @@ class GraphLattice:
                 w_src = torch.pow(gamma, (d_src - D_h).clamp(min=0.0) / NR)
                 use = (src >= 0) & torch.isfinite(d_src) & (d_src > D_h)              # only beyond-horizon teammates
                 b_team.scatter_add_(1, g_src.unsqueeze(1), (use.float() * w_src).unsqueeze(1))
-        b_team = b_team.clamp(0.0, 1.0)
+        # ROW-normalize into a directional distribution (v11): "share of my belief about the teammate
+        # that lies beyond gateway k". The two source paths above were on incompatible scales — the
+        # belief branch scatters Σ=1 probability mass (so every gateway reads ~1e-3 and shrinks
+        # further as the belief spreads), the lkp branch scatters γ^hops ≤ 1 — yet both went through
+        # the same clamp(0,1), which only ever bit the second one. Normalizing makes feat[6] mean the
+        # same thing under either --radar-team-source and keeps it on the same footing as feat[5].
+        b_team = b_team / b_team.sum(-1, keepdim=True).clamp(min=1e-8)
         return b_util, b_team
 
     # ---------------------------------------------------------------------- #

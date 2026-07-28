@@ -32,7 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     g_run.add_argument("--force", action="store_true",
                     help="overwrite an existing --out directory without asking. Only matters when --out "
                          "names an existing dir; auto-named runs never collide.")
-    g_run.add_argument("--seed", type=int, default=0, help="random seed")
+    g_run.add_argument("--seed", type=int, default=0, help="random seed (torch: action sampling, init)")
+    g_run.add_argument("--map-seed", type=int, default=None,
+                    help="Seed the MAP stream too. Default None = fresh OS entropy every run (map diversity), which means two runs with the same --seed still see different maps — fine for training, fatal for an A/B. Pass an int so two configs differ only by the thing under test")
     g_run.add_argument("--device", default="cuda:0", help="torch device (cuda:0 or cpu)")
 
     g_scale = ap.add_argument_group("Scale & episode")
@@ -42,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Number of cooperative agents per env")
     g_scale.add_argument("--rollout-len", type=int, default=128, help="rollout length per PPO iteration")
     g_scale.add_argument("--max-episode-steps", type=int, default=512, help="max steps per episode")
+    g_scale.add_argument("--done-mode", choices=["union", "own"], default="union",
+                    help="What ends an episode. 'union' = the TEAM union map hits 99%% (legacy MARLauder). "
+                         "'own' = EVERY agent's OWN map hits 99%% — the IR2 rule (their env.check_done), "
+                         "which makes sharing part of the task and is what their `success` column measures. "
+                         "Under 'own' the completion_bonus almost never fires on hard maps, so it is a real "
+                         "change to the reward structure, not just to the stopping rule")
     g_scale.add_argument("--minibatches", type=int, default=1,
                     help="PPO minibatches per epoch (must divide n-envs)")
     g_scale.add_argument("--n-hops", type=int, default=6,
@@ -87,8 +95,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     g_reward = ap.add_argument_group("Reward shaping")
     g_reward.add_argument("--novel-scan-weight", type=float, default=1.0, help="α_novel: privileged team-union novel-scan credit (v2 core reward)")
-    g_reward.add_argument("--rdv-weight",      type=float, default=0.10, help="w: dense RENDEZVOUS reward = w·g·(φ_prev−φ_now), g=surplus gate. Rewards net geodesic approach toward the owed teammate. 0 disables. M>1 only")
+    g_reward.add_argument("--rdv-weight",      type=float, default=1.0, help="w: dense RENDEZVOUS reward = w·g·(φ_prev−φ_now), g=surplus gate. At w=1.0 a full-gate approach hop pays 1.0·0.02=0.020 against a 0.015-0.021 step_penalty, i.e. it exactly REBATES the travel cost and leaves the meet-vs-explore decision to --sync-weight. Above ~2 it becomes a chase term. 0 disables. M>1 only")
     g_reward.add_argument("--rdv-offer-frac",  type=float, default=0.15, help="Rendezvous gate saturates (g→1) when the map gained since last sync reaches this fraction of the OWN map size AT that sync (relative growth, floored by scan_norm_nodes); also normalizes the ∆M actor obs")
+    g_reward.add_argument("--sync-weight",     type=float, default=0.0,
+                    help="ζ_g: SYNC-EVENT reward = ζ_g·(give + ρ·recv)/scan_norm_nodes, paid on the RISING EDGE of comm only, and only ≥ --sync-min-gap steps after the last paid sync. give = |my map \\ his map| pre-fusion. This is the OBJECTIVE term for rendezvous (rdv-weight is only shaping). 0.25 ≈ 2.55 per sync after 200 steps apart vs a measured 1.7-1.9 detour cost. 0 disables (pre-v11 behavior)")
+    g_reward.add_argument("--sync-recv-ratio", type=float, default=0.5,
+                    help="ρ: recv is paid at ρ·ζ_g so BOTH agents gain from meeting (else the map-poor one evades while the rich one chases), while give stays dominant so free-riding on recv doesn't pay")
+    g_reward.add_argument("--sync-min-gap",    type=int,   default=32,
+                    help="Steps since the last PAID sync required for a contact to pay again. Kills comm-boundary flicker; the contact still FUSES, only the payment is suppressed")
     g_reward.add_argument("--revisit-pen",     type=float, default=0.05, help="γ: revisit penalty per step (graduated by recency)")
     g_reward.add_argument("--revisit-window",  type=int,   default=16,   help="W: revisit lookback steps (8→16 2026-07-15: freshly-scanned trail stays hot longer)")
     g_reward.add_argument("--stall-pen",       type=float, default=0.1,  help="δ_stall: heavy penalty for standing still (no net displacement this step)")
@@ -100,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="v0.9 cumulative revisit: landings on recent (age<W) nodes multiply the graduated revisit penalty by 1+β_rev·(streak−1), UNCAPPED. 0 disables")
     g_reward.add_argument("--revisit-streak-decay", type=float, default=0.5,
                     help="v0.9.1: a NON-recent landing subtracts this from the revisit streak instead of zeroing it — one high-age hop can't launder the debt; working it off takes a sustained run on new/old ground")
+    g_reward.add_argument("--revisit-streak-cap", type=float, default=float("inf"),
+                    help="Max multiplier on the graduated revisit penalty (mirrors --stall-streak-cap). Default inf = legacy uncapped. Measured on v10: streak peaks at 89 → ×45 → 4.05 reward/step and a −44 per-episode tail vs novel +17, i.e. pure return variance that can bury the sync reward. Try 4.0 if reward/revisit p95 dominates")
     g_reward.add_argument("--radar-gamma",     type=float, default=0.92, help="RADAR feat[5/6] per-hop discount beyond the ego-window horizon. 0.92 mutes frontiers ~45+ hops out (0.4%%/node); 0.97 keeps them visible (~8%% with --radar-util-norm 3)")
     g_reward.add_argument("--radar-util-norm", type=float, default=8.0,  help="RADAR b_util normalization divisor (lower = far frontier mass squashed less)")
     g_reward.add_argument("--belief-mode",     choices=["uniform", "pathfront"], default="uniform",

@@ -13,6 +13,17 @@ sweep** — it halves SPS for both.
 
 ---
 
+> **STALE — this file describes the 2026-06-12 state.** Current state and the reasoning behind it
+> are in `dev_log.md` (newest entry at the top) and in the memory index. Two things below are
+> outright wrong today: the "strategic target" thrash analysis refers to the StrategicHead, deleted
+> 2026-06-29, and the eval numbers quoted are on TRAINING maps (see the eval-suite gotcha in the
+> 2026-07-27 dev_log entry). Read this only for historical context.
+>
+> **Open as of 2026-07-27**: (a) run R2 in flight — sync-event reward, see `pipeline_v11_R2.sh`;
+> (b) known bug NOT yet fixed — feat[3] `age` uses a batch-wide scalar `t.max()`, so 43% of envs
+> read a dead recency channel (measurement in dev_log); (c) the anti-loop penalties still need the
+> review the user asked for (`--revisit-streak-cap` exists, off by default).
+
 ## THE OPEN PROBLEM (top priority — not yet fixed/verified)
 
 **Agents stall / ping-pong: the deterministic policy oscillates between 2 cells, constantly

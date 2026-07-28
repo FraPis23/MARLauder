@@ -14,11 +14,10 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 import imageio.v2 as imageio
-import numpy as np
 import torch
 
 from env.explorer import EnvCfg, Explorer
-from env.maps import load_split, sample_batch
+from env.maps import load_split
 from eval.rollout import EvalCfg, EvalRollout
 from models.actor_critic import MarlActorCritic
 

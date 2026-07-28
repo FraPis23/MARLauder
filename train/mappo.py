@@ -1,4 +1,9 @@
-"""MAPPO update with chunked encoder + truncated BPTT through the GRU.
+"""MAPPO update with chunked encoder + truncated BPTT.
+
+NOTE on TBPTT: the GRUCells are OFF by default (TrainCfg.use_gru=False, --gru to opt in), so on the
+shipped config there is no recurrence to back-propagate through and tbptt_steps only controls how
+the rollout is chunked for the encoder. The chunking machinery is kept because it is what makes the
+--gru arm trainable at all, and because chunk size still drives update-time memory.
 
 v0.2 changes vs v0.1:
 - Encoder is called ONCE per TBPTT chunk on the reshaped [T*N*M, N_max, F] batch

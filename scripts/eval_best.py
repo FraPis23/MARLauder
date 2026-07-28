@@ -75,7 +75,16 @@ def _score_batched(model, env: Explorer, cfg, map_idxs: tuple[int, ...]) -> dict
     novel_prev = torch.zeros(K, M, device=dev)
     act_count = torch.zeros(K, M, device=dev)          # per-agent steps that found ≥1 novel cell
     novel_final = torch.zeros(K, M, device=dev)
+    # v11 coordination block, mirroring driver._run_eval_suite.
+    own_sum = torch.zeros(K, device=dev)                # Σ min-over-agents own coverage (for AUC)
+    last_own = torch.zeros(K, device=dev)
+    n_syncs = torch.zeros(K, device=dev)                # PAID sync events
+    duty_sum = torch.zeros(K, device=dev)
+    gap_now = torch.zeros(K, device=dev)                # steps since last contact
+    gap_max = torch.zeros(K, device=dev)
     SR2 = 2.0 * float(env.cfg.sensor_range_px)
+    # Pin the radio-shadowing stream so comm_duty / n_syncs are reproducible across checkpoints.
+    env.reseed_channel_noise(777)
     if M > 1:
         triu = torch.triu(torch.ones(M, M, device=dev), diagonal=1).bool()
 
@@ -94,9 +103,17 @@ def _score_batched(model, env: Explorer, cfg, map_idxs: tuple[int, ...]) -> dict
         else:
             ov_step = torch.zeros(K, device=dev)
         novel_step = (nf - novel_prev).clamp(min=0.0)                      # [K, M]
+        own_min = info["own_cov"].to(dev).float().min(dim=-1).values        # [K] weakest robot
         er_sum += er * a
         steps_rec += a
         last_er = torch.where(active, er, last_er)
+        own_sum += own_min * a
+        last_own = torch.where(active, own_min, last_own)
+        n_syncs += (info["sync_paid"].to(dev).float().max(dim=-1).values > 0).float() * a
+        in_comm = info["comm_any"].to(dev).float()                          # [K] any pair in contact
+        duty_sum += in_comm * a
+        gap_now = torch.where(in_comm > 0, torch.zeros_like(gap_now), gap_now + a)
+        gap_max = torch.maximum(gap_max, gap_now)
         ov_sum += ov_step * a
         act_count += (novel_step > 0).float() * a.unsqueeze(-1)
         novel_final = torch.where(active.unsqueeze(-1), nf, novel_final)
@@ -121,10 +138,13 @@ def _score_batched(model, env: Explorer, cfg, map_idxs: tuple[int, ...]) -> dict
                       torch.zeros_like(total_novel))
     imb_denom = (1.0 - 1.0 / M) if M > 1 else 1.0
     imb_norm = imb / imb_denom
-    score_map = (auc
-                 - cfg.score_w_imbalance * imb_norm
-                 - cfg.score_w_overlap * ov
-                 - cfg.score_w_idle * idle)                                 # [K]
+    penalty = (cfg.score_w_imbalance * imb_norm
+               + cfg.score_w_overlap * ov
+               + cfg.score_w_idle * idle)                                   # [K]
+    score_map = auc - penalty                                               # [K]
+    # own_auc padded with the final value exactly like auc, so an early finish still scores higher.
+    own_auc = (own_sum + last_own * (T - steps_rec)) / T                    # [K]
+    score_own_map = own_auc - penalty                                       # same penalty by design
     return {
         "eval/score":             float(score_map.mean().item()),
         "eval/score_std":         float(score_map.std(unbiased=False).item()),
@@ -132,6 +152,15 @@ def _score_batched(model, env: Explorer, cfg, map_idxs: tuple[int, ...]) -> dict
         "eval/success_rate":      float(succ.mean().item()),
         "eval/idle_rate_max":     float(idle.mean().item()),
         "eval/contrib_imbalance_norm": float(imb_norm.mean().item()),
+        "eval/sensing_overlap":   float(ov.mean().item()),
+        # ---- v11 coordination block (diagnostic; does NOT feed eval/score) ----
+        "eval/own_coverage_auc":  float(own_auc.mean().item()),
+        "eval/own_coverage_final": float(last_own.mean().item()),
+        "eval/sync_gap":          float((last_er - last_own).clamp(min=0.0).mean().item()),
+        "eval/n_syncs":           float(n_syncs.mean().item()),
+        "eval/max_comm_gap":      float(gap_max.mean().item()),
+        "eval/comm_duty":         float((duty_sum / steps_c).mean().item()),
+        "eval/score_own":         float(score_own_map.mean().item()),
     }
 
 
@@ -185,7 +214,8 @@ def main() -> None:
 
     print(f"[eval_best] run={run.name} split={split_name} maps={k} steps={steps} agents={n_agents} "
           f"mode={'slow' if args.slow else 'batched'} ckpts={[p.name for p in ckpts]}", flush=True)
-    print(f"{'ckpt':<16}{'score':>9}{'±std':>8}{'auc':>7}{'succ':>7}{'idle':>7}{'imbN':>7}", flush=True)
+    print(f"{'ckpt':<16}{'score':>9}{'±std':>8}{'auc':>7}{'succ':>7}{'idle':>7}{'imbN':>7}"
+          f"{'ownAUC':>8}{'syncGap':>8}{'nSync':>7}{'duty':>7}{'maxGap':>8}{'scoreOwn':>10}", flush=True)
 
     results: list[tuple[str, float]] = []
     for p in ckpts:
@@ -194,7 +224,13 @@ def main() -> None:
         results.append((p.name, s["eval/score"]))
         print(f"{p.name:<16}{s['eval/score']:>+9.3f}{s['eval/score_std']:>8.3f}"
               f"{s['eval/coverage_auc']:>7.3f}{s['eval/success_rate']:>7.2f}"
-              f"{s['eval/idle_rate_max']:>7.2f}{s['eval/contrib_imbalance_norm']:>7.3f}", flush=True)
+              f"{s['eval/idle_rate_max']:>7.2f}{s['eval/contrib_imbalance_norm']:>7.3f}"
+              f"{s.get('eval/own_coverage_auc', float('nan')):>8.3f}"
+              f"{s.get('eval/sync_gap', float('nan')):>8.3f}"
+              f"{s.get('eval/n_syncs', float('nan')):>7.1f}"
+              f"{s.get('eval/comm_duty', float('nan')):>7.2f}"
+              f"{s.get('eval/max_comm_gap', float('nan')):>8.0f}"
+              f"{s.get('eval/score_own', float('nan')):>+10.3f}", flush=True)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

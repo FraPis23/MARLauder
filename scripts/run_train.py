@@ -13,8 +13,6 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-import torch
-
 from env.explorer import EnvCfg
 from scripts.train_args import build_parser
 from train.driver import TrainCfg, train
@@ -175,6 +173,7 @@ def main() -> None:
             n_agents=args.n_agents,
             nr=16,                              # lattice spacing — 16px → N_max≈1200 nodes
             max_episode_steps=args.max_episode_steps,
+            done_mode=args.done_mode,
             sensor_range_px=args.sensor_range,
             comm_range_px=args.comm_range,
             comm_model=args.comm_model,
@@ -186,6 +185,9 @@ def main() -> None:
             novel_scan_weight=args.novel_scan_weight,
             rdv_dense_weight=args.rdv_weight,
             rdv_offer_frac=args.rdv_offer_frac,
+            sync_give_weight=args.sync_weight,
+            sync_recv_ratio=args.sync_recv_ratio,
+            sync_min_gap=args.sync_min_gap,
             teammate_obs=not args.no_teammate_obs,
             vf_gamma=args.vf_gamma,
             revisit_penalty_coef=args.revisit_pen,
@@ -195,10 +197,12 @@ def main() -> None:
             stall_streak_cap=args.stall_streak_cap,
             revisit_streak_beta=args.revisit_streak_beta,
             revisit_streak_decay=args.revisit_streak_decay,
+            revisit_streak_cap=args.revisit_streak_cap,
             radar_gamma=args.radar_gamma,
             radar_util_norm=args.radar_util_norm,
             belief_mode=args.belief_mode,
             radar_team_source=args.radar_team_source,
+            map_seed=args.map_seed,
         ),
         ppo=MAPPOCfg(
             ent_coef=args.ent_coef,
