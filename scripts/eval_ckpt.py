@@ -34,6 +34,13 @@ def main() -> None:
     ap.add_argument("--n-maps", type=int, default=3, help="how many evenly-spaced maps to evaluate")
     ap.add_argument("--n-agents", type=int, default=None, help="default: from ckpt cfg, else 2")
     ap.add_argument("--steps", type=int, default=256)
+    ap.add_argument("--trace-steps", type=int, default=512,
+                    help="Hard cap on the STEP-THROUGH TRACE only (the scored rollout still runs the "
+                         "full --steps). capture_trace holds every step's node list AND a 500x500 RGB "
+                         "frame per agent in RAM, then json.dumps the whole document at once: a "
+                         "2048-step trace measured 3.1 GB on disk and ~27 GB live, which OOM-killed the "
+                         "host. train/driver.py has applied min(eval_steps, trace_steps) for a while; "
+                         "this script was the remaining path straight to the un-capped version")
     # Architecture args default to None → auto-detected from the checkpoint (see
     # eval.ckpt_loader) so this ALWAYS evaluates with the exact architecture the checkpoint was
     # trained with. A mismatch here doesn't crash — load_state_dict(strict=False) silently drops
@@ -97,7 +104,7 @@ def main() -> None:
         # Inspector trace (viewer itself is served canonically by web_server.py)
         try:
             capture_trace(model, split, trace_env_peek, args.n_agents,
-                          int(midx), args.steps, args.out, tag, args.device)
+                          int(midx), min(args.steps, args.trace_steps), args.out, tag, args.device)
         except Exception as exc:
             print(f"[eval_ckpt] trace {tag} skipped ({exc})")
     print(f"[eval_ckpt] DONE → http://localhost:8080/{args.out.name}/inspector.html")

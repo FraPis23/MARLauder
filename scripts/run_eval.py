@@ -70,6 +70,18 @@ def main() -> None:
     sd = {k: v.to(args.device) if torch.is_tensor(v) else v for k, v in ckpt["model"].items()}
     # Strip torch.compile prefix if present.
     sd = {k.replace("encoder._orig_mod.", "encoder."): v for k, v in sd.items()}
+    # strict=False forgives missing/unexpected KEYS but NOT shape mismatches — torch collects those
+    # unconditionally and raises. Any width change since the checkpoint was written (F_IN,
+    # CRITIC_GLOBAL_DIM, AGENT_SCALAR_DIM) therefore hard-crashes here instead of degrading. Drop
+    # and report, same as eval/ckpt_loader.py.
+    _msd = model.state_dict()
+    _dropped = [k for k in sd if k in _msd and _msd[k].shape != sd[k].shape]
+    if _dropped:
+        print(f"[load] WARNING: {len(_dropped)} shape-mismatched key(s) DROPPED — those modules are "
+              f"RANDOMLY INITIALIZED, so any score below is fiction: {_dropped[:5]}"
+              f"{'...' if len(_dropped) > 5 else ''}")
+    for k in _dropped:
+        del sd[k]
     model.load_state_dict(sd, strict=False)
     # Restore GRU-ablation flag from the training cfg (mutable attr).
     if isinstance(cfg_peek, dict):

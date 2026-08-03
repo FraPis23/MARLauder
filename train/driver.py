@@ -13,10 +13,58 @@ import torch
 
 from env.explorer import EnvCfg, Explorer
 from env.maps import MultiSplit, load_split
+from jsonio import jsonable
 from models.actor_critic import MarlActorCritic
 from models.value_normalizer import ValueNormalizer
 from train.buffer import Rollout
 from train.mappo import AMP_DTYPE, MAPPOCfg, ppo_update
+
+
+class MetricsWriter:
+    """Append-only JSONL sink for per-iteration metrics — the W&B-free record of a run.
+
+    Everything the driver knows lands in `log` at the end of each iteration, and until now that
+    dict had exactly ONE consumer: `wb.log`. With --wandb off (the default) all of it was dropped
+    and only the six values on the console line survived, which is why diagnosing a finished run
+    meant regex-ing a text log. This writes the SAME object to runs/<run>/metrics.jsonl.
+
+    JSONL rather than CSV because the key set is not knowable when the file is opened: eval keys
+    appear only on eval iterations and `eval/<split>/*` depends on --eval-suite-splits, so a fixed
+    CSV header cannot be written up front. Line-buffered append means a SIGTERM (see _finalize)
+    loses at most the in-flight iteration, and a reader that tolerates one torn final line loses
+    nothing else. Never raises: a full disk must not kill a 19-hour training run.
+    """
+
+    def __init__(self, out_dir: Path, meta: dict) -> None:
+        self.path = Path(out_dir) / "metrics.jsonl"
+        self.fh = None
+        self.n_written = 0
+        try:
+            self.fh = open(self.path, "a", buffering=1, encoding="utf-8")
+        except OSError as exc:
+            print(f"[metrics] DISABLED — cannot open {self.path}: {exc}")
+            return
+        self.write({"kind": "meta", **meta})
+
+    def write(self, row: dict) -> None:
+        if self.fh is None:
+            return
+        try:
+            self.fh.write(json.dumps(jsonable(row), separators=(",", ":")) + "\n")
+            self.n_written += 1
+        except Exception as exc:                          # noqa: BLE001 — logging must never kill training
+            print(f"[metrics] write failed ({exc}); disabling")
+            self.close()
+
+    def close(self) -> None:
+        if self.fh is None:
+            return
+        try:
+            self.fh.flush()
+            self.fh.close()
+        except Exception:                                 # noqa: BLE001
+            pass
+        self.fh = None
 
 
 def _dump_status(out_dir: Path, status: dict) -> None:
@@ -95,6 +143,9 @@ class TrainCfg:
     eval_split: str = "train/easy"
     eval_map_idx: int = -1          # -1 = random each time
     eval_steps: int = 256
+    # Cap for the milestone GIF + inspector trace ONLY. The eval SUITE (which produces eval/score
+    # and picks ckpt_best) is untouched and still runs full-length episodes. See --trace-steps.
+    trace_steps: int = 512
     eval_n_maps: int = 2            # GIFs per milestone
     env: EnvCfg = field(default_factory=EnvCfg)
     ppo: MAPPOCfg = field(default_factory=MAPPOCfg)
@@ -151,6 +202,14 @@ def _normalize_cfg(cfg: TrainCfg) -> None:
     cfg.env.n_envs = cfg.n_envs
     cfg.env.n_agents = cfg.n_agents
     cfg.env.n_hops = cfg.n_hops
+    # An episode shorter than one rollout would straddle the buffer boundary, so it is clamped up.
+    # SAY SO: params.json is written from argparse BEFORE this runs, so a run asked for --max-
+    # episode-steps 128 with --rollout-len 256 records 128 and executes 256. That silence cost a
+    # real diagnosis (v12 phase 1: params.json 128, every episode actually 256, s90 pinned at 256).
+    if cfg.env.max_episode_steps < cfg.rollout_len:
+        print(f"[cfg] WARNING: --max-episode-steps {cfg.env.max_episode_steps} < --rollout-len "
+              f"{cfg.rollout_len}; episodes will run at {cfg.rollout_len} steps. params.json still "
+              f"records the value you asked for — metrics.jsonl records the effective one.")
     cfg.env.max_episode_steps = max(cfg.env.max_episode_steps, cfg.rollout_len)
     # Tie n_layers to n_hops so the GAT receptive field uses the full window.
     cfg.n_layers = cfg.n_hops
@@ -302,12 +361,16 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
     from env.maps import load_split as _load
 
     split = _load(split_name or cfg.eval_split, device=cfg.device)
+    # Every RGB frame of the episode is held in a Python list until imageio encodes it
+    # (500x500x3 = 750 kB each), so the GIF is capped like the trace. Instrumentation only —
+    # the eval suite that scores checkpoints does not come through here.
+    n_steps = min(cfg.eval_steps, cfg.trace_steps)
     # I.2 — mirror the FULL training env cfg (force flags, top_k, n_hops, ...) so the
     # eval render reflects the same comm/sharing behavior used in training.
     env_cfg = _EnvCfg.from_ckpt_dict(
         cfg.env.__dict__,
         n_envs=1, n_agents=cfg.n_agents,
-        max_episode_steps=cfg.eval_steps + 1,
+        max_episode_steps=n_steps + 1,
     )
     env = _Explorer(split, env_cfg, seed=map_idx)
     # Full reset for the specific map (clears all stale caches; correct adjacent spawn).
@@ -315,7 +378,7 @@ def _emit_eval_gif(model: "MarlActorCritic", cfg: "TrainCfg", out: Path, map_idx
 
     was_training = model.training
     model.eval()
-    rollout = EvalRollout(env, model, EvalCfg(max_steps=cfg.eval_steps, env_idx=0,
+    rollout = EvalRollout(env, model, EvalCfg(max_steps=n_steps, env_idx=0,
                                               deterministic=True, draw_edges=True))
     frames, stats = rollout.run()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -644,6 +707,28 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     }
     _dump_status(cfg.out_dir, status)
 
+    # Per-iteration metrics on disk, unconditionally (no W&B needed). `meta` records what the
+    # rows cannot: the RESOLVED config (post-_normalize_cfg, so max_episode_steps is the value
+    # actually executed, not the one argparse wrote into params.json), the eval map indices that
+    # define the suite, and the rollout geometry needed to turn `iter` into env steps offline.
+    import sys as _sys
+    metrics = MetricsWriter(cfg.out_dir, {
+        "schema": 1,
+        "run": cfg.out_dir.name,
+        "argv": _sys.argv,
+        "start_time": status["start_time"],
+        "n_iters": n_iters,
+        "steps_per_iter": steps_per_iter,
+        "n_envs": cfg.n_envs,
+        "rollout_len": cfg.rollout_len,
+        "max_episode_steps": cfg.env.max_episode_steps,   # EFFECTIVE (after the rollout_len clamp)
+        "split": cfg.split,
+        "n_agents": cfg.n_agents,
+        "eval_every": cfg.eval_every,
+        "eval_suites": {short: list(idxs) for short, _ev, idxs in eval_suites},
+        "cfg": {**vars(cfg), "env": vars(cfg.env), "ppo": vars(cfg.ppo)},
+    })
+
     # Exit events: normal finish sets state="done" below; any abnormal exit
     # (exception, Ctrl-C, docker stop/SIGTERM) lands here and records "stopped".
     # kill -9 leaves no event → server falls back to the PID liveness check.
@@ -661,6 +746,9 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                 print(f"[finalize] policy save failed ({exc})")
             status["state"] = "stopped"
             _dump_status(cfg.out_dir, status)
+            metrics.write({"kind": "event", "event": "stopped",
+                           "iter": int(status.get("iter", 0))})
+        metrics.close()
     atexit.register(_finalize)
 
     def _on_sigterm(*_):
@@ -694,6 +782,12 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
             print(f"[control eval tag={tag}] {short}(n={len(idxs)}): "
                   f"score={s['eval/score']:+.3f} auc={s['eval/coverage_auc']:.3f} "
                   f"succ={s['eval/success_rate']:.2f} idle={s['eval/idle_rate_max']:.2f}")
+            # On-demand evals are the only place a DIFFERENT split gets measured mid-run, and they
+            # were console-only — the v12 hybrid control eval (succ=1.00 auc=0.910) survives
+            # nowhere else. Persist the full suite dict, not the four values that get printed.
+            metrics.write({"kind": "eval_ondemand", "iter": int(status.get("iter", 0)),
+                           "env_steps": env_steps, "tag": tag, "split": split_name,
+                           "n_maps": len(idxs), **s})
             if wb is not None:
                 wb.log({k.replace("eval/", f"eval/ondemand/{short}/"): v for k, v in s.items()},
                        step=env_steps)
@@ -710,7 +804,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                     print(f"[control] gif '{mtag}' skipped ({exc})")
                 try:
                     capture_trace(model, split_obj, cfg.env.__dict__, cfg.n_agents,
-                                  int(midx), cfg.eval_steps, cfg.out_dir, mtag, cfg.device)
+                                  int(midx), min(cfg.eval_steps, cfg.trace_steps), cfg.out_dir, mtag, cfg.device)
                 except Exception as exc:
                     print(f"[control] trace '{mtag}' skipped ({exc})")
                 if wb is not None and gif_path.exists():
@@ -843,7 +937,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                         torch.cuda.empty_cache()   # free fragmentation headroom for the render env
                     _short, _ev, _midxs = eval_suites[0]
                     capture_trace(model, _ev.split, cfg.env.__dict__, cfg.n_agents,
-                                  int(_midxs[0]), cfg.eval_steps, cfg.out_dir,
+                                  int(_midxs[0]), min(cfg.eval_steps, cfg.trace_steps), cfg.out_dir,
                                   f"auto_it{it:04d}", cfg.device)
                     print(f"[inspector] auto trace captured (it={it}) → inspector unlocked")
                 except Exception as exc:
@@ -874,6 +968,8 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                 best_eval_iter = it
                 _save_ckpt(cfg.out_dir, model, vnorm, cfg, it, "ckpt_best")
                 print(f"[best] new best eval/score={best_eval_score:+.3f} at it={it} → ckpt_best.pt")
+                metrics.write({"kind": "event", "event": "best", "iter": it,
+                               "env_steps": total_env_steps, "score": best_eval_score})
             # GATED curriculum: advance to the next split when the suite score clears the gate
             # AND the current stage has had its minimum dwell (avoids advancing on a noisy early
             # spike). Advance SWAPS the training split → rebuild env + buffer (canvas/N_max may
@@ -895,18 +991,30 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                 print(f"[curriculum] GATED advance → stage {cur_stage} split='{next_name}' "
                       f"(score {eval_stats['eval/score']:+.3f} ≥ {cfg.curriculum_gate_score}); "
                       f"env+buffer rebuilt (canvas {env.H}×{env.W}, max_steps={env.cfg.max_episode_steps})")
+                metrics.write({"kind": "event", "event": "curriculum_advance", "iter": it,
+                               "env_steps": total_env_steps, "stage": cur_stage,
+                               "split": next_name,
+                               "max_episode_steps": env.cfg.max_episode_steps})
+        # Assembled OUTSIDE the wandb guard on purpose: the same object feeds both sinks, so a
+        # key can never exist in W&B but not on disk (or drift between them). eval_stats is empty
+        # on non-eval iterations, which is exactly why the on-disk format has to be JSONL.
+        log = {
+            "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
+            "train/entropy": stats["entropy"], "train/kl": stats["kl"],
+            "train/clipfrac": stats["clipfrac"], "train/nan_skips": stats.get("nan_skips", 0),
+            "perf/sps": sps_iter,
+            "perf/coll_sps": coll_sps, "perf/upd_sps": upd_sps,
+            "explore/ep_end": ep_end_mean, "explore/ep_end_n": ep_end_n,
+            "explore/efficiency": efficiency, "iter": it,
+        }
+        log.update(agg)
+        log.update(eval_stats)
+        metrics.write({"kind": "iter", "env_steps": total_env_steps,
+                       "wall": time.time() - status["start_time"],
+                       "split": cfg.curriculum_stage_splits[cur_stage] if cfg.curriculum_gated
+                       else cfg.split,
+                       "stage": cur_stage, **log})
         if wb is not None:
-            log = {
-                "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
-                "train/entropy": stats["entropy"], "train/kl": stats["kl"],
-                "train/clipfrac": stats["clipfrac"], "train/nan_skips": stats.get("nan_skips", 0),
-                "perf/sps": sps_iter,
-                "perf/coll_sps": coll_sps, "perf/upd_sps": upd_sps,
-                "explore/ep_end": ep_end_mean, "explore/ep_end_n": ep_end_n,
-                "explore/efficiency": efficiency, "iter": it,
-            }
-            log.update(agg)
-            log.update(eval_stats)
             wb.log(log, step=total_env_steps)
         if it in milestones:
             pct = milestones[it]
@@ -920,6 +1028,9 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                                        "n_agents": cfg.n_agents},
             }, ckpt_path)
             print(f"[ckpt] {ckpt_path}")
+            metrics.write({"kind": "event", "event": "ckpt", "iter": it,
+                           "env_steps": total_env_steps, "tag": f"ckpt_{pct:03d}",
+                           "path": str(ckpt_path)})
             # Milestone status update (rare event — piggybacks the ckpt's own disk write).
             status.update(iter=it, progress_pct=round(100.0 * it / n_iters, 1),
                           last_ckpt=f"ckpt_{pct:03d}", env_steps=total_env_steps,
@@ -941,7 +1052,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                     # Step-through decision trace for the web inspector (same episode/map).
                     try:
                         capture_trace(model, _eval_split, cfg.env.__dict__, cfg.n_agents,
-                                      int(midx), cfg.eval_steps, cfg.out_dir,
+                                      int(midx), min(cfg.eval_steps, cfg.trace_steps), cfg.out_dir,
                                       f"ckpt_{pct:03d}_m{gi}", cfg.device)
                     except Exception as e:
                         print(f"[trace] skipped ({e})")
@@ -964,5 +1075,9 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
     status.update(state="done", iter=n_iters, progress_pct=100.0,
                   env_steps=total_env_steps)
     _dump_status(cfg.out_dir, status)
+    metrics.write({"kind": "event", "event": "done", "iter": n_iters,
+                   "env_steps": total_env_steps, "best_eval_score": best_eval_score,
+                   "best_eval_iter": best_eval_iter})
+    metrics.close()
     if wb is not None:
         wb.finish()

@@ -77,6 +77,16 @@ def main() -> None:
                                 n_layers=int(n_layers)).to(args.device)
         sd = {k.replace("encoder._orig_mod.", "encoder."): (v.to(args.device) if torch.is_tensor(v) else v)
               for k, v in ckpt["model"].items()}
+        # strict=False does NOT forgive shape mismatches (torch raises on those regardless), so a
+        # checkpoint written before any width change (F_IN, CRITIC_GLOBAL_DIM, AGENT_SCALAR_DIM)
+        # would hard-crash here. Drop and report, same as eval/ckpt_loader.py.
+        _msd = model.state_dict()
+        _dropped = [k for k in sd if k in _msd and _msd[k].shape != sd[k].shape]
+        if _dropped:
+            print(f"[load] WARNING: {len(_dropped)} shape-mismatched key(s) DROPPED — those modules "
+                  f"are RANDOMLY INITIALIZED: {_dropped[:5]}{'...' if len(_dropped) > 5 else ''}")
+        for k in _dropped:
+            del sd[k]
         model.load_state_dict(sd, strict=False)
         if isinstance(cfg_peek, dict):
             model.use_gru = bool(cfg_peek.get("use_gru", True))

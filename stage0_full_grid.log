@@ -1,0 +1,79 @@
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['hybrid'] agents=[2, 4] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[hybrid] travel budget 8000px (step cap 1000 = safety net; IR2 native was 196)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.66 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [hybrid M=2] 25/100 maps
+  [hybrid M=2] 50/100 maps
+  [hybrid M=2] 75/100 maps
+  [hybrid M=2] 100/100 maps
+hybrid_M2                 2343   109.6     0.998     1.00   0.97   0.998   → marlauder_hybrid_M2_s0g.csv
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+  [hybrid M=4] 25/100 maps
+  [hybrid M=4] 50/100 maps
+  [hybrid M=4] 75/100 maps
+  [hybrid M=4] 100/100 maps
+hybrid_M4                 1841    82.4     0.999     1.00   0.65   0.999   → marlauder_hybrid_M4_s0g.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0g
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['corridor'] agents=[2, 4] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[corridor] travel budget 14000px (step cap 1750 = safety net; IR2 native was 196)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.54 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [corridor M=2] 25/100 maps
+  [corridor M=2] 50/100 maps
+  [corridor M=2] 75/100 maps
+  [corridor M=2] 100/100 maps
+corridor_M2               4781   258.2     0.998     1.00   0.94   0.999   → marlauder_corridor_M2_s0g.csv
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+  [corridor M=4] 25/100 maps
+  [corridor M=4] 50/100 maps
+  [corridor M=4] 75/100 maps
+  [corridor M=4] 100/100 maps
+corridor_M4               3830   202.7     1.000     1.00   0.69   1.000   → marlauder_corridor_M4_s0g.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0g
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['complex'] agents=[2, 4] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[complex] travel budget 30000px (step cap 3750 = safety net; IR2 native was 384)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.52 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [complex M=2] 25/100 maps
+  [complex M=2] 50/100 maps
+  [complex M=2] 75/100 maps
+  [complex M=2] 100/100 maps
+complex_M2               14536   757.7     0.994     0.98   0.83   0.997   → marlauder_complex_M2_s0g.csv
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+  [complex M=4] 25/100 maps
+  [complex M=4] 50/100 maps
+  [complex M=4] 75/100 maps
+  [complex M=4] 100/100 maps
+complex_M4               10671   547.5     0.998     1.00   0.49   0.998   → marlauder_complex_M4_s0g.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0g
+=== GRID_DONE ===

@@ -92,7 +92,7 @@
       <option value="uv">util · detectable vol</option>
       <option value="age">age</option>
       <option value="team">teammate_pot</option>
-      <option value="bel">belief p (pathfront, fixed 0→0.03: black→yellow→red; cyan○ = transit dots)</option>
+      <option value="bel">belief p (fixed 0→0.03 black→yellow→red · cyan○ transit dot · yellow○ frontier · blue○ in comm range · MAGENTA○ = belief inside comm on a non-frontier = wrong)</option>
       <option value="bu">radar · utility (out-of-window)</option>
       <option value="bt">radar · teammate (out-of-window)</option>
     </select></label>
@@ -131,8 +131,16 @@
     <div id="attribHint" style="margin-top:6px;color:var(--dim);font-size:11px"></div>
     <div id="headsGrid"></div>
   </details>
+  <details class="sec" id="secScalars" open><summary>actor scalars (what the policy read for this move)</summary>
+    <table id="scalars"></table>
+    <div id="scalarsHint" style="margin-top:6px;color:var(--dim);font-size:11px"></div>
+  </details>
   <details class="sec" id="secReward" open><summary>reward breakdown (received entering this step)</summary>
     <table id="reward"></table>
+  </details>
+  <details class="sec" id="secRdv" open><summary>rendezvous — raw state &amp; how it pays</summary>
+    <table id="rdv"></table>
+    <div id="rdvHint" style="margin-top:6px;color:var(--dim);font-size:11px"></div>
   </details>
   <details class="sec" id="secNode" open><summary id="nodeTitle">selected node</summary>
     <table id="node"><tr><td class="k">—</td></tr></table>
@@ -387,6 +395,21 @@ function drawNodes(){
   // hypothesis (belt===1) in cyan — uniform brightness so ALL dots are visible departing lkp→frontier
   // even when the utility/distance weights concentrate the probability mass on one cluster.
   if(A.field==="bel"){
+    // The belief field cannot be judged from the heat alone. Two overlays, same grammar as the
+    // scripted-scenario pages (runs/pf_scenarios): a BLUE halo on every node inside comm range
+    // (sn — "if he stood here the radio would have him, and it didn't"), and a YELLOW outline on
+    // every FRONTIER (fr — an opening into the unknown). Belief on a yellow node inside a blue
+    // halo is CORRECT: it means "he is beyond that opening". Belief inside a blue halo with NO
+    // yellow outline is the one configuration that is always wrong, and it is now visible instead
+    // of having to be inferred.
+    ctx.lineWidth=1.2; ctx.strokeStyle="rgba(90,170,255,0.55)";
+    for(const n of ag.nodes){ if(n.sn===1){ ctx.beginPath(); ctx.arc(n.x,n.y,5.2,0,6.283); ctx.stroke(); } }
+    ctx.lineWidth=1.8; ctx.strokeStyle="#f0c674";
+    for(const n of ag.nodes){ if(n.fr===1){ ctx.beginPath(); ctx.arc(n.x,n.y,4.2,0,6.283); ctx.stroke(); } }
+    // WRONG-PLACEMENT MARKER: belief inside comm range on ground that is not an opening.
+    ctx.lineWidth=2.4; ctx.strokeStyle="#ff35d0";
+    for(const n of ag.nodes){ if(n.sn===1 && n.fr!==1 && n.bel>1e-4){
+      ctx.beginPath(); ctx.arc(n.x,n.y,7.5,0,6.283); ctx.stroke(); } }
     ctx.strokeStyle="#25f0ff"; ctx.lineWidth=2.2;
     for(const n of ag.nodes){ if(n.belt===1){ ctx.beginPath(); ctx.arc(n.x,n.y,6.5,0,6.283); ctx.stroke(); } }
   }
@@ -690,17 +713,54 @@ function panels(){
   const banner = term
     ? `<tr><td colspan=2 style="text-align:center;color:var(--ok);font-weight:600;padding:5px 0;border-bottom:1px solid var(--ok)">✓ EPISODE COMPLETE · full map (both agents)</td></tr>`
     : "";
+  const st=curStep();
   $("meta").innerHTML = banner + row("step",A.t)+row("agent",A.agent)+row("value",ag.value)
-    +row("curr node",ag.curr)+row("chosen action",ag.action);
+    +row("curr node",ag.curr)+row("chosen action",ag.action)
+    +(st.explored!==undefined?row("union explored",st.explored):"")
+    +(st.own_min!==undefined?row("weakest own map",st.own_min):"")
+    +(ag.travel!==undefined?row("travelled (px)",ag.travel):"");
+  // ACTOR SCALARS — the per-agent inputs the trunk reads alongside the GAT embedding. Order is
+  // fixed env-side (AGENT_SCALAR_DIM in models/actor_critic.py); labelled here so a raw vector
+  // doesn't have to be decoded by hand. travel_frac is the one to watch for "is it in a hurry":
+  // it is progress toward whichever stop criterion binds first, and before v16 it did not exist.
+  const SCAL=[
+    ["g (rdv gate)",      "surplus gate ∈[0,1] — also multiplies the rdv reward"],
+    ["staleness",         "steps since last sync with the owed teammate / rdv_urgency_T"],
+    ["travel_frac",       "episode budget consumed — max(travel/budget, t/T_max)"],
+    ["contact",           "1 while in comm with a teammate"],
+    ["offer_frac",        "map owed to that teammate / free_total (does NOT saturate like g)"],
+  ];
+  const sc=ag.scalars;
+  if(sc && sc.length){
+    $("scalars").innerHTML = sc.map((v,i)=>{
+      const nm=(SCAL[i]||[`scalar[${i}]`,""])[0], tip=(SCAL[i]||["",""])[1];
+      // bar as a share of [0,1] — every scalar is normalised to that range env-side.
+      const w=Math.max(0,Math.min(1,v))*100;
+      return `<tr title="${tip}"><td class=k>${nm}</td><td class=v>${v.toFixed(4)}
+        <div style="height:3px;background:var(--dim);opacity:.25;margin-top:2px">
+        <div style="height:3px;width:${w}%;background:var(--ok);opacity:1"></div></div></td></tr>`;
+    }).join("");
+    $("scalarsHint").textContent = sc.length!==SCAL.length
+      ? `trace has ${sc.length} scalars, viewer knows ${SCAL.length} — labels may be off`
+      : "all normalised to [0,1]; bar = value";
+  } else {
+    $("scalars").innerHTML = "<tr><td class=k>(not in this trace)</td></tr>";
+    $("scalarsHint").textContent = "";
+  }
   // communication: per teammate, live (knows true pos) vs estimate (stale belief).
   const tms=ag.teammates||[];
-  $("comm").innerHTML = tms.length ? tms.map(tm=>{
+  // A PAID sync is narrower than contact: rising edge only, and only past --sync-min-gap. The two
+  // come apart exactly where the min-gap suppresses a payment, which is invisible from comm alone.
+  const syncBadge = ag.sync
+    ? `<tr><td colspan=2 style="text-align:center;padding:4px 0"><span class="cstat live">⇄ MAP SYNC PAID this step</span></td></tr>`
+    : "";
+  $("comm").innerHTML = (tms.length ? tms.map(tm=>{
     const live=!!tm.comm, p=live?tm.true:tm.est;
     return `<tr><td><span class="cdot" style="background:${acol(tm.j)}"></span>agent ${tm.j}</td>
       <td class=v><span class="cstat ${live?'live':'est'}">${live?'● communicating':'≈ estimate'}</span></td></tr>
       <tr><td class=k style="padding-top:0">${live?'true pos':'believed pos'}</td>
       <td class="v" style="padding-top:0;color:var(--dim)">${p[0]}, ${p[1]}</td></tr>`;
-  }).join("") : "<tr><td class=k>(single agent)</td></tr>";
+  }).join("") : "<tr><td class=k>(single agent)</td></tr>") + syncBadge;
   // logits 3x3 (center blank). DIVERGING bar from the mid-line (= logit 0): positive grows
   // UP (blue/green), negative grows DOWN (red). Sign = fill direction, magnitude = length.
   // Symmetric scale by the max |logit| in the set so the bars are comparable.
@@ -744,8 +804,103 @@ function panels(){
         + `<td class="v ${rw.total<0?'neg':rw.total>0?'pos':''}" style="font-weight:600">${rw.total===null?'·':rw.total.toFixed(4)}</td></tr>`;
   }
   $("reward").innerHTML = html||"<tr><td class=k>—</td></tr>";
+  showRdv(rw);
   showAttrib();
   showNode();
+}
+
+// rendezvous — the RAW numbers, in their own units, plus the arithmetic that turns them into the
+// `rdv` line of the reward table. Read from step t-1 for the same reason the reward table is:
+// the term is produced by the transition INTO the frame on screen.
+// Two questions this has to answer without the reader guessing:
+//   * why is g what it is — content (surplus I owe) vs urgency (staleness), and against what scale
+//   * why is rdv what it is — g, or Δφ, or both, and a zero from which of them
+function showRdv(rw){
+  const R = (A.t>0 ? ((A.trace.steps[A.t-1].agents[A.agent]||{}).rdv||null) : null);
+  if(!R){ $("rdv").innerHTML="<tr><td class=k>—</td></tr>"; $("rdvHint").innerHTML=""; return; }
+  const n=(v,d)=> (v===null||v===undefined) ? "·" : (+v).toFixed(d===undefined?4:d);
+  const hd=t=>`<tr><td colspan=2 style="padding-top:6px;color:var(--dim);font-size:11px">${t}</td></tr>`;
+  let h="";
+  h+=hd("gate g — content");
+  h+=row("owed teammate j*", R.j===null?"·":("#"+R.j));
+  h+=row("offer (px I have, j* lacks)", n(R.offer,1));
+  h+=row("baseline (my map at last sync)", n(R.baseline,1));
+  h+=row("frac required (decays w/ baseline)", n(R.frac));
+  h+=row("scale = frac · baseline (floored)", n(R.scale,1));
+  h+=row("<b>g_content</b> = offer / scale", `<b>${n(R.g_content)}</b>`);
+  const budgetMode = (R.urgency_mode==="budget");
+  h+=hd("gate g — urgency ("+(R.urgency_mode||"time")+")");
+  h+=row("dt since last sync (steps)", R.dt===null?"·":R.dt);
+  h+=row(budgetMode ? "urgency = (travel_frac − start)/(1 − start)" : "urgency = dt / T",
+         n(R.urgency));
+  h+=row("urgency weight", n(R.urgency_w));
+  h+=hd("gate g — result");
+  h+=row("<b>g</b> = clamp(g_content + w·urgency, 0, 1)", `<b>${n(R.g)}</b>`);
+  h+=hd("approach Δφ (geodesic to j*, normalised)");
+  h+=row("φ_prev", R.valid===0 ? "<span style='color:var(--dim)'>+inf (first step)</span>" : n(R.phi_prev));
+  h+=row("φ now", n(R.phi));
+  // With --rdv-clamp-pos the paid Δφ is max(raw, 0). Showing only the paid value would make a
+  // clamped run look like the agent never retreated at all — the gap between the two rows IS the
+  // standing tax on leaving that the clamp removes.
+  if(R.clamped && R.dphi_raw!==null && R.dphi_raw!==undefined && R.dphi_raw < -1e-9){
+    h+=row("Δφ raw (geometry)", `<span class=neg>${n(R.dphi_raw,5)}</span>`);
+    h+=row("<b>Δφ</b> paid = max(raw, 0) <span style='color:var(--dim)'>[clamped]</span>", `<b>${n(R.dphi,5)}</b>`);
+  } else {
+    h+=row("<b>Δφ</b> = φ_prev − φ now"+(R.clamped?" <span style='color:var(--dim)'>[clamp on]</span>":""),
+           `<b>${n(R.dphi,5)}</b>`);
+  }
+  h+=hd("payout");
+  h+=row("w (rdv_dense_weight)", n(R.w));
+  const rdv = R.rdv, tot = (rw && "total" in rw) ? rw.total : null;
+  h+=`<tr><td class=k style="font-weight:600;color:var(--txt)">rdv = w · g · Δφ</td>`
+    +`<td class="v ${rdv<0?'neg':rdv>0?'pos':''}" style="font-weight:600">${n(rdv,5)}</td></tr>`;
+  if(tot!==null && tot!==undefined && Math.abs(tot)>1e-9)
+    h+=row("share of total reward", (100*rdv/tot).toFixed(1)+"%");
+  // WHICH MOVE IS THE GATE PAYING FOR. g says the gate is hot; it never says which neighbour it
+  // favours. preview[k] = w·g·(φ_curr − φ_nbr[k]) is what the term would actually hand out for
+  // taking k, so a hot gate that is NOT steering the choice becomes visible instead of assumed.
+  // Laid out as the same 3x3 the logits use, so the two panels read against each other directly.
+  if(R.preview && R.preview.length){
+    const pv=R.preview, fin=pv.filter(v=>v!==null&&v!==undefined);
+    const mx=fin.length?Math.max(...fin.map(Math.abs)):0;
+    const best=pv.reduce((b,v,i)=>(v!==null&&v!==undefined&&(b<0||v>pv[b]))?i:b,-1);
+    const took=(A.t>0?(A.trace.steps[A.t-1].agents[A.agent]||{}).action:null);
+    const cells=[0,1,2,3,null,4,5,6,7];
+    const grid=cells.map(k=>{
+      if(k===null) return `<div style="padding:4px"></div>`;
+      const v=pv[k];
+      if(v===null||v===undefined)
+        return `<div style="padding:4px;text-align:center;color:var(--dim);font-size:10px">·</div>`;
+      const s=mx>0?Math.abs(v)/mx:0;
+      const col=v>0?`rgba(80,200,140,${.15+.55*s})`:v<0?`rgba(220,90,90,${.15+.55*s})`:"transparent";
+      const mark=(k===took?"◉":"")+(k===best&&v>0?"★":"");
+      return `<div style="padding:4px;text-align:center;font-size:10px;background:${col};
+        border:1px solid ${k===took?'var(--ok)':'transparent'}">${v.toFixed(4)}<br>
+        <span style="color:var(--dim)">${k}${mark}</span></div>`;
+    }).join("");
+    h+=hd("per-move payout — w · g · (φ here − φ there)");
+    h+=`<tr><td colspan=2><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:2px">
+      ${grid}</div>
+      <div style="margin-top:4px;color:var(--dim);font-size:10px">
+      ◉ = move taken &nbsp; ★ = best approach &nbsp; green = toward j*, red = away</div></td></tr>`;
+  }
+  $("rdv").innerHTML=h;
+  // Say WHY it is zero when it is — the single thing a bare number cannot tell you.
+  let why="";
+  if(rdv!==null && Math.abs(rdv)<1e-9){
+    if(R.valid===0) why="rdv = 0 because φ_prev is +inf (first step after reset): nothing to compare against, the term is masked.";
+    else if(R.g!==null && R.g<1e-6) why="rdv = 0 because <b>g = 0</b> — no surplus owed and no staleness. Approach is not paid right now, whatever the agent does.";
+    else if(R.dphi!==null && Math.abs(R.dphi)<1e-9) why="rdv = 0 because <b>Δφ = 0</b> — the gate is open but the agent did not close any geodesic distance to j* this step.";
+    else why="rdv = 0.";
+  } else if(rdv<0){
+    why="rdv &lt; 0: the agent moved AWAY from j* while the gate was open, and this run charges it — "
+      + "i.e. --rdv-clamp-pos is OFF. With the clamp on, Δφ &lt; 0 pays exactly 0 and leaving is free.";
+  }
+  $("rdvHint").innerHTML = why + (why?"<br>":"")
+    + "All quantities raw: offer/baseline/scale in pixels, dt in steps, φ ∈ [0,1]. "
+    + "φ is the geodesic distance to j*'s last-known position. NOTE this is not potential-based "
+    + "shaping — g is state-dependent and there is no γ — so the per-episode sum does not cancel, "
+    + "with or without the clamp.";
 }
 function row(k,v){ return `<tr><td class=k>${k}</td><td class=v>${v}</td></tr>`; }
 
@@ -764,9 +919,17 @@ function showNode(){
   const uvv = n.uv!=null?row("&nbsp;&nbsp;↳ detectable vol",n.uv):"";
   const buv = n.bu!=null?row("radar util (out-of-win)",n.bu):"";
   const btv = n.bt!=null?row("radar teammate (out-of-win)",n.bt):"";
+  // Belief verdict per node, spelled out rather than left to be read off three overlays at once.
+  const bv = n.bel>1e-4 && n.sn===1
+    ? (n.fr===1 ? "<span style='color:#f0c674'>on a frontier inside comm — OK (he is beyond it)</span>"
+                : "<span style='color:#ff35d0'>inside comm, NOT a frontier — WRONG</span>")
+    : (n.bel>1e-4 ? "out of comm range" : "—");
   $("node").innerHTML = row("utility (diffused)",n.util)+ubv+uvv
     +row("age",n.age)+row("teammate_pot",n.team)
     +buv+btv
+    +row("belief p",n.bel!=null?n.bel:"·")
+    +row("frontier / in comm",(n.fr===1?"frontier":"—")+" / "+(n.sn===1?"in comm":"out"))
+    +row("belief verdict",bv)
     + (n.i===ag.curr?row("•","CURR"):"");
 }
 

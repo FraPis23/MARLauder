@@ -64,6 +64,23 @@ class EnvCfg:
     guidepost_path_max: int = 0
     num_sim_steps: int = 5
     max_episode_steps: int = 512
+    # TRAVEL BUDGET (px, 0.0 = OFF → step cap alone, so every existing checkpoint replays exactly
+    # as it trained). When > 0 the episode also truncates once the FARTHEST-travelled robot has
+    # covered this much ground. This is the only horizon that means the same thing on both sides
+    # of the IR2 comparison: an IR2 "step" is a waypoint teleport of unbounded length, ours is one
+    # lattice hop of ≤ nr·√2 px, so equal step caps are NOT equal budgets — at IR2's native caps we
+    # get ~100% of their measured travel on hybrid but only ~50% on corridor and ~43% on complex,
+    # which is exactly the pattern of where we pass and fail. A distance budget is also the honest
+    # physical constraint for a real robot (battery / mission time).
+    max_travel_px: float = 0.0
+    # Same budget, expressed PER MAP as px-travelled per GT-free-pixel (0.0 = off). Takes
+    # precedence over max_travel_px when both are set. This is the form TRAINING needs:
+    # train/difficult spans 3.9x in free area between its p50 (128k px) and p90 (495k px) maps, so
+    # one fixed px budget is simultaneously generous on half the split and starving on the other
+    # half — and the starved half is exactly where the completion bonus has to fire for the own-99%
+    # objective to have a gradient. Scale for calibration, measured on the v12 policy in Stage 0:
+    # it actually spent 0.0217 px/free-px on hybrid, 0.0311 on complex, 0.0374 on corridor.
+    max_travel_frac: float = 0.0
     flood_max_iters: int = 200
     done_explored_thresh: float = 0.99
     # Episode-termination rule (what counts as "the map is done"):
@@ -130,6 +147,25 @@ class EnvCfg:
     # consideration, not noise, but never bigger than a full novel-scan credit — exploration still
     # wins a frontier-vs-teammate tug of war when both are on the table.
     rdv_dense_weight: float = 2.5           # w: strength of g·(φ_prev−φ_now). 0 disables. M>1 only.
+    # Pay only the APPROACH half: Δφ clamped to ≥0, so moving away from the teammate is never taxed.
+    # Two things make this safe, neither of which is "it stays telescoping" — it does not:
+    #   1. NOTHING IS LOST. The term was never potential-based shaping to begin with. PBRS needs
+    #      γ·Φ(s')−Φ(s) with Φ a pure function of state; this is g·(Φ_prev−Φ_now) with a
+    #      state-dependent, time-varying gate g and no γ. The policy-invariance guarantee was
+    #      already gone, so clamping forfeits nothing that was actually held.
+    #   2. THE OSCILLATION IS NOT FARMABLE while w < step_penalty_coef·scan_norm_nodes = 0.75.
+    #      One approach hop pays at most w·(1/scan_norm_nodes) = w·0.02 (0.002 at the shipped
+    #      w=0.10); the hop itself costs step_penalty_coef = 0.015, plus the revisit penalty on the
+    #      way back. Approach→retreat→approach loses 7.5× what it earns. Raise w past 0.75 and this
+    #      inverts into free money — the bound is the flag's whole safety argument.
+    # WHY: measured over v15, `reward/rdv` was −0.20/episode — a NET TAX on the divergence that
+    # exploration requires. The positive half is the shaping that was wanted; the negative half was
+    # a standing penalty on leaving.
+    rdv_clamp_pos: bool = False
+    # Inspector/trace only: suppress BUDGET truncation (step cap + travel budget) without zeroing the
+    # budget itself, so `travel_frac` in agent_scalars stays on-distribution while capture_trace runs
+    # an episode past its natural end. Zeroing max_travel_frac (the old way) also zeroed the obs.
+    ignore_budget_truncation: bool = False
     # ABLATION — blind the ACTOR to teammates: zeroes agent_scalars [∆M-gate, staleness],
     # feat[4] (teammate-proximity potential) and feat[6] (radar teammate). Map fusion at comm,
     # the rdv reward gate and the privileged critic (geo_pair) are untouched. Pure-exploration
@@ -160,6 +196,17 @@ class EnvCfg:
     # capped push so a very long separation nudges toward meeting even with a modest surplus.
     rdv_urgency_weight: float = 0.25        # max additive boost to g from pure staleness
     rdv_urgency_T: float = 200.0            # steps of staleness to reach the full urgency boost
+    # WHAT MAKES A MEETING URGENT. "time" (legacy) ramps on steps-since-last-sync, so the gate opens
+    # merely because the two have been apart a while — which pulls them together in the MIDDLE of an
+    # episode, when they should still be splitting. "budget" ramps on the fraction of the episode
+    # budget already spent, so the pull appears only as the deadline approaches. That matches the
+    # actual objective: under done_mode="own" the terminal rendezvous is what completes both maps,
+    # and there is no reason to pay for it early. Uses the same travel_frac the actor now observes.
+    # NOTE this changes what `g` means, and `g` is BOTH agent_scalars[0] and the rdv reward gate — a
+    # warm start across a mode switch shifts that input's distribution. Deliberate at a phase
+    # boundary (the split/cap/budget all change there anyway); do not flip it mid-phase.
+    rdv_urgency_mode: str = "time"          # "time" | "budget"
+    rdv_urgency_start: float = 0.5          # budget mode: fraction of budget spent before urgency starts
     # ---- SYNC-EVENT reward (the OBJECTIVE term rendezvous was missing). rdv_dense above is
     # TELESCOPING shaping: its net payoff over a full separate→approach→meet cycle is only
     # w·g·φ_sep (measured φ_sep≈0.45 → 0.045 at w=0.10, 1.13 even at w=2.5) against a measured
@@ -271,32 +318,47 @@ class EnvCfg:
     # its walls → the whole corridor is one connected "frontier" → 1 giant cluster whose centroid sits in
     # the middle. Requiring more unknown neighbours keeps only genuine OPENINGS into large unknown regions,
     # so distinct openings become distinct clusters and a point departs toward each.
-    pf_frontier_min_unknown: int = 4
+    # Kept only as a MINIMUM GUARD (≥1 unknown 8-neighbour). It used to be 4, to stop thin-corridor
+    # interior cells chaining into one giant cluster — but it measures the wrong thing: the count
+    # collapses as soon as the observer gets CLOSE and reveals a few neighbours, while the node's
+    # actual ribbon into the unknown is still there. Measured on test/hybrid #1, node #362 between
+    # t=73 and t=74: seed 0.9002 → 0.5428 (still 61% of its ribbon, 27× the utility gate) and it was
+    # dropped anyway, purely because its unknown-neighbour count fell under 4 — the belief moved to
+    # node #809, seed 0.1439, whose only merit was being far enough away to still be surrounded by
+    # unknown. The anti-chaining job is done properly by pf_frontier_min_util below, which measures
+    # what is left to reveal. Sweep on the same episode (frontier clusters median/max · belief
+    # sitting on real openings): 4/0.02 → 5/9 · 0.5302 ; 1/0.02 → 6/18 · 0.4265 ; 1/0.10 → 6/14 ·
+    # 0.6800. The giant cluster does not come back, and the belief lands on openings far more often.
+    pf_frontier_min_unknown: int = 1
+    # ...AND a real frontier ribbon behind it. The unknown-neighbour count alone marks a node as an
+    # opening whenever the cells past it are unknown — including when they are unknown because a
+    # WALL is in the way and they will never be revealed from anywhere. Those nodes are permanent
+    # false openings: walking over them does not clear them (the count never drops), so the belief
+    # absorbs on them forever. Measured on test/hybrid #1 at t=60: 29 of the 32 nodes flagged as
+    # frontiers had util_boundary = 0.000, i.e. a PRE-DIFFUSION seed of exactly 0.0 — no ribbon at
+    # all — and they were holding 0.2442 of the belief. `util_raw` (= f_ind, the seed, nonzero only
+    # on true frontier nodes) is the honest test, and it also removes what the user called "la punta
+    # dell'angolo di una stanza": a corner tip has a negligible ribbon, so a negligible seed. The
+    # DIFFUSED utility is NOT usable here — a corner tip next to a real opening inherits its value.
+    # STRICTLY POSITIVE, not a tuned threshold. The bug is nodes with EXACTLY zero ribbon, and
+    # `> 0` is the whole fix. A threshold of 0.10 was calibrated on one test/hybrid episode, where
+    # genuine openings scored 0.14-0.90 — it does NOT generalise: on train/easy the same gate cut
+    # the openings from ~20 per step to ~5 and, because a hypothesis needs a frontier target, took
+    # the belief's own liveness with it. Measured with a fixed policy over 4 easy maps, 1600 steps
+    # (scripts/pf_obs_diag.py), against the v13 belief as control — frontier nodes · belief alive
+    # while out of comm · feat[4] teammate_pot nonzero · mass on real openings:
+    #   v13 belief, no gate   21.1 · 99.4% · 24.7% · 0.184
+    #   gate 0.10 (shipped)    5.5 · 81.0% ·  5.6% · 0.542   <- v14's 60-iteration regression
+    #   gate 0.02              6.1 · 84.0% · 14.9% · 0.682
+    #   gate 1e-6              6.3 · 82.8% · 24.6% · 0.686   <- full observation coverage restored
+    # feat[4] is the potential the policy navigates the teammate by; starving it from a quarter of
+    # the known nodes to a twentieth is what cost v14 the run, not any of the belief logic fixes
+    # (the same measurement shows those cost nothing: 19.3 · 99.4% · 24.6% at gate 0).
+    pf_frontier_min_util: float = 1e-6
     # pathfront phase-2 absorbing-diffusion knobs (β_F = min(gain·utility(F), β_max) per-step lock rate).
-    # Absorption rate at an opening: β = min(gain·utility, β_max) of the live mass locked per step. Full
-    # strength pins essentially the whole belief on the frontier ring; keeping it partial leaves a tail
-    # that propagates back into the mapped area, which is where the teammate may also be.
-    belief_absorb_gain: float = 0.45
-    belief_beta_max: float = 0.45
-    # Fraction of a node's live mass that flows out per step, one hop, split over its known-free
-    # neighbours ∝ their utility (never onto ground the observer can see). The utility bias is what makes
-    # this carry the belief ALONG the frontier and toward what is still unexplored instead of smearing it
-    # evenly — plain isotropic diffusion both leaked mass backwards into already-swept corridor and never
-    # managed to move it to the next opening over.
-    belief_diffuse_lambda: float = 0.5
-    # A node counts as a "way out" (belief mass on it means "the teammate is somewhere BEYOND here", and is
-    # therefore exempt from the comm-range deletion) only while at least this much utility is left behind
-    # it. A whisker of unreachable unknown is not a way out: without the gate, a node with utility 0.004
-    # keeps its mass even with the observer standing ON it, so a ghost trail survives behind the agent and
-    # the redistribution keeps feeding it (confirmed: m50/agent1 t=114-118).
-    belief_door_min_util: float = 0.05
-    # PLAUSIBILITY PRUNING (pathfront only, 0.0 = OFF): a frontier whose utility has decayed below
-    # belief_prune_util is a "closed door" — an explored pocket with a residual sliver of unknown that
-    # nobody would travel to. Its locked belief mass is dropped (Σp < 1 → feat[4] fades = "teammate
-    # lost") instead of being kept as a confident wrong peak, and no hypothesis is frozen toward it.
-    # belief_prune_min_cluster drops openings made of fewer than this many frontier nodes at freeze time.
-    belief_prune_util: float = 0.0
-    belief_prune_min_cluster: int = 0
+    belief_absorb_gain: float = 1.0
+    belief_beta_max: float = 0.9
+    belief_diffuse_lambda: float = 0.5   # fraction of a node's live mass that hops out per step
     # radar_team_source: what feat[6] (b_team, teammate RADAR) sources beyond the ego window.
     # "lkp" (default, legacy) = point-source at each teammate's LAST-KNOWN node, decayed by hops
     # beyond the horizon — independent of belief_mode, blind to where the belief filter thinks the
@@ -377,12 +439,23 @@ class Explorer:
         self.store_render_global = False
         self._render_global: dict | None = None
         self._dbg_reward: dict | None = None   # per-agent reward components (inspector)
+        # RAW rendezvous state, per env/agent, for the inspector: every factor that goes into
+        # rdv = w · g · (φ_prev − φ_now) and every input the gate g is built from. Populated only
+        # when store_render_global is on (traces/eval), so training pays nothing for it. Without
+        # this the inspector shows the rdv reward as a bare number with no way to tell WHICH factor
+        # made it what it is — a zero from g=0, from Δφ=0, or from the two cancelling.
+        self._rdv_dbg: dict | None = None
+        # φ evaluated at the K candidate moves [N, M, K] (inspector only; None during training).
+        self._phi_nbr: torch.Tensor | None = None
         self.P_max = self.graph.guidepost_path_max
         self.K = 8
 
         self.pos          = torch.zeros((self.N, self.M, 2),           dtype=torch.float32, device=self.dev)
         self.visited_step = torch.full((self.N, self.M, self.N_max), -1, dtype=torch.long,  device=self.dev)
         self.t            = torch.zeros(self.N,                        dtype=torch.long,    device=self.dev)
+        # Cumulative px travelled per robot this episode (EnvCfg.max_travel_px budget + the
+        # max_dist column of the IR2 comparison). Reset with self.t at every episode boundary.
+        self.travel_px    = torch.zeros((self.N, self.M),              dtype=torch.float32, device=self.dev)
         self.last_union   = torch.zeros(self.N,                        dtype=torch.float32, device=self.dev)
         self.curr_idx     = torch.zeros((self.N, self.M),              dtype=torch.long,    device=self.dev)
         self.curr_idx_global = torch.zeros((self.N, self.M),           dtype=torch.long,    device=self.dev)
@@ -456,9 +529,6 @@ class Explorer:
         # step index at which the hypotheses froze (comm-break), so transit s = t - pf_t0 starts at 0 →
         # the FIRST out-of-comm frame shows the dots AT lkp, then they visibly depart hop by hop.
         self.pf_t0         = torch.zeros((self.N, self.M, self.M), dtype=torch.long, device=self.dev)
-        # Known-free footprint of the PREVIOUS step, per observer row → the nodes revealed THIS step are
-        # node_free & ~pf_known_prev. Belief mass sitting on a frontier is pushed onto exactly those.
-        self.pf_known_prev = torch.zeros((self.N, self.M, self.N_max), dtype=torch.bool, device=self.dev)
         self._comm_prev    = torch.zeros((self.N, self.M, self.M), dtype=torch.bool, device=self.dev)
         # Static teammate table: _others_idx[a] = the M-1 indices j != a. Drives the batched
         # Pass-1 radar teammate_src + teammate BF (agents folded into the batch dim).
@@ -668,6 +738,12 @@ class Explorer:
         # Stall penalty — no net displacement this step (collision-revert hold or
         # invalid/curr-node pick). step_disp also feeds the coverage-efficiency metric.
         step_disp = (self.pos - pos_entry).norm(dim=-1)                  # [N, M]
+        # Cumulative distance travelled per robot (px) — the episode's PHYSICAL budget, and the
+        # only unit in which our horizon is comparable to IR2's. Their "step" is a waypoint
+        # teleport of arbitrary length; ours is one lattice hop (≤ nr·√2 = 22.63 px), so capping
+        # both at the same step count hands them 2-2.3x our travel on corridor/complex. This is
+        # also exactly IR2's headline metric (max over robots of distance travelled).
+        self.travel_px = self.travel_px + step_disp                      # [N, M]
 
         # progress_reward REMOVED (2026-06-30): it shaped the agent toward the analytic
         # committed target (d_prev−d_new over the target-rooted BF field) → soft-forced the
@@ -721,6 +797,13 @@ class Explorer:
             "stall":         (-delta_stall * stall_pen).mean(),
             "step":          (-step_penalty).mean(),
             "sync":          sync_bonus.mean(),
+            # The terminal payout was the ONE summand with no telemetry, so "did the completion
+            # bonus ever fire?" could only be answered indirectly via eval/success_rate — which is
+            # measured on the eval suite, not on the training distribution. Under done_mode="own"
+            # that is the difference between a hard objective and an unreachable one: v12 ran 4M
+            # steps with this term identically zero and nothing in the training log said so.
+            "completion":    (terminated_now.float().unsqueeze(-1)
+                              * self.cfg.completion_bonus).mean(),
             # Diagnostics (not reward summands): raw map delivered/received per step in
             # scan_norm units, and the paid-sync rate — n_syncs/episode is their time-sum.
             "sync_give_diag": sync_give.mean(),
@@ -739,6 +822,15 @@ class Explorer:
                 "revisit":       (-gamma * revisit_pen).detach(),
                 "stall":         (-delta_stall * stall_pen).detach(),
                 "sync":          sync_bonus.detach(),
+                # step + completion were the two summands the inspector never showed, so its rows
+                # silently failed to add up to the `total` row printed right under them — by exactly
+                # (completion − step). Both are per-agent [N, M] like the rest.
+                "step":          (-step_penalty).detach(),
+                # expand, not unsqueeze: termination is per-ENV [N], and it only BROADCASTS to
+                # [N, M] inside the reward sum. The inspector indexes [0, a] per agent, so a [N, 1]
+                # entry here reads fine for agent 0 and throws for every other agent.
+                "completion":    (terminated_now.float().unsqueeze(-1)
+                                  * self.cfg.completion_bonus).expand(-1, self.M).detach(),
             }
 
         # ---- Exploration-quality metrics (per-step scalars; driver aggregates) ----
@@ -760,21 +852,57 @@ class Explorer:
             valid_prev = torch.isfinite(self._rdv_phi_prev)                  # [N, M]
             delta_phi = torch.where(valid_prev, self._rdv_phi_prev - phi_now,
                                     torch.zeros_like(phi_now))
+            delta_phi_raw = delta_phi
+            if self.cfg.rdv_clamp_pos:
+                delta_phi = delta_phi.clamp(min=0.0)                         # see EnvCfg.rdv_clamp_pos
             rdv_dense = rdv_w * self._rdv_gate * delta_phi                   # [N, M]
             reward = reward + rdv_dense
+            if self.store_render_global and self._rdv_dbg is not None:
+                # captured BEFORE _rdv_phi_prev is overwritten below. `valid` = 0 on the first
+                # post-reset step, where φ_prev is +inf and the term is masked to exactly 0 — that
+                # is not "the agent did not approach", it is "there is nothing to compare against".
+                self._rdv_dbg.update({
+                    "w": rdv_w, "phi": phi_now.detach(),
+                    "phi_prev": torch.where(valid_prev, self._rdv_phi_prev,
+                                            torch.full_like(phi_now, float("nan"))).detach(),
+                    # BOTH: dphi is what got paid, dphi_raw is the geometry. Recording only the
+                    # post-clamp value would make a clamped run look like the agent never moved away
+                    # from the teammate at all, which is the opposite of what the clamp is there to
+                    # reveal. Their difference IS the tax the clamp removed.
+                    "dphi": delta_phi.detach(), "dphi_raw": delta_phi_raw.detach(),
+                    "clamped": bool(self.cfg.rdv_clamp_pos),
+                    "valid": valid_prev.detach(),
+                    "rdv": rdv_dense.detach(),
+                })
             self._rdv_phi_prev = phi_now
             reward_terms["rdv"] = rdv_dense.mean()
             if self.store_render_global and self._dbg_reward is not None:
                 self._dbg_reward["rdv"] = rdv_dense.detach()
                 self._dbg_reward["total"] = reward.detach()
 
+        # Episode budget: step count AND (when enabled) travel distance. The step cap stays as a
+        # safety net — a policy that stalls forever burns no distance and would otherwise never
+        # truncate. max over robots, matching IR2's max_dist: the mission ends when the FIRST
+        # robot exhausts its budget, not the average one.
         truncated  = self.t >= self.cfg.max_episode_steps
+        if self.cfg.max_travel_frac > 0.0:                      # per-map budget (training)
+            budget = self.cfg.max_travel_frac * self.free_total                  # [N]
+            truncated = truncated | (self.travel_px.amax(dim=1) >= budget)
+        elif self.cfg.max_travel_px > 0.0:                      # flat budget (comparison cells)
+            truncated = truncated | (self.travel_px.amax(dim=1) >= self.cfg.max_travel_px)
+        if self.cfg.ignore_budget_truncation:
+            # Trace/inspector only. Suppress the truncation but NOT the budget itself, so
+            # agent_scalars[2] (travel_frac) keeps the value the policy trained against. The old
+            # capture_trace trick — zeroing max_travel_frac/max_travel_px — would have zeroed the
+            # observation too, quietly running every trace off-distribution.
+            truncated = torch.zeros_like(truncated)
         terminated = done_frac >= self.cfg.done_explored_thresh
         done = truncated | terminated
         info = {
             "explored_rate": explored_rate,
             "terminated":    terminated,
             "truncated":     truncated,
+            "travel_px":     self.travel_px.clone(),   # [N, M] cumulative px, pre-auto-reset
             "step":          self.t.clone(),
             "reward_terms":  reward_terms,
             "metrics":       metrics,
@@ -1298,6 +1426,7 @@ class Explorer:
         self.starts[idx_t]                            = starts_new
         self.visited_step[idx_t]                      = -1
         self.t[idx_t]                                 = 0
+        self.travel_px[idx_t]                         = 0.0
         self._curr_prev[idx_t]                        = -1
         self._dist_curr_prev[idx_t]                   = float("inf")
         self.t_last_comm[idx_t]                       = 0
@@ -1313,7 +1442,6 @@ class Explorer:
         self.pf_front_node[idx_t] = -1; self.pf_weight[idx_t] = 0.0; self.pf_dist[idx_t] = 0
         self.pf_path[idx_t] = -1; self.pf_live[idx_t] = 0.0; self.pf_acc[idx_t] = 0.0
         self.pf_seeded[idx_t] = False; self.pf_born[idx_t] = False
-        self.pf_known_prev[idx_t] = False
         self.pf_t0[idx_t] = 0
         self._comm_prev[idx_t] = False
         self.last_action[idx_t]                       = -1
@@ -1371,6 +1499,7 @@ class Explorer:
         self.starts[idx_t]                            = starts_new
         self.visited_step[idx_t]                      = -1
         self.t[idx_t]                                 = 0
+        self.travel_px[idx_t]                         = 0.0
         # Reset BF-from-curr cache.
         self._curr_prev[idx_t]                        = -1
         self._dist_curr_prev[idx_t]                   = float("inf")
@@ -1382,7 +1511,6 @@ class Explorer:
         self.pf_front_node[idx_t] = -1; self.pf_weight[idx_t] = 0.0; self.pf_dist[idx_t] = 0
         self.pf_path[idx_t] = -1; self.pf_live[idx_t] = 0.0; self.pf_acc[idx_t] = 0.0
         self.pf_seeded[idx_t] = False; self.pf_born[idx_t] = False
-        self.pf_known_prev[idx_t] = False
         self.pf_t0[idx_t] = 0
         self._comm_prev[idx_t] = False
         # Reset comm-gap timer: at reset, last_known_pos is set to actual start positions
@@ -1498,7 +1626,7 @@ class Explorer:
         info["bf_dist_team"] = bf_dist_team                                         # [B, M, N_max]
 
     def _pathfront_belief(self, B, info, team_node, comm_bm, frontier_node, edge_free, seen_nodes,
-                          escape_node=None, newly_free=None):
+):
         """PATHFRONT belief (EnvCfg.belief_mode=='pathfront'). Two phases on the KNOWN graph: BF particles
         lkp→frontier (transit), then absorbing diffusion (diffuse inward + frontiers lock β=utility, with
         release when a frontier is explored). Sets self._belief_p [B,M,N_max] / _belief_alive [B,M].
@@ -1529,6 +1657,9 @@ class Explorer:
             lkp_m = team_node[:, m].clamp(0, N - 1)                     # [B]
             frz = break_bm[:, m] & active
             if bool(frz.any()):
+                # FREEZE ON THE SAME SET advance_pathfront calls an opening — the current
+                # frontier. Two sites with two definitions of one set is how hypotheses ended up
+                # born already refuted.
                 # Transit BF over the KNOWN-FREE graph (edge_free), NOT the optimistic
                 # unknown-passable one: the geodesic lkp→frontier must stay in known space
                 # (frontier nodes are known-free, same component as lkp), so the transit point
@@ -1538,12 +1669,9 @@ class Explorer:
                     info, target=lkp_m, edge_valid=edge_free)
                 fidx = frz.nonzero(as_tuple=True)[0]
                 fn, w, dh, pth = freeze_hypotheses(
-                    lkp_node=lkp_m[fidx], frontier_node=frontier_node[fidx],
+                    lkp_node=lkp_m[fidx], opening=frontier_node[fidx],
                     dist=dist_m[fidx], parent=parent_m[fidx], utility=utility[fidx],
-                    nbr_idx=eidx, edge_ok=edge_free[fidx], node_spacing=NR,
-                    node_xy=self.graph.node_xy, Kf=Kf, Lmax=Lmax,
-                    min_util=float(self.cfg.belief_prune_util),
-                    min_cluster=int(self.cfg.belief_prune_min_cluster))
+                    node_xy=self.graph.node_xy, node_spacing=NR, Kf=Kf, Lmax=Lmax)
                 pf_front[fidx, m] = fn; pf_w[fidx, m] = w; pf_d[fidx, m] = dh; pf_pth[fidx, m] = pth
                 pf_live[fidx, m] = 0.0; pf_acc[fidx, m] = 0.0; pf_seed[fidx, m] = False
                 pf_born[fidx, m] = True
@@ -1552,12 +1680,9 @@ class Explorer:
                 # not s=0 (sitting on lkp, indistinguishable from the marker until the step after).
                 pf_t0[fidx, m] = t_b[fidx, 0] - 1
                 if _PF_DEBUG:
-                    from env.teammate_belief_pathfront import cluster_frontiers as _cf
                     for r, b0 in enumerate(fidx.tolist()):
-                        fn_b = frontier_node[b0]; nfr = int(fn_b.sum())
-                        lab = _cf(fn_b.unsqueeze(0), eidx, edge_free[b0].unsqueeze(0))[0]
-                        ncomp = int(torch.unique(lab[fn_b]).numel()) if nfr else 0
-                        print(f"[PF] obs{b0//self.M} tm{m} t={int(t_b[b0,0])}: frontier={nfr}n/{ncomp}c "
+                        print(f"[PF] obs{b0//self.M} tm{m} t={int(t_b[b0,0])}: "
+                              f"frontier={int(frontier_node[b0].sum())}n "
                               f"used={int((fn[r]>=0).sum())} dist_h={dh[r][fn[r]>=0].tolist()}")
             s_m = (t_b[:, 0] - pf_t0[:, m]).clamp(min=0)                # [B] hops since THIS freeze (s=0 at lkp)
             live_m, acc_m, seed_m, p_m, alive_m, tviz_m, w_m = advance_pathfront(
@@ -1567,9 +1692,6 @@ class Explorer:
                 nbr_idx=eidx, absorb_gain=float(self.cfg.belief_absorb_gain),
                 beta_max=float(self.cfg.belief_beta_max),
                 diffuse_lambda=float(self.cfg.belief_diffuse_lambda),
-                prune_util=float(self.cfg.belief_prune_util),
-                door_min_util=float(self.cfg.belief_door_min_util),
-                escape_node=escape_node, newly_free=newly_free,
                 seen=seen_nodes, just_frozen=frz)
             pf_live[:, m] = live_m; pf_acc[:, m] = acc_m; pf_seed[:, m] = seed_m; pf_w[:, m] = w_m
             use = pf_born[:, m] & active & ~comm_bm[:, m]
@@ -1676,22 +1798,15 @@ class Explorer:
                 n_unk = nbr_unknown.sum(-1)                                     # [B, N_max] unknown 8-nbrs
                 min_unk = int(self.cfg.pf_frontier_min_unknown)
                 frontier_node = node_free & (n_unk >= min_unk) & (n_unk <= 7)  # [B, N_max] openings only
-                # SPREAD edges = generatable edges whose DESTINATION is still unknown. Belief that means
-                # "he is somewhere past the explored boundary" is held on those unknown nodes, never on the
-                # visible frontier node in front of the observer — the observer can see that node, so
-                # nothing may sit there. known→unknown must be orthogonal ("archi generabili": a diagonal
-                # into the unknown cuts a corner), unknown→unknown stays 8-connected.
-                # ESCAPE nodes = known-free nodes with at least one GENERATABLE orthogonal edge into the
-                # unknown: real ground the teammate could have left the known map through. Deliberately
-                # LAXER than `frontier_node` (whose ≥min_unk gate exists to keep hypothesis CLUSTERS
-                # distinct) so the leading edge of a thin corridor counts too — otherwise, the moment the
-                # observer walks up a corridor and the strict opening disappears, that mass has nowhere to
-                # go, is dumped into the corridor the observer is standing in and erased on the spot
-                # (m50/agent1 t=96: the whole west hypothesis gone in one step while the corridor kept
-                # going for another 20 nodes). Unknown behind a wall does not qualify — not a generatable
-                # edge, so not an escape route.
-                escape_node = node_free & (
-                    info["edge_valid_optim"] & crossing & self._orth_k.view(1, 1, -1)).any(-1)
+                # ...and it must have something to actually reveal. See pf_frontier_min_util: the
+                # count alone keeps every node whose unknown neighbours sit BEHIND A WALL, which no
+                # amount of walking ever clears. `util_raw` is the pre-diffusion seed, nonzero only
+                # where a real known-free→unknown ribbon exists. Applied HERE, at the single place
+                # `frontier_node` is built, so every consumer agrees: cluster freezing, absorption,
+                # the push target, the `acc`-immunity rule, and the `fr` flag in the trace.
+                min_futil = float(self.cfg.pf_frontier_min_util)
+                if min_futil > 0.0 and info.get("util_raw") is not None:
+                    frontier_node = frontier_node & (info["util_raw"] >= min_futil)
                 # NEGATIVE-EVIDENCE footprint: nodes where, if the teammate stood there, COMM WOULD HAVE
                 # FIRED — the exact same criterion _comm_check applies to the true teammate position,
                 # now evaluated against every known-free node. Previously this used the MAPPING lidar's
@@ -1737,13 +1852,13 @@ class Explorer:
                 else:
                     would_comm = (eucl < float(self.cfg.comm_range_px)) & ~obst.any(dim=-1)
                 seen_nodes = node_free & would_comm
-                # Nodes revealed THIS step (per observer row): what the push hands frontier mass to.
-                known_prev = self.pf_known_prev.reshape(B, self.N_max)
-                newly_free = node_free & (~known_prev)                           # [B, N_max]
-                known_prev.copy_(node_free)
                 self._pf_seen = seen_nodes                                       # [B, N_max] for the trace
+                # The openings themselves, exported alongside `seen`: "belief mass on ground that
+                # is inside comm range and is NOT an opening" is the one check that settles whether
+                # the model is behaving, and it cannot be evaluated from `seen` alone.
+                self._pf_frontier = frontier_node                                # [B, N_max] for the trace
                 self._pathfront_belief(B, info, team_node, comm_bm, frontier_node, known_free.bool(),
-                                       seen_nodes, escape_node, newly_free)
+                                       seen_nodes)
             else:
                 reached_new, p_bel, alive = update_teammate_belief(
                     self.belief_reached.reshape(B, self.M, self.N_max),
@@ -1836,6 +1951,8 @@ class Explorer:
                 # No belief may sit here; dumped so the trace/inspector can check it directly.
                 "belief_seen": (self._pf_seen.view(self.N, self.M, self.N_max).clone()
                                 if getattr(self, "_pf_seen", None) is not None else None),
+                "belief_frontier": (self._pf_frontier.view(self.N, self.M, self.N_max).clone()
+                                    if getattr(self, "_pf_frontier", None) is not None else None),
                 # Utility decomposition (boundary-pixel ribbon vs revealable-volume) per node.
                 "util_boundary": info["util_boundary"].view(self.N, self.M, self.N_max),       # [N, M, N_max]
                 "util_volume":   info["util_volume"].view(self.N, self.M, self.N_max),         # [N, M, N_max]
@@ -1944,6 +2061,24 @@ class Explorer:
             geo = torch.where(torch.isfinite(geo), geo, torch.full_like(geo, diam))
             geo_pair = (geo.mean(dim=1) / max(1.0, diam)).clamp(0.0, 1.0)                            # [N]
             self._geo_curr_team = (geo / phi_norm_px).clamp(0.0, 1.0)                                # [N, M]
+            # φ at each of the K CANDIDATE moves, not just at curr — inspector only, so it is gated
+            # on store_render_global and costs training exactly nothing. This is what makes the rdv
+            # gate legible: `g` alone says "the gate is hot", it never says WHICH move the gate is
+            # paying for. With this, rdv_preview[k] = w·g·(φ_curr − φ_nbr[k]) is the actual reward
+            # the term would hand out for taking neighbour k, readable next to that action's logit.
+            if self.store_render_global:
+                nb = curr_nbr_global.clamp(min=0)                                                    # [N, M, K]
+                K_ = nb.shape[-1]
+                d_nb = bt.gather(3, nb.view(self.N, self.M, 1, K_).expand(-1, -1, self.M, -1))       # [N, a, j, K]
+                geo_nb = d_nb.min(dim=2).values                                                      # [N, a, K]
+                geo_nb = torch.where(torch.isfinite(geo_nb), geo_nb, torch.full_like(geo_nb, diam))
+                phi_nb = (geo_nb / phi_norm_px).clamp(0.0, 1.0)
+                # Invalid neighbour slots carry a meaningless index; blank them rather than show a
+                # number that looks like a real option.
+                self._phi_nbr = torch.where(curr_nbr_valid.bool(), phi_nb,
+                                            torch.full_like(phi_nb, float("nan")))                   # [N, M, K]
+            else:
+                self._phi_nbr = None
         else:
             geo_pair = torch.zeros(self.N, device=self.dev)
             self._geo_curr_team = torch.zeros((self.N, self.M), device=self.dev)
@@ -1991,11 +2126,28 @@ class Explorer:
             imbalance = ((share.max(dim=1).values - 1.0 / self.M) / (1.0 - 1.0 / self.M)).clamp(0.0, 1.0)
         else:
             imbalance = torch.zeros(self.N, device=self.dev)
+        # ---- BUDGET CONSUMED, per agent ∈[0,1] — agent_scalars[2]. THE DEADLINE THE ACTOR COULD NOT
+        # SEE. An episode ends on whichever of the two criteria binds first (see the truncation block
+        # in step()): the step cap, or the travel budget. Until v16 neither reached the actor —
+        # critic_global carried t_frac, but the actor had nothing, and under a travel budget t_frac
+        # does not even predict the end (train/difficult spans 3.9x in free area p50→p90, so a p50
+        # episode truncates at t_frac≈0.23 and a p90 one at ≈0.90). A policy that cannot perceive its
+        # own deadline cannot choose to be brisk about it, which is most of what "the agents stopped
+        # going straight" was. max() of the two ratios = progress toward whichever binds FIRST, so
+        # this stays the honest signal under either criterion alone or both together.
+        t_ratio = (self.t.float() / T_max).clamp(0.0, 1.0).view(self.N, 1).expand(self.N, self.M)
+        if self.cfg.max_travel_frac > 0.0:
+            budget_px = (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0).unsqueeze(1)      # [N, 1]
+            travel_frac = (self.travel_px / budget_px).clamp(0.0, 1.0).maximum(t_ratio)               # [N, M]
+        elif self.cfg.max_travel_px > 0.0:
+            travel_frac = (self.travel_px / max(1.0, float(self.cfg.max_travel_px))).clamp(0.0, 1.0).maximum(t_ratio)
+        else:
+            travel_frac = t_ratio                                                                     # step cap only
         # ---- RENDEZVOUS RAW OBS + gate (per-agent scalars, execution-decentralized). Given to the
-        # actor as agent_scalars = [∆M_norm, staleness_norm] so the policy can DECIDE when to
-        # rendezvous; the SAME ∆M gate scales the dense reward. ∆M_a = surplus (cells I mapped that
-        # the teammate I owe most lacks) since our last sync, normalized by the map I HAD at that sync
-        # (relative growth, not a fraction of the whole canvas); staleness = steps since that sync.
+        # actor as agent_scalars so the policy can DECIDE when to rendezvous; the SAME ∆M gate scales
+        # the dense reward. ∆M_a = surplus (cells I mapped that the teammate I owe most lacks) since
+        # our last sync, normalized by the map I HAD at that sync (relative growth, not a fraction of
+        # the whole canvas); staleness = steps since that sync.
         if self.M > 1:
             offer = (own_expl_a.unsqueeze(2) - self._own_expl_at_comm).clamp(min=0.0)                # [N, M, M]
             eye = torch.eye(self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M)
@@ -2017,22 +2169,70 @@ class Explorer:
             scale = (frac * baseline).clamp(min=float(self.cfg.scan_norm_nodes))
             g_content = (offer_max / scale).clamp(0.0, 1.0)                                          # [N, M] content-driven gate
             last_comm = self.t_last_comm.gather(2, j_star.unsqueeze(2)).squeeze(2).float()           # [N, M]
-            staleness = ((self.t.view(self.N, 1).float() - last_comm).clamp(min=0.0) / T_max).clamp(0.0, 1.0)
-            # Secondary urgency nudge from raw staleness (steps, not the T_max-normalized one above) —
-            # small, capped, never overrides the content-driven gate on its own.
             dt = (self.t.view(self.N, 1).float() - last_comm).clamp(min=0.0)                         # [N, M] steps
-            urgency = (dt / float(self.cfg.rdv_urgency_T)).clamp(0.0, 1.0)
+            # OBSERVED staleness — "how long since we last synced", agent_scalars[1]. It used to be
+            # dt/T_max, which was wrong twice over: at T_max=2048 one step moved it by 0.0005 (below
+            # the noise the policy can act on), and T_max CHANGES between curriculum phases, so a
+            # warm start silently rescaled the input while the weights reading it stayed put.
+            # rdv_urgency_T is a fixed physical scale, so this is now phase- and trace-invariant.
+            staleness = (dt / float(self.cfg.rdv_urgency_T)).clamp(0.0, 1.0)                         # [N, M]
+            # GATE urgency — a small, capped nudge on top of the content-driven gate; it never
+            # overrides g_content on its own. Kept SEPARATE from the staleness obs above: they
+            # answer different questions ("how long apart" vs "how late is it"), and collapsing them
+            # would both hide staleness from the policy and duplicate travel_frac.
+            if self.cfg.rdv_urgency_mode == "budget":
+                t0 = float(self.cfg.rdv_urgency_start)
+                urgency = ((travel_frac - t0) / max(1e-6, 1.0 - t0)).clamp(0.0, 1.0)                 # [N, M]
+            else:
+                urgency = staleness
             g = (g_content + float(self.cfg.rdv_urgency_weight) * urgency).clamp(0.0, 1.0)
             self._rdv_gate = g
-            # teammate_obs=False (ablation): gate g still feeds the rdv REWARD above, but the
-            # actor's [∆M-gate, staleness] scalars are zeroed — no "when to rendezvous" signal.
+            if self.store_render_global:
+                # Everything the gate is made of, unnormalised where it is a count (offer,
+                # baseline, scale are PIXELS; dt is STEPS), so the inspector can show the actual
+                # arithmetic rather than a single opaque g.
+                self._rdv_dbg = {
+                    "g": g.detach(), "g_content": g_content.detach(),
+                    "urgency": urgency.detach(),
+                    "urgency_w": float(self.cfg.rdv_urgency_weight),
+                    "urgency_mode": str(self.cfg.rdv_urgency_mode),
+                    "offer": offer_max.detach(), "baseline": baseline.detach(),
+                    "frac": frac.detach(), "scale": scale.detach(),
+                    "j_star": j_star.detach(), "dt": dt.detach(),
+                    "staleness": staleness.detach(),
+                    # Per-candidate-move payout of the rdv term (see _phi_nbr above). NaN on
+                    # invalid slots. Read it against the same step's logits to see whether the gate
+                    # is actually steering the choice or just decorating it.
+                    "phi_nbr": (self._phi_nbr.detach() if self._phi_nbr is not None else None),
+                    "rdv_preview": (
+                        (float(self.cfg.rdv_dense_weight) * g.unsqueeze(-1)
+                         * (self._geo_curr_team.unsqueeze(-1) - self._phi_nbr)).detach()
+                        if self._phi_nbr is not None else None),
+                }
+            # contact: am I in comm with ANY teammate right now? comm_mask has been in the obs dict
+            # since v1 but no model ever read it, so "we are talking" reached the policy only
+            # indirectly, through staleness collapsing to 0. One unambiguous bit is cheaper than
+            # asking the trunk to infer an edge from a level.
+            contact = (comm_mask & ~eye).any(dim=2).float()                                          # [N, M]
+            # offer_frac: the surplus MAGNITUDE. g cannot carry it — it is clamped to 1 twice over
+            # (g_content above, then g), so past offer_max ≥ scale "I owe him a sensor disk" and
+            # "I owe him half the map" are the same number to both the actor and the reward. Same
+            # denominator as explored_frac/own_cov, so it reads on the map-fraction scale the policy
+            # already sees elsewhere, and it cannot saturate: offer ≤ own map ≤ free_total.
+            offer_frac = (offer_max / self.free_total.clamp(min=1.0).unsqueeze(1)).clamp(0.0, 1.0)   # [N, M]
+            # teammate_obs=False (ablation): gate g still feeds the rdv REWARD above, but every
+            # TEAMMATE-derived scalar is zeroed — no "when to rendezvous" signal. travel_frac stays
+            # live: my own remaining budget is not information about a teammate, and blinding the
+            # ablation arm to its own deadline would confound the ablation with a horizon change.
             if self.cfg.teammate_obs:
-                agent_scalars = torch.stack([g, staleness], dim=-1)                                  # [N, M, 2]
+                agent_scalars = torch.stack([g, staleness, travel_frac, contact, offer_frac], dim=-1)
             else:
-                agent_scalars = torch.zeros((self.N, self.M, 2), device=self.dev)
+                zc = torch.zeros_like(travel_frac)
+                agent_scalars = torch.stack([zc, zc, travel_frac, zc, zc], dim=-1)
         else:
             self._rdv_gate = torch.zeros((self.N, self.M), device=self.dev)
-            agent_scalars = torch.zeros((self.N, self.M, 2), device=self.dev)
+            zc = torch.zeros_like(travel_frac)
+            agent_scalars = torch.stack([zc, zc, travel_frac, zc, zc], dim=-1)                       # [N, M, 5]
         critic_global = torch.stack(
             [explored_frac, t_frac, geo_pair, cov_rate, redundancy, sync_surplus, sync_staleness],
             dim=-1,
@@ -2059,8 +2259,9 @@ class Explorer:
             "last_known_pos":       self.last_known_pos.clone(),
             # Previous action one-hot per agent.
             "prev_action":          self._prev_action_onehot(),    # [N, M, K=8] float
-            # Rendezvous raw obs: [∆M surplus-gate, staleness] per agent (actor input).
-            "agent_scalars":        agent_scalars,                 # [N, M, 2] float
+            # Per-agent actor scalars (see AGENT_SCALAR_DIM in models/actor_critic.py for the
+            # authoritative order): [g, staleness, travel_frac, contact, offer_frac].
+            "agent_scalars":        agent_scalars,                 # [N, M, 5] float
             # Value-field: per-first-step discounted utility mass, max-normalized (actor input).
             "value_field":          self._vf,                      # [N, M, K] float ∈[0,1]
         }

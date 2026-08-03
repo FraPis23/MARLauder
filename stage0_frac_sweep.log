@@ -1,0 +1,37 @@
+### easy | ckpt_020 (20% training) | frac 0.10
+  TERMINATION RATE (own-99% by every robot) : 0.25   (8/32 episodes)
+  weakest robot's own coverage at end       : mean 0.531  min 0.148  max 1.000
+  distance spent (max over robots, px)      : mean 9951  p50 13016  max 13343
+  steps                                     : mean 532
+  VERDICT: REACHABLE — the completion bonus fires, so a run starting from a policy this weak has a gradient toward the objective from iteration 1.
+### easy | ckpt_020 (20% training) | frac 0.15
+  TERMINATION RATE (own-99% by every robot) : 0.22   (7/32 episodes)
+  weakest robot's own coverage at end       : mean 0.553  min 0.204  max 1.000
+  distance spent (max over robots, px)      : mean 14493  p50 19339  max 19638
+  steps                                     : mean 781
+  VERDICT: REACHABLE — the completion bonus fires, so a run starting from a policy this weak has a gradient toward the objective from iteration 1.
+### easy | ckpt_020 (20% training) | frac 0.25
+  TERMINATION RATE (own-99% by every robot) : 0.25   (8/32 episodes)
+  weakest robot's own coverage at end       : mean 0.624  min 0.174  max 1.000
+  distance spent (max over robots, px)      : mean 23501  p50 32207  max 32479
+  steps                                     : mean 1275
+  VERDICT: REACHABLE — the completion bonus fires, so a run starting from a policy this weak has a gradient toward the objective from iteration 1.
+### easy | ckpt_060 | frac 0.06
+  TERMINATION RATE (own-99% by every robot) : 0.38   (12/32 episodes)
+  weakest robot's own coverage at end       : mean 0.706  min 0.202  max 1.000
+  distance spent (max over robots, px)      : mean 5652  p50 7810  max 8188
+  steps                                     : mean 289
+  VERDICT: REACHABLE — the completion bonus fires, so a run starting from a policy this weak has a gradient toward the objective from iteration 1.
+### easy | ckpt_100 | frac 0.06
+  TERMINATION RATE (own-99% by every robot) : 0.81   (26/32 episodes)
+  weakest robot's own coverage at end       : mean 0.961  min 0.587  max 1.000
+  distance spent (max over robots, px)      : mean 4690  p50 5633  max 8066
+  steps                                     : mean 240
+  VERDICT: REACHABLE — the completion bonus fires, so a run starting from a policy this weak has a gradient toward the objective from iteration 1.
+### difficult | ckpt_100 (end of easy phase) | frac 0.06
+  TERMINATION RATE (own-99% by every robot) : 0.88   (28/32 episodes)
+  weakest robot's own coverage at end       : mean 0.992  min 0.854  max 1.000
+  distance spent (max over robots, px)      : mean 9684  p50 5785  max 33258
+  steps                                     : mean 507
+  VERDICT: REACHABLE — the completion bonus fires, so a run starting from a policy this weak has a gradient toward the objective from iteration 1.
+=== SWEEP_DONE ===

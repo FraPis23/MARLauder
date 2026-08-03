@@ -1,0 +1,161 @@
+=== CORRIDOR (IR2 max_dist 7204px, native cap 196 steps) ===
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['corridor'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 3.30 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [corridor M=2] 25/100 maps
+  [corridor M=2] 50/100 maps
+  [corridor M=2] 75/100 maps
+  [corridor M=2] 100/100 maps
+corridor_M2               3713   195.5     0.827     0.09   0.42   0.906   → marlauder_corridor_M2_s0_cor_native.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cor_native
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['corridor'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[corridor] travel budget 3600px (step cap 450 = safety net; IR2 native was 196)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.52 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [corridor M=2] 25/100 maps
+  [corridor M=2] 50/100 maps
+  [corridor M=2] 75/100 maps
+  [corridor M=2] 100/100 maps
+corridor_M2               3878   204.2     0.854     0.12   0.40   0.922   → marlauder_corridor_M2_s0_cor_3600.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cor_3600
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['corridor'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[corridor] travel budget 7204px (step cap 902 = safety net; IR2 native was 196)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.54 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [corridor M=2] 25/100 maps
+  [corridor M=2] 50/100 maps
+  [corridor M=2] 75/100 maps
+  [corridor M=2] 100/100 maps
+corridor_M2               4815   260.1     0.998     1.00   0.93   0.999   → marlauder_corridor_M2_s0_cor_7204.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cor_7204
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['corridor'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[corridor] travel budget 10800px (step cap 1350 = safety net; IR2 native was 196)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.52 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [corridor M=2] 25/100 maps
+  [corridor M=2] 50/100 maps
+  [corridor M=2] 75/100 maps
+  [corridor M=2] 100/100 maps
+corridor_M2               4774   258.7     0.998     1.00   0.94   0.999   → marlauder_corridor_M2_s0_cor_10800.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cor_10800
+=== COMPLEX (IR2 max_dist 16966px, native cap 384 steps) ===
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['complex'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.55 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [complex M=2] 25/100 maps
+  [complex M=2] 50/100 maps
+  [complex M=2] 75/100 maps
+  [complex M=2] 100/100 maps
+complex_M2                7722   383.9     0.669     0.01   0.17   0.760   → marlauder_complex_M2_s0_cpx_native.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cpx_native
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['complex'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[complex] travel budget 7200px (step cap 900 = safety net; IR2 native was 384)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.50 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [complex M=2] 25/100 maps
+  [complex M=2] 50/100 maps
+  [complex M=2] 75/100 maps
+  [complex M=2] 100/100 maps
+complex_M2                7734   383.6     0.669     0.01   0.21   0.754   → marlauder_complex_M2_s0_cpx_7200.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cpx_7200
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['complex'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[complex] travel budget 16966px (step cap 2122 = safety net; IR2 native was 384)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.58 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [complex M=2] 25/100 maps
+  [complex M=2] 50/100 maps
+  [complex M=2] 75/100 maps
+  [complex M=2] 100/100 maps
+complex_M2               13870   723.1     0.991     0.90   0.80   0.994   → marlauder_complex_M2_s0_cpx_16966.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cpx_16966
+[eval_comparison] ckpt=runs/v12_ir2_difficult_20260728_151102/ckpt_best.pt splits=['complex'] agents=[2] device=cuda:0
+cell                  max_dist   steps  explored  success   conn   union
+[complex] travel budget 25000px (step cap 3126 = safety net; IR2 native was 384)
+Warp 1.15.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 5080 Laptop GPU" (15 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     /root/.cache/warp/1.15.0
+Module env.world_warp c2cac31 load on device 'cuda:0' took 0.52 ms  (cached)
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+  [complex M=2] 25/100 maps
+  [complex M=2] 50/100 maps
+  [complex M=2] 75/100 maps
+  [complex M=2] 100/100 maps
+complex_M2               14519   757.8     0.992     0.97   0.85   0.995   → marlauder_complex_M2_s0_cpx_25000.csv
+
+[eval_comparison] done. Aggregate against IR2 with:
+  python eval/comparison/analyze.py --tag s0_cpx_25000
+=== STAGE0_DONE ===

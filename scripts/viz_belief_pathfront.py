@@ -23,6 +23,7 @@ import imageio.v2 as imageio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
 import torch
 from matplotlib.colors import LinearSegmentedColormap

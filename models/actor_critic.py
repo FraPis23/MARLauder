@@ -47,6 +47,18 @@ K = 8
 # training-map layouts. redundancy in particular lets the critic explain the privileged novel_scan's
 # ~union drops → lower advantage variance. All ∈[0,1]. Built env-side in _refresh_obs.
 CRITIC_GLOBAL_DIM = 7
+# Per-agent ACTOR scalars, built env-side in Explorer._refresh_obs. Execution-decentralized: every
+# entry is something a deployed robot could compute for itself. Order is authoritative — the env
+# stacks in exactly this order and the inspector labels it from here:
+#   0 g            ∆M surplus gate ∈[0,1] — the SAME gate that scales the rdv reward
+#   1 staleness    steps since the last sync with the owed teammate / rdv_urgency_T ∈[0,1]
+#   2 travel_frac  episode budget consumed ∈[0,1], max(travel_px/budget, t/T_max) — progress toward
+#                  whichever stop criterion binds FIRST. Without it the actor cannot perceive its own
+#                  deadline, which is most of why the policy stopped being brisk after v12.
+#   3 contact      1 while in comm with any teammate (comm_mask off-diagonal)
+#   4 offer_frac   surplus owed to that teammate / free_total — the MAGNITUDE g cannot carry, since
+#                  g is clamped to 1 twice over and saturates long before the surplus does
+AGENT_SCALAR_DIM = 5
 
 
 def _mask_scores(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -123,11 +135,18 @@ class MarlActorCritic(nn.Module):
         self.store_logit_components = False
         self._dbg_logits: dict | None = None
         self.encoder = GATEncoder(in_dim=F_IN, d=d, n_heads=n_heads, n_layers=n_layers)
-        # Actor input = (curr_emb || prev_action[K] || agent_scalars[2]) → d. agent_scalars =
-        # [∆M surplus-gate, staleness] (env-computed, execution-decentralized) let the policy DECIDE
-        # when to rendezvous. Beyond-window spatial context still reaches the actor through the
-        # GAT-processed node features (utility feat[2] + radar feat[5]/feat[6]).
-        self.n_agent_scalars = 2
+        # Actor input = (curr_emb || prev_action[K] || value_field[K] || agent_scalars) → d.
+        # agent_scalars (env-computed, execution-decentralized; see AGENT_SCALAR_DIM above) let the
+        # policy DECIDE when to rendezvous and how much episode budget it has left. Beyond-window
+        # spatial context still reaches the actor through the GAT-processed node features
+        # (utility feat[2] + radar feat[5]/feat[6]).
+        # agent_scalars sits LAST in the concat on purpose: the warm-start path in
+        # train/driver.py copies a narrower checkpoint weight into the LEADING columns of the wider
+        # one. Any block after agent_scalars would therefore be silently re-aimed at the new scalar
+        # columns the next time this width grows. Trailing position makes future additions
+        # warm-start-safe; the layer itself is permutation-invariant at init, so the ordering costs
+        # nothing to a from-scratch run.
+        self.n_agent_scalars = AGENT_SCALAR_DIM
         # + K: the value-field [B, K] enters the actor trunk too (context for the trunk, which is
         # a plain Linear unless --gru re-enables the recurrent cell),
         # in addition to its per-neighbor logit bias in the pointer / actor_head.
@@ -227,15 +246,16 @@ class MarlActorCritic(nn.Module):
         self,
         curr_emb: torch.Tensor | None,      # [B, d] GAT embedding, or None (no-GAT-actor)
         prev_action: torch.Tensor,          # [B, K] one-hot
-        agent_scalars: torch.Tensor,        # [B, 2] [∆M-gate, staleness]
+        agent_scalars: torch.Tensor,        # [B, AGENT_SCALAR_DIM]
         vf: torch.Tensor,                   # [B, K] value-field ∈[0,1]
     ) -> torch.Tensor:
-        """Build the actor trunk input: curr_emb || prev_action || agent_scalars || value_field.
+        """Build the actor trunk input: curr_emb || prev_action || value_field || agent_scalars.
         (Feeds the GRUCell only under --gru; feed-forward otherwise — see _step_actor.)
-        gat_actor=False → curr_emb slot zeroed (VF-only actor)."""
+        gat_actor=False → curr_emb slot zeroed (VF-only actor).
+        agent_scalars is LAST so the warm-start widening path stays correct — see __init__."""
         if not self.gat_actor or curr_emb is None:
             curr_emb = vf.new_zeros(vf.shape[0], self.d)
-        return self.actor_pre(torch.cat([curr_emb, prev_action, agent_scalars, vf], dim=-1))
+        return self.actor_pre(torch.cat([curr_emb, prev_action, vf, agent_scalars], dim=-1))
 
     def _actor_logits(
         self,

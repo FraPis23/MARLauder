@@ -15,6 +15,7 @@ if str(_REPO) not in sys.path:
 
 from env.explorer import EnvCfg
 from scripts.train_args import build_parser
+from jsonio import jsonable
 from train.driver import TrainCfg, train
 from train.mappo import MAPPOCfg
 
@@ -118,8 +119,11 @@ def main() -> None:
     _params_path = Path(args.out) / "params.json"
     if not _params_path.exists():
         Path(args.out).mkdir(parents=True, exist_ok=True)
+        # jsonable(): --revisit-streak-cap defaults to +inf, and json.dumps emits the bare token
+        # `Infinity` for it — readable by Python's json.load, rejected by JSON.parse, so every
+        # params.json written so far is invalid JSON to the dashboard and to any external tool.
         _params_path.write_text(json.dumps(
-            {"params": vars(args), "cmd": " ".join(sys.argv)}, indent=2, default=str))
+            jsonable({"params": vars(args), "cmd": " ".join(sys.argv)}), indent=2, default=str))
 
     cfg = TrainCfg(
         split=args.split,
@@ -145,6 +149,7 @@ def main() -> None:
             else ("test/complex" if args.curriculum else args.split)
         ),
         eval_steps=(args.max_episode_steps if args.eval_steps < 0 else args.eval_steps),
+        trace_steps=args.trace_steps,
         curriculum=args.curriculum,
         curriculum_gated=args.curriculum_gated,
         curriculum_stage_splits=tuple(
@@ -173,6 +178,8 @@ def main() -> None:
             n_agents=args.n_agents,
             nr=16,                              # lattice spacing — 16px → N_max≈1200 nodes
             max_episode_steps=args.max_episode_steps,
+            max_travel_px=args.max_travel_px,
+            max_travel_frac=args.max_travel_frac,
             done_mode=args.done_mode,
             sensor_range_px=args.sensor_range,
             comm_range_px=args.comm_range,
@@ -185,6 +192,12 @@ def main() -> None:
             novel_scan_weight=args.novel_scan_weight,
             rdv_dense_weight=args.rdv_weight,
             rdv_offer_frac=args.rdv_offer_frac,
+            rdv_clamp_pos=args.rdv_clamp_pos,
+            rdv_urgency_T=args.rdv_urgency_T,
+            rdv_urgency_mode=args.rdv_urgency_mode,
+            rdv_urgency_start=args.rdv_urgency_start,
+            completion_bonus=args.completion_bonus,
+            step_penalty_coef=args.step_penalty,
             sync_give_weight=args.sync_weight,
             sync_recv_ratio=args.sync_recv_ratio,
             sync_min_gap=args.sync_min_gap,
@@ -201,6 +214,8 @@ def main() -> None:
             radar_gamma=args.radar_gamma,
             radar_util_norm=args.radar_util_norm,
             belief_mode=args.belief_mode,
+            pf_frontier_min_unknown=args.pf_frontier_min_unknown,
+            pf_frontier_min_util=args.pf_frontier_min_util,
             radar_team_source=args.radar_team_source,
             map_seed=args.map_seed,
         ),

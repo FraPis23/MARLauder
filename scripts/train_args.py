@@ -44,6 +44,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Number of cooperative agents per env")
     g_scale.add_argument("--rollout-len", type=int, default=128, help="rollout length per PPO iteration")
     g_scale.add_argument("--max-episode-steps", type=int, default=512, help="max steps per episode")
+    g_scale.add_argument("--max-travel-px", type=float, default=0.0,
+                    help="Episode travel budget in px (0 = off, step cap only). Truncates once the "
+                         "FARTHEST-travelled robot has covered this much ground. One of our steps is "
+                         "a single lattice hop (<=22.63px) while an IR2 step is a waypoint teleport of "
+                         "arbitrary length, so an equal step cap is NOT an equal budget — at IR2's "
+                         "native caps we get ~43%% of their travel on complex. Distance is the unit "
+                         "that means the same thing on both sides (and is IR2's own headline metric). "
+                         "The step cap stays active as a safety net for a stalling policy.")
+    g_scale.add_argument("--max-travel-frac", type=float, default=0.0,
+                    help="Travel budget PER MAP, as px travelled per GT-free-pixel (0 = off; "
+                         "overrides --max-travel-px when both are set). Use this for TRAINING: "
+                         "train/difficult spans 3.9x in free area p50->p90, so a flat px budget "
+                         "starves exactly the large maps where the completion bonus must fire. "
+                         "Measured spend of the v12 policy: 0.0217 (hybrid), 0.0311 (complex), "
+                         "0.0374 (corridor) px per free-px.")
     g_scale.add_argument("--done-mode", choices=["union", "own"], default="union",
                     help="What ends an episode. 'union' = the TEAM union map hits 99%% (legacy MARLauder). "
                          "'own' = EVERY agent's OWN map hits 99%% — the IR2 rule (their env.check_done), "
@@ -97,6 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
     g_reward.add_argument("--novel-scan-weight", type=float, default=1.0, help="α_novel: privileged team-union novel-scan credit (v2 core reward)")
     g_reward.add_argument("--rdv-weight",      type=float, default=1.0, help="w: dense RENDEZVOUS reward = w·g·(φ_prev−φ_now), g=surplus gate. At w=1.0 a full-gate approach hop pays 1.0·0.02=0.020 against a 0.015-0.021 step_penalty, i.e. it exactly REBATES the travel cost and leaves the meet-vs-explore decision to --sync-weight. Above ~2 it becomes a chase term. 0 disables. M>1 only")
     g_reward.add_argument("--rdv-offer-frac",  type=float, default=0.15, help="Rendezvous gate saturates (g→1) when the map gained since last sync reaches this fraction of the OWN map size AT that sync (relative growth, floored by scan_norm_nodes); also normalizes the ∆M actor obs")
+    g_reward.add_argument("--rdv-clamp-pos", action="store_true",
+                    help="Pay only the APPROACH half of the rdv term: Δφ clamped to ≥0, so moving AWAY from the teammate is never taxed. Measured on v15, reward/rdv was −0.20/episode — a standing tax on exactly the divergence exploration requires. This does break the telescoping property, but that property was already gone: g·(φ_prev−φ_now) with a state-dependent gate and no γ was never potential-based shaping. Safe while --rdv-weight < step_penalty_coef·scan_norm_nodes = 0.75, above which approach→retreat→approach becomes free money")
+    g_reward.add_argument("--rdv-urgency-mode", choices=["time", "budget"], default="time",
+                    help="What makes a rendezvous urgent. 'time' (legacy) ramps on steps-since-last-sync, so the gate opens merely because the two have been apart — pulling them together mid-episode, when they should still be splitting. 'budget' ramps on the fraction of the episode budget spent (the same travel_frac the actor observes), so the pull appears only near the deadline. Under --done-mode own the terminal meeting is what completes both maps, and there is no reason to pay for it early. Changes what `g` means, and `g` is both agent_scalars[0] and the rdv reward gate — switch it only at a phase boundary")
+    g_reward.add_argument("--rdv-urgency-start", type=float, default=0.5,
+                    help="budget mode only: fraction of the episode budget spent before urgency starts ramping (0.5 = explore for the first half, then meeting becomes progressively worth more). Ignored when --rdv-urgency-mode time")
+    g_reward.add_argument("--rdv-urgency-T", type=float, default=200.0,
+                    help="Steps of separation at which the rendezvous urgency nudge saturates. ALSO the normalizer of the staleness ACTOR OBS (was max_episode_steps, which made one step worth 0.0005 at T=2048 and silently rescaled the input across the easy→difficult warm start). Set it to a real physical scale: 'how long apart before meeting is urgent'")
+    g_reward.add_argument("--completion-bonus", type=float, default=10.0,
+                    help="Terminal payout when the done criterion fires. Under --done-mode own this is the ONLY term paying for the actual objective, and it had no flag at all before v16. Raise it if reward/completion stays flat while coverage plateaus — but check --gamma first: at γ=0.99 a 2048-step episode discounts a bonus of 10 to ≈0 seen from t=0, so the term is invisible no matter how large it is")
+    g_reward.add_argument("--step-penalty", type=float, default=0.015,
+                    help="Per-axial-step movement cost (diagonal costs ·√2), charged per lattice-edge length. The direct price of hesitation: raise it to buy directness, at the risk of the agent preferring to stop exploring. Distinct from --stall-pen, which prices standing still")
     g_reward.add_argument("--sync-weight",     type=float, default=0.0,
                     help="ζ_g: SYNC-EVENT reward = ζ_g·(give + ρ·recv)/scan_norm_nodes, paid on the RISING EDGE of comm only, and only ≥ --sync-min-gap steps after the last paid sync. give = |my map \\ his map| pre-fusion. This is the OBJECTIVE term for rendezvous (rdv-weight is only shaping). 0.25 ≈ 2.55 per sync after 200 steps apart vs a measured 1.7-1.9 detour cost. 0 disables (pre-v11 behavior)")
     g_reward.add_argument("--sync-recv-ratio", type=float, default=0.5,
@@ -120,6 +147,18 @@ def build_parser() -> argparse.ArgumentParser:
     g_reward.add_argument("--radar-util-norm", type=float, default=8.0,  help="RADAR b_util normalization divisor (lower = far frontier mass squashed less)")
     g_reward.add_argument("--belief-mode",     choices=["uniform", "pathfront"], default="uniform",
                     help="teammate-position belief model used post-comm-break: 'uniform' geodesic ball (old default) vs 'pathfront' two-phase hypothesis model")
+    # What the pathfront belief calls an OPENING. These were EnvCfg-only defaults, so a run's
+    # params.json recorded nothing about them and two runs with different frontier semantics were
+    # indistinguishable after the fact — exactly the config drift this project has already been
+    # bitten by. Defaults here mirror EnvCfg; passing them explicitly is what puts them on record.
+    g_reward.add_argument("--pf-frontier-min-unknown", type=int, default=1,
+                    help="pathfront: minimum UNKNOWN 8-neighbours for a node to count as an opening. "
+                         "Guard only — the real gate is --pf-frontier-min-util. Was 4, which dropped "
+                         "large openings the observer had merely approached")
+    g_reward.add_argument("--pf-frontier-min-util", type=float, default=1e-6,
+                    help="pathfront: minimum PRE-diffusion utility seed (util_raw = ribbon x volume) "
+                         "for a node to count as an opening. This is what removes wall-adjacent "
+                         "nodes whose 'unknown' is unreachable, and room-corner tips")
     g_reward.add_argument("--radar-team-source", choices=["lkp", "belief"], default="lkp",
                     help="feat[6] RADAR teammate source beyond the ego window: 'lkp' (old default) decays "
                          "a point at each teammate's last-known node; 'belief' mass-transports the belief "
@@ -163,6 +202,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Emit 2 eval GIFs at each milestone (25/50/75/100%%)")
     g_flags.add_argument("--eval-steps", type=int, default=-1,
                     help="G.2: episode length for eval-on-ckpt GIFs/traces. -1 = same as --max-episode-steps")
+    g_flags.add_argument("--trace-steps", type=int, default=512,
+                    help="HARD CAP on the episode length of the milestone GIF + inspector trace "
+                         "(NOT the eval suite, which still runs full --eval-steps episodes and is "
+                         "what picks ckpt_best). eval/trace.py builds the whole episode in Python "
+                         "objects before serialising: a 1813-step difficult episode is 3.1 GB of "
+                         "JSON on disk and ~27 GB live, which OOM-killed v14 and v15 at it=98 on a "
+                         "30 GB host. 512 is v10's value, which ran a full phase 2 without dying.")
     g_flags.add_argument("--eval-n-maps", type=int, default=2, help="GIFs + decision traces per milestone")
     g_flags.add_argument("--eval-map-idx", type=int, default=-1, help="fixed eval map (-1 = random each milestone)")
 

@@ -66,11 +66,13 @@ def main() -> None:
                     help="'ckpt' keeps the checkpoint's own comm model/range (as trained)")
     ap.add_argument("--belief-mode", choices=["uniform", "pathfront"], default="pathfront",
                     help="which teammate-belief model to record (bel field)")
-    ap.add_argument("--prune-util", type=float, default=0.0,
-                    help="plausibility pruning (fix C): drop belief mass locked behind frontiers whose "
-                         "utility is below this (0 = off). Sum(p) then falls below 1 = 'teammate lost'.")
-    ap.add_argument("--prune-min-cluster", type=int, default=0,
-                    help="fix C: ignore frontier openings made of fewer than this many nodes at freeze")
+    ap.add_argument("--frontier-min-unknown", type=int, default=None,
+                    help="pathfront: min UNKNOWN 8-neighbours for a node to count as an opening "
+                         "(env default 4). Lower it to stop dropping openings the observer has "
+                         "only partly revealed.")
+    ap.add_argument("--frontier-min-util", type=float, default=None,
+                    help="pathfront: min PRE-diffusion utility seed (util_raw) for a node to count "
+                         "as an opening (env default 0.02)")
     ap.add_argument("--use-policy", action="store_true",
                     help="drive with the TRAINED policy (agents explore & separate on their own) "
                          "instead of the scripted agent1-holds/agent0-walks-away override")
@@ -85,8 +87,26 @@ def main() -> None:
     trace_env = dict(env_peek or {})
     trace_env["use_teammate_belief"] = True
     trace_env["belief_mode"] = args.belief_mode
-    trace_env["belief_prune_util"] = float(args.prune_util)
-    trace_env["belief_prune_min_cluster"] = int(args.prune_min_cluster)
+    # What counts as an OPENING. These two gates overlap and can disagree: the unknown-neighbour
+    # COUNT drops a node the moment the observer reveals a few of its neighbours, even while it
+    # still has most of its ribbon, whereas the SEED (util_raw) measures what is actually left to
+    # reveal. Exposed here so the two can be compared on the same episode instead of argued about.
+    if args.frontier_min_unknown is not None:
+        trace_env["pf_frontier_min_unknown"] = int(args.frontier_min_unknown)
+    if args.frontier_min_util is not None:
+        trace_env["pf_frontier_min_util"] = float(args.frontier_min_util)
+    # PRINT WHAT IS ACTUALLY IN FORCE. A checkpoint stores its own env cfg and `from_ckpt_dict`
+    # restores it, which is right for an eval but means a value CHANGED IN THE CODE SINCE THE
+    # CHECKPOINT WAS SAVED DOES NOT APPLY unless overridden here. That is not hypothetical: the
+    # v10 checkpoint pins pf_frontier_min_unknown=4, so traces regenerated from it after the
+    # default moved to 1 came out byte-identical and looked like the fix had not been applied.
+    from env.explorer import EnvCfg as _EC
+    _eff = _EC.from_ckpt_dict(trace_env, n_envs=1, n_agents=2, max_episode_steps=args.steps + 1)
+    print(f"[trace] frontier semantics IN FORCE: min_unknown={_eff.pf_frontier_min_unknown} "
+          f"min_util={_eff.pf_frontier_min_util:g}  "
+          f"(ckpt pinned min_unknown="
+          f"{(env_peek or {}).get('pf_frontier_min_unknown', 'absent')}, "
+          f"min_util={(env_peek or {}).get('pf_frontier_min_util', 'absent')})")
     if args.comm_model != "ckpt":                 # 'ckpt' → leave the trained comm model/range alone
         trace_env["comm_model"] = args.comm_model
         trace_env["comm_range_px"] = float(args.comm_range)
@@ -101,9 +121,13 @@ def main() -> None:
         probe = Explorer(split, probe_cfg, seed=int(args.map_idx))
         action_fn = build_action_fn(probe)
 
-    tag = f"belief_{args.belief_mode}_{'policy' if args.use_policy else 'scripted'}_{args.ckpt.stem}_m{args.map_idx}"
-    if args.prune_util > 0.0 or args.prune_min_cluster > 0:
-        tag += f"_prune{args.prune_util:g}-{args.prune_min_cluster}"
+    # The SPLIT and the COMM RANGE belong in the tag. Without them a hybrid run and a complex run
+    # of the same checkpoint and map index write to the same folder and silently replace each
+    # other, and two comm ranges — the whole point of comparing — cannot coexist.
+    sp = args.split.replace("/", "-")
+    cr = "ckpt" if args.comm_model == "ckpt" else f"{args.comm_model}{args.comm_range:g}"
+    tag = (f"belief_{args.belief_mode}_{'policy' if args.use_policy else 'scripted'}"
+           f"_{args.ckpt.stem}_{sp}_m{args.map_idx}_{cr}")
     capture_trace(model, split, trace_env, 2, int(args.map_idx), int(args.steps),
                   args.out, tag, args.device, action_fn=action_fn)
     print(f"[trace] wrote {args.out}/traces/{tag}  → open the inspector and pick the '{tag}' episode")

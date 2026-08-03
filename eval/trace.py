@@ -22,6 +22,8 @@ _KOFF = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]
 
 
 def _r(x, nd=4):
+    if x is None:                 # absent field (e.g. M=1 → no rendezvous state) stays absent
+        return None
     v = float(x)
     if v != v or v in (float("inf"), float("-inf")):
         return None
@@ -62,12 +64,34 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
     env.store_render_global = True
     env.reload_map(env_idx=0, map_idx=int(map_idx))
 
-    # The env auto-resets (wiping occupancy) the moment an episode terminates, so we'd never
-    # be able to render the COMPLETED/fused map. Disable termination+truncation for the trace
-    # and detect completion ourselves via explored_rate ≥ complete_thresh.
+    # The env auto-resets (wiping occupancy) the moment an episode ends, so we'd never be able to
+    # render the COMPLETED/fused map. Every end condition is therefore disabled ON THE ENV and
+    # re-implemented below, on the trace side, from the SAME quantities the env uses.
+    #
+    # It has to be the same rule, and it was not. This block used to stop on `explored_rate`, the
+    # team UNION — so under --done-mode own the inspector ended the episode the moment the union
+    # hit 99%, even when one robot was still missing a large part of its own map and the two had
+    # never exchanged anything. That is a different (and strictly easier) question than the one
+    # being trained and scored, and it is what the rendered episodes have been showing all along.
+    # `_run_eval_suite` and `eval/rollout.py` were always correct — they read info["terminated"] —
+    # so eval/success_rate was never affected; only what you SEE was.
     complete_thresh = float(env.cfg.done_explored_thresh)
+    done_mode = str(env.cfg.done_mode)
+    # Travel budget: mirrored here too. Leaving it live on the env would auto-reset the trace
+    # mid-episode the moment the budget ran out (a new failure mode introduced with
+    # max_travel_frac, which trace.py predates).
+    travel_budget = (float(env.cfg.max_travel_frac) * float(env.free_total[0].item())
+                     if env.cfg.max_travel_frac > 0.0 else float(env.cfg.max_travel_px))
     env.cfg.done_explored_thresh = 2.0       # never terminate → never auto-reset
+    # ditto for the distance budget — but SUPPRESS the truncation instead of zeroing the budget.
+    # Zeroing max_travel_frac/max_travel_px (the pre-v16 way) also zeroed agent_scalars[2]
+    # (travel_frac), so every traced episode ran with a deadline signal the policy never saw in
+    # training. The env keeps its real budget; only the truncation is switched off.
+    env.cfg.ignore_budget_truncation = True
     env.cfg.max_episode_steps = n_steps + 5  # never truncate within the trace
+    # n_agents, not M: M is bound further down, after this block.
+    travel_per_robot = torch.zeros(n_agents, device=env.dev)  # cumulative px, mirrors env.travel_px[0]
+    travelled = 0.0                                           # max over robots
 
     was_training = model.training
     model.eval()
@@ -135,6 +159,9 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         value = float(out["value"][0].cpu().numpy())
         action = out["action"][0].cpu().numpy()
         amask = obs["action_mask"][0].cpu().numpy()
+        # The actor's own scalar inputs, exactly as the policy saw them for THIS decision (obs is
+        # still the pre-step one here). [M, AGENT_SCALAR_DIM]; the inspector labels the columns.
+        ascal = obs["agent_scalars"][0].cpu().numpy()
         # Teammate visibility for the inspector (env 0). pos_all = ground-truth xy of every
         # agent; lkp[i,j] = i's believed pos of j; cmask[i,j] = i&j communicating this step.
         pos_all = rg["pos"][0].cpu().numpy()                  # [M, 2]
@@ -199,8 +226,25 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             fr = compute_frontier(env.world.occupancy_torch[0:1, a])[0].cpu().numpy()
             agent_frames[a].append(paint_frontier(shade_occupancy_prob(prob), fr))   # → animated GIF later
 
+        _pos_prev = env.pos.clone()
         obs, reward, done, info = env.step(out["action"])
+        # Mirror env.travel_px so the trace honours the same distance budget the env would have
+        # enforced, without letting the env auto-reset and wipe the map. Accumulate PER ROBOT and
+        # take the max at the end — Σ max_a(Δd_a) is not max_a(Σ Δd_a) and would cut the episode
+        # short whenever the two robots take turns being the faster one, i.e. always.
+        travel_per_robot += (env.pos - _pos_prev).norm(dim=-1)[0]        # [M]
+        travelled = float(travel_per_robot.max().item())
+        # Paid-sync event per agent [M]. Distinct from comm_mask: this is the rising edge that
+        # cleared --sync-min-gap and actually paid, i.e. the thing reward/sync is made of.
+        _sp = info.get("sync_paid")
+        sync_paid_np = (_sp[0].cpu().numpy() if _sp is not None
+                        else np.zeros(M, dtype=np.float32))
         dbg = env._dbg_reward or {}
+        # RAW rendezvous state — every factor of rdv = w · g · (φ_prev − φ_now) and every input g
+        # is built from. Scalars are per [env, agent]; env index is 0 (single-env trace).
+        rdv_dbg = getattr(env, "_rdv_dbg", None) or {}
+        rdv_np = {k: (v[0].cpu().numpy() if hasattr(v, "cpu") else v)
+                  for k, v in rdv_dbg.items()}
 
         # RAW teammate belief posterior per node (unmasked → includes UNKNOWN nodes the diffusion
         # spreads onto, which feat[4]/"team" drops). Max over teammates, peak-normalized per agent
@@ -218,6 +262,8 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
         # Rendered as distinct points so the viewer sees each dot depart lkp→frontier (viz only).
         seen_rg = rg.get("belief_seen")
         seen_np = seen_rg[0].cpu().numpy() if seen_rg is not None else None      # [M, N_max] observer POV
+        front_rg = rg.get("belief_frontier")
+        front_np = front_rg[0].cpu().numpy() if front_rg is not None else None   # [M, N_max] openings
         bt_rg = rg.get("belief_transit")
         bel_transit = bt_rg[0].cpu().numpy().max(axis=1) if bt_rg is not None else None   # [M, N_max]
 
@@ -241,6 +287,12 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 # sn = the observer can see this node right now (comm would have fired) → belief here
                 # would be belief on ground already proven empty.
                 "sn": 1 if (seen_np is not None and seen_np[a, n]) else 0,
+                # fr = the node is a FRONTIER (an opening into the unknown) right now. Belief on a
+                # frontier inside `sn` is LEGITIMATE — it means "he is beyond that opening", and
+                # the frontier node is only its proxy. Belief inside `sn` on a node that is NOT a
+                # frontier is the one thing that is always wrong. Without this flag the viewer
+                # cannot tell the two apart and neither can anyone reading it.
+                "fr": 1 if (front_np is not None and front_np[a, n]) else 0,
                 # v = the node is VALID (known ground in this observer's map). A drawn node with v=0 is
                 # only on screen because it carries belief — i.e. belief outside the known zone.
                 "v": 1 if nv[a, n] else 0,
@@ -259,6 +311,43 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                             edges.append([int(s), d])
             cur = int(curr[a])
             rew = {kk: _r(v[0, a]) for kk, v in dbg.items()} if dbg else {}
+            # Per-agent rendezvous record. Kept as RAW numbers in their own units (offer/baseline/
+            # scale in pixels, dt in steps, phi in [0,1]) — the viewer does the arithmetic on
+            # screen so the reward is traceable factor by factor instead of asserted.
+            if rdv_np:
+                def _g(k, cast=float):
+                    v = rdv_np.get(k)
+                    if v is None:
+                        return None
+                    if np.isscalar(v) or getattr(v, "ndim", 1) == 0:
+                        return cast(v)
+                    return cast(v[a])
+                rdv_rec = {
+                    "g": _r(_g("g"), 4), "g_content": _r(_g("g_content"), 4),
+                    "urgency": _r(_g("urgency"), 4), "urgency_w": _r(_g("urgency_w"), 4),
+                    "urgency_mode": rdv_np.get("urgency_mode"),
+                    "offer": _r(_g("offer"), 1), "baseline": _r(_g("baseline"), 1),
+                    "frac": _r(_g("frac"), 4), "scale": _r(_g("scale"), 1),
+                    "j": _g("j_star", int), "dt": _g("dt", int),
+                    "staleness": _r(_g("staleness"), 4),
+                    "w": _r(_g("w"), 4), "phi": _r(_g("phi"), 4),
+                    "phi_prev": _r(_g("phi_prev"), 4), "dphi": _r(_g("dphi"), 5),
+                    "dphi_raw": _r(_g("dphi_raw"), 5),
+                    "clamped": (1 if rdv_np.get("clamped") else 0) if "clamped" in rdv_np else None,
+                    "valid": int(bool(_g("valid", float))) if "valid" in rdv_np else None,
+                    "rdv": _r(_g("rdv"), 5),
+                    # What the rdv term would pay for EACH candidate move: w·g·(φ_curr − φ_nbr[k]).
+                    # null on invalid slots. This is the part that answers "is the gate steering
+                    # this decision, and toward which neighbour" — g alone cannot say.
+                    "preview": ([None if not np.isfinite(x) else _r(float(x), 5)
+                                 for x in rdv_np["rdv_preview"][a]]
+                                if rdv_np.get("rdv_preview") is not None else None),
+                    "phi_nbr": ([None if not np.isfinite(x) else _r(float(x), 4)
+                                 for x in rdv_np["phi_nbr"][a]]
+                                if rdv_np.get("phi_nbr") is not None else None),
+                }
+            else:
+                rdv_rec = None
             # Per-teammate visibility from a's POV. comm=1 → a knows j's true pos this step
             # (belief == truth); comm=0 → est is a stale guess (drawn differently by the UI).
             teammates = [{
@@ -280,18 +369,37 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "action_mask": [int(b) for b in amask[a].tolist()],
                 "curr_nbrs": curr_nbrs,
                 "reward": rew, "nodes": nodes, "edges": edges,
-                "teammates": teammates,
+                "teammates": teammates, "rdv": rdv_rec,
+                # The actor's scalar inputs for this decision, and whether a sync was actually PAID
+                # entering this step. teammates[].comm already shows CONTACT; sync is the narrower
+                # event — rising edge, past --sync-min-gap — that the reward pays for, and the two
+                # come apart exactly where the min-gap suppresses a payment.
+                "scalars": [_r(float(x), 4) for x in ascal[a].tolist()],
+                "sync": int(sync_paid_np[a] > 0.0),
+                "travel": _r(float(travel_per_robot[a].item()), 1),
                 # REAL per-layer, per-head GAT neighbor-attention softmax for this agent's window —
                 # NOT embedded here (see gdir above); this just flags whether gat/{t:04d}.json exists.
                 "has_gat": gat_agents is not None,
             })
         # True coverage from info (reset is disabled above, so occupancy is intact).
         explored = float(info["explored_rate"][0].item())
+        own_cov = info["own_cov"][0]                       # [M] per-robot OWN-map coverage
+        own_min = float(own_cov.min().item())
+        # THE SAME TEST THE ENV MAKES (env/explorer.py: done_frac = explored_rate if done_mode ==
+        # "union" else own_cov.amin(dim=1)). Under "own" the episode is over only when the WEAKEST
+        # robot privately holds the map — the union being complete is explicitly not enough, since
+        # the exchange is the part of the task being trained.
+        done_frac = explored if done_mode == "union" else own_min
+        rec["explored"] = _r(explored, 4)
+        rec["own_cov"] = [_r(float(x), 4) for x in own_cov.tolist()]
+        rec["own_min"] = _r(own_min, 4)
         h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
         steps.append(rec)
-        if explored >= complete_thresh:        # map complete → natural episode end
+        if done_frac >= complete_thresh:       # objective met → natural episode end
             completed = True
             break
+        if travel_budget > 0.0 and travelled >= travel_budget:
+            break                              # budget exhausted → truncation, NOT completion
 
     # Terminal completion frame: the UNION of both agents' (now-fused) maps = the full
     # environment. Appended as a final step so it's visible that the episode ended COMPLETE.
@@ -301,6 +409,16 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             agent_frames[a].append(union_rgb)      # union = last frame of every agent's GIF
         term_fi = len(agent_frames[0]) - 1
         pos_now = env.pos[0].cpu().numpy()     # [M, 2] final positions (no reset happened)
+        # REAL comm state on the terminal frame. This used to be hardcoded to comm=1 for every
+        # pair, on the reasoning that the union map is complete so "everyone shares everything".
+        # But the inspector draws comm=1 as a solid green link at the teammates' TRUE positions,
+        # so the last step always looked like a live contact no matter where the robots actually
+        # were — indistinguishable, on screen, from map exchange happening across the map and
+        # through walls. Measured on the real env, comm at that moment is nothing of the sort:
+        # 19% of contacts exceed the LiDAR range (the radio legitimately reaches further, same
+        # signal-strength model and constants as IR2) but only 0.3% have a wall on the segment.
+        # The frame is synthetic; the comm state drawn on it must not be.
+        term_cmask = env._render_global["comm_mask"][0].cpu().numpy()   # [M, M] last real step
         term_agents = []
         for a in range(M):
             term_agents.append({
@@ -311,8 +429,11 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "logits": [None] * K, "action_mask": [0] * K,
                 "curr_nbrs": [-1] * K,
                 "reward": {}, "nodes": [], "edges": [], "has_gat": False,
-                # all agents share the complete map now → draw teammates solid at true pos.
-                "teammates": [{"j": int(j), "comm": 1,
+                # Teammate markers carry the ACTUAL contact state of the final real step. When
+                # there is no contact the UI draws the estimate (dashed, "?"), which is the honest
+                # picture: the map is complete, the robots need not be within radio range of each
+                # other at the instant it completed.
+                "teammates": [{"j": int(j), "comm": int(term_cmask[a, j]),
                                "est":  [_r(pos_now[j, 0], 1), _r(pos_now[j, 1], 1)],
                                "true": [_r(pos_now[j, 0], 1), _r(pos_now[j, 1], 1)]}
                               for j in range(M) if j != a],

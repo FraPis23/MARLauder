@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MARLauder — Architettura</title>
+<title>MARLauder — Architettura v1.4</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --mut:#8b949e;
-    --env:#1f6feb; --net:#2ea043; --train:#bc8cff; --bus:#d29922;
+    --env:#1f6feb; --net:#2ea043; --train:#bc8cff; --bus:#d29922; --off:#6e7681;
     --line:#30363d; --edge:#6e7681;
   }
   *{box-sizing:border-box}
@@ -15,29 +15,29 @@
     font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   header{padding:18px 24px;border-bottom:1px solid var(--line)}
   h1{margin:0;font-size:18px}
-  .sub{color:var(--mut);font-size:12px;margin-top:4px}
+  .sub{color:var(--mut);font-size:12px;margin-top:4px;max-width:1100px}
   .legend{display:flex;gap:18px;flex-wrap:wrap;padding:12px 24px;border-bottom:1px solid var(--line)}
   .lg{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)}
   .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
   .wrap{padding:24px;display:flex;flex-direction:column;gap:0;align-items:center}
-  .lane{width:100%;max-width:1120px}
+  .lane{width:100%;max-width:1180px}
   .laneTitle{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin:18px 0 8px}
   .row{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;justify-content:center}
   .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-    padding:10px 12px;min-width:150px;max-width:230px}
+    padding:10px 12px;min-width:150px;max-width:250px}
   .box b{display:block;font-size:13px;margin-bottom:3px}
   .box .io{color:var(--mut);font-size:11px;white-space:pre-line}
   .box.env{border-left:3px solid var(--env)}
   .box.net{border-left:3px solid var(--net)}
   .box.train{border-left:3px solid var(--train)}
   .bus{background:linear-gradient(90deg,#3a2d05,#241c04);border:1px dashed var(--bus);
-    border-radius:8px;padding:10px 14px;width:100%;max-width:1120px;text-align:center}
+    border-radius:8px;padding:10px 14px;width:100%;max-width:1180px;text-align:center}
   .bus b{color:var(--bus)}
   .bus .io{color:#d8c79a;font-size:11px;white-space:pre-line;margin-top:4px}
   .arrow{align-self:center;color:var(--edge);font-size:20px;padding:0 2px}
   .down{color:var(--edge);font-size:22px;text-align:center;margin:6px 0}
-  .split{display:flex;gap:24px;width:100%;max-width:1120px;justify-content:center;flex-wrap:wrap}
-  .col{flex:1;min-width:300px;background:#11161d;border:1px solid var(--line);border-radius:10px;padding:14px}
+  .split{display:flex;gap:24px;width:100%;max-width:1180px;justify-content:center;flex-wrap:wrap}
+  .col{flex:1;min-width:320px;background:#11161d;border:1px solid var(--line);border-radius:10px;padding:14px}
   .col h3{margin:0 0 10px;font-size:13px}
   .col.actor h3{color:#2ea043}.col.critic h3{color:#58a6ff}
   .note{color:var(--mut);font-size:11px;margin-top:6px}
@@ -46,120 +46,185 @@
   .pill .t{color:var(--mut);font-size:11px}
   .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:10px;margin-left:6px;vertical-align:middle}
   .tag.new{background:#13311c;color:#3fb950;border:1px solid #238636}
+  .tag.off{background:#1c2128;color:var(--off);border:1px solid #30363d}
   code{color:#79c0ff}
+  table{border-collapse:collapse;width:100%;font-size:12px}
+  th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+  th{color:var(--mut);font-weight:normal;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+  td.k{color:#79c0ff;white-space:nowrap}
+  td.v{color:var(--ink);white-space:nowrap}
+  .tblwrap{overflow-x:auto;background:#11161d;border:1px solid var(--line);border-radius:10px;padding:6px 10px}
+  .cols2{display:flex;gap:20px;flex-wrap:wrap;width:100%;max-width:1180px}
+  .cols2 > *{flex:1;min-width:340px}
   footer{color:var(--mut);font-size:11px;padding:16px 24px;border-top:1px solid var(--line)}
+  .off b, .off .k{color:var(--off)}
 </style>
 </head>
 <body>
 <header>
-  <h1>MARLauder — Architettura (v0.9, policy appresa + value-field analitico)</h1>
-  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO · GAT ego-centrico · nessun target analitico: la rete guida dalle feature del grafo + 2 scalari di rendezvous + <b>value-field</b> (V_k per direzione: "quanto rende andare di là", sconto γ^hops — anti-loop tra frontiere)</div>
+  <h1>MARLauder — Architettura v1.4 <span style="color:var(--mut);font-size:13px">(run <code>v14_frontier</code>, 2026-07-31)</span></h1>
+  <div class="sub">Esplorazione multi-agente GPU-resident · MAPPO CTDE · encoder GAT ego-centrico a 6 layer · policy appresa (nessun target analitico) guidata da: feature del grafo + <b>value-field</b> V_k per direzione + 2 scalari di rendezvous + <b>belief pathfront</b> del compagno che alimenta feat[4]/feat[6].<br>
+  Questa pagina descrive <b>solo ciò che è effettivamente attivo</b> nella configurazione di training corrente (fonte: <code>runs/v14_frontier_easy_20260731_004306/params.json</code> + <code>pipeline_v14_frontier.sh</code>). Ciò che esiste nel codice ma è spento è raccolto nella sezione finale.</div>
 </header>
 
 <div class="legend">
-  <span class="lg"><span class="dot" style="background:var(--env)"></span>Env / simulazione (GPU)</span>
+  <span class="lg"><span class="dot" style="background:var(--env)"></span>Env / simulazione (GPU, Warp)</span>
   <span class="lg"><span class="dot" style="background:var(--net)"></span>Rete (MarlActorCritic)</span>
   <span class="lg"><span class="dot" style="background:var(--train)"></span>Training (MAPPO)</span>
   <span class="lg"><span class="dot" style="background:var(--bus)"></span>Bus dati (interfaccia)</span>
+  <span class="lg"><span class="dot" style="background:var(--off)"></span>Presente ma DISATTIVO in questa config</span>
 </div>
 
 <div class="wrap">
 
+  <!-- CONFIG ATTIVA -->
+  <div class="lane">
+    <div class="laneTitle">⓪ Configurazione in uso (v14 — le due fasi condividono <code>$COMMON</code>)</div>
+    <div class="cols2">
+      <div class="tblwrap">
+        <table>
+          <tr><th colspan="2">Scala &amp; episodio</th></tr>
+          <tr><td class="k">n_envs · n_agents</td><td class="v">32 · <b>2</b></td></tr>
+          <tr><td class="k">rollout_len · tbptt_steps</td><td class="v">256 · 8</td></tr>
+          <tr><td class="k">minibatches · k_epochs</td><td class="v">1 · 4</td></tr>
+          <tr><td class="k">n_hops (raggio finestra ego)</td><td class="v">6 → finestra 15×15 = 225 nodi</td></tr>
+          <tr><td class="k">nr (passo lattice)</td><td class="v">16 px → N_max ≈ 1200 nodi</td></tr>
+          <tr><td class="k">max_episode_steps</td><td class="v">1024 (easy) / 2048 (difficult) — solo rete di sicurezza</td></tr>
+          <tr><td class="k">max_travel_frac</td><td class="v"><b>0.06</b> px percorsi / px-liberi-GT ← <b>è questo che vincola</b></td></tr>
+          <tr><td class="k">done_mode</td><td class="v"><b>own</b> — ogni agente al 99% della SUA mappa (regola IR2)</td></tr>
+          <tr><td class="k">map_seed · seed</td><td class="v">0 · 0 (A/B riproducibile)</td></tr>
+          <tr><th colspan="2">Sensing &amp; comm</th></tr>
+          <tr><td class="k">sensor_range · n_rays</td><td class="v">80 px · 720 raggi LiDAR</td></tr>
+          <tr><td class="k">comm_model</td><td class="v"><b>signal_strength</b> (path-loss, i muri attenuano, rumore per-episodio)</td></tr>
+          <tr><td class="k">ss_thresh</td><td class="v">−70 dBm (raggio libero effettivo 150–310 px)</td></tr>
+        </table>
+      </div>
+      <div class="tblwrap">
+        <table>
+          <tr><th colspan="2">Percezione derivata</th></tr>
+          <tr><td class="k">vf_gamma (value-field)</td><td class="v">0.97</td></tr>
+          <tr><td class="k">radar_gamma · radar_util_norm</td><td class="v">0.97 · <b>3.0</b></td></tr>
+          <tr><td class="k">belief_mode</td><td class="v"><b>pathfront</b> (ipotesi a 2 fasi)</td></tr>
+          <tr><td class="k">radar_team_source</td><td class="v"><b>belief</b> — feat[6] trasporta il campo, non il lkp</td></tr>
+          <tr><td class="k">pf_frontier_min_unknown</td><td class="v">1 (solo guardia)</td></tr>
+          <tr><td class="k">pf_frontier_min_util</td><td class="v"><b>1e-6</b> — strettamente &gt; 0, non una soglia tarata</td></tr>
+          <tr><th colspan="2">PPO</th></tr>
+          <tr><td class="k">lr · ent_coef</td><td class="v">3e-4 · 0.01</td></tr>
+          <tr><td class="k">clip_eps · max_grad_norm</td><td class="v">0.15 · 2.0</td></tr>
+          <tr><td class="k">gamma · gae_lambda · vf_coef</td><td class="v">0.99 · 0.95 · 0.5</td></tr>
+          <tr><th colspan="2">Rete</th></tr>
+          <tr><td class="k">d_hidden · n_heads · n_layers</td><td class="v">128 · 4 · <b>6</b> (n_layers legato a n_hops)</td></tr>
+          <tr><td class="k">GRU</td><td class="v"><span class="tag off">OFF</span> → il modello gira feed-forward</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="note">⚠ <code>revisit_pen</code> effettivo = <b>0.05</b> (default della CLI), NON lo 0.10 scritto in <code>EnvCfg</code>: <code>run_train.py</code> passa sempre l'argparse, quindi il default di EnvCfg è morto. <code>params.json</code> registra il valore effettivo.</div>
+  </div>
+
   <!-- ENV PIPELINE -->
   <div class="lane">
-    <div class="laneTitle">① Env — pipeline percezione → grafo (per step, tutta su GPU, agenti in batch B=N·M)</div>
+    <div class="laneTitle">① Env — pipeline percezione → grafo (per step, tutta su GPU, agenti in batch B = N·M = 64)</div>
     <div class="row">
       <div class="box env"><b>WarpWorld</b><span class="io">in: pos [N,M,2]
 out: occupancy [N,M,H,W]
-LiDAR 720 raggi · sensore 80px
+LiDAR 720 raggi · range 80 px
 comm signal-strength · fuse_maps()</span></div>
       <span class="arrow">→</span>
       <div class="box env"><b>Frontier</b><span class="io">in: occupancy
 out: frontier [N,H,W]
-conv2d (FREE adiac. UNKNOWN)</span></div>
+conv2d (FREE adiacente a UNKNOWN)</span></div>
       <span class="arrow">→</span>
       <div class="box env"><b>GraphLattice.build</b><span class="io">out: node_feat[7], edge_idx[8],
 node_valid, utility (info-gain)
-lattice 8-vicini · reachability</span></div>
+lattice 8-vicini · reachability
+feat[0,1] x/y_rel · [2] utility · [3] age (W=16)</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>Bellman-Ford</b><span class="io">bf_from_curr → dist/parent
+bf_from_teammate (grafo ottimistico)
+wall-aware, warm-started</span></div>
     </div>
     <div class="down">↓</div>
     <div class="row">
-      <div class="box env"><b>Bellman-Ford</b><span class="io">bf_from_curr → dist/parent
-bf_from_teammate (grafo optim)
-wall-aware, warm-started</span></div>
+      <div class="box env"><b>pathfront belief <span class="tag new">v1.4</span></b><span class="io">ipotesi congelate alla rottura del comm,
+una per cluster di frontiere (max 6):
+1) TRANSITO: punto lkp→frontiera, 1 hop/step
+2) DIFFUSIONE ASSORBENTE: β_F = min(1·util, 0.9),
+   λ_diff 0.5, rilascio quando la frontiera è esplorata
+Σp = 1, mai su nodi UNKNOWN</span></div>
+      <span class="arrow">→</span>
+      <div class="box env"><b>feat[4] teammate_pot</b><span class="io">potenziale BF derivato dal belief
+(non più exp(−d/scale) sul lkp)
+in-window · cross-agent · M&gt;1</span></div>
       <span class="arrow">→</span>
       <div class="box env"><b>value_field <span class="tag new">VF</span></b><span class="io">albero BF partizionato per PRIMO passo
-V_k = Σ γ^hops·utility del ramo k
-max-norm [0,1] · vicina-debole vs
+V_k = Σ γ^hops·utility del ramo k, γ=0.97
+max-norm [0,1] → vicina-debole vs
 lontana-forte su un'unica scala</span></div>
       <span class="arrow">→</span>
       <div class="box env"><b>build_radar <span class="tag new">RADAR</span></b><span class="io">massa oltre-finestra → nodi gateway
-feat[5] b_util · feat[6] b_teammate
-sostituisce il guidepost analitico</span></div>
+feat[5] b_util (γ_r 0.97, norm 3)
+feat[6] b_teammate = trasporto di massa
+   del CAMPO belief (non del lkp)</span></div>
       <span class="arrow">→</span>
-      <div class="box env"><b>feat[4] teammate_pot</b><span class="io">potenziale BF verso il compagno
-in-window · cross-agent · M&gt;1</span></div>
-      <span class="arrow">→</span>
-      <div class="box env"><b>extract_local_window</b><span class="io">ritaglio ego (2·n_hops+3)²
-= ciò che la rete vede</span></div>
+      <div class="box env"><b>extract_local_window</b><span class="io">ritaglio ego (2·n_hops+3)² = 15×15
+= esattamente ciò che la rete vede</span></div>
     </div>
   </div>
 
-  <div class="down">↓ &nbsp; Explorer assembla obs + critic_global[7] + agent_scalars[2]</div>
+  <div class="down">↓ &nbsp; Explorer assembla obs + critic_global[7] + agent_scalars[2] + value_field[8]</div>
 
   <!-- OBS BUS -->
   <div class="bus">
     <b>BUS #1 — obs dict [N, M, …]</b> (env → modello)
-    <div class="io">node_feat[7] (0 x_rel · 1 y_rel · 2 utility · 3 age · 4 teammate_pot · 5 radar-util · 6 radar-teammate)
-edge_idx · node_valid · curr_idx · curr_nbr · action_mask · prev_action[8] · <span style="color:#3fb950">agent_scalars[2] = (∆M-gate, staleness)</span> · <span style="color:#3fb950">value_field[8] = V_k per direzione</span> · critic_global[7]</div>
+    <div class="io">node_feat[7] (0 x_rel · 1 y_rel · 2 utility · 3 age · 4 teammate_pot ← belief · 5 radar-util · 6 radar-teammate ← belief)
+edge_idx[8] · edge_valid · node_valid · curr_idx · curr_nbr · action_mask · prev_action[8] · <span style="color:#3fb950">agent_scalars[2] = (gate ∆M, staleness)</span> · <span style="color:#3fb950">value_field[8] = V_k per direzione</span> · critic_global[7] <i>(solo critic)</i></div>
   </div>
 
   <div class="down">↓</div>
 
   <!-- ENCODER -->
   <div class="lane">
-    <div class="laneTitle">② Rete — encoder condiviso</div>
+    <div class="laneTitle">② Rete — encoder condiviso (un solo forward per actor e critic)</div>
     <div class="row">
-      <div class="box net"><b>GATEncoder</b><span class="io">in: node_feat,edge_idx,edge_valid,node_valid
-MaskedGAT × n_layers · self-loop
-A1 temperatura per-testa · A2 bias-feature per-testa
-gruppi: H0[2,5] explore · H1[4,6] rendezvous
-        H2[3] recency · H3[5,6] far-field
-out: curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
+      <div class="box net" style="max-width:520px"><b>GATEncoder — 6 layer, d=128, 4 teste</b><span class="io">in: node_feat[7], edge_idx, edge_valid, node_valid
+MaskedGAT × 6 · self-loop · residual + LayerNorm + GELU
+A1: temperatura τ learnable per-testa (clamp [0.1,10])
+A2: bias strutturale per-testa dalle feature RAW del vicino
+    H0 [2,5] EXPLORE · H1 [4,6] RENDEZVOUS · H2 [3] AGE · H3 [5,6] FAR-FIELD
+out: h [B, 225, 128] → curr_emb [B,128] · nbr_embs [B,8,128]</span></div>
     </div>
   </div>
 
-  <div class="down">↓ &nbsp; curr_emb &amp; nbr_embs (un solo forward, condiviso)</div>
+  <div class="down">↓ &nbsp; curr_emb &amp; nbr_embs</div>
 
   <!-- ACTOR / CRITIC SPLIT -->
   <div class="split">
     <div class="col actor">
       <h3>③a ACTOR — decentralizzato (vede solo il proprio grafo)</h3>
       <div class="stack">
-        <div class="pill">actor_pre (Linear)<div class="t">in: curr_emb ‖ prev_action[8] ‖ agent_scalars[2] ‖ value_field[8] → d</div></div>
+        <div class="pill">actor_pre (Linear)<div class="t">in: curr_emb[128] ‖ prev_action[8] ‖ agent_scalars[2] ‖ value_field[8] → 128</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill"><b>GRUCell (actor)</b><div class="t">memoria per-agente · stato [N,M,d] · <b>OFF di default</b> (feed-forward); abilita con <code>--gru</code></div></div>
+        <div class="pill off"><b>GRUCell (actor)</b> <span class="tag off">OFF</span><div class="t">bypassata: h_act = actor_in. I pesi esistono (compatibilità state_dict) ma non vengono mai chiamati. Si riabilita con <code>--gru</code>.</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">PointerHead<div class="t">logit_k = (q·k_k)/√d · τ + <b>w_vf·V_k</b> · keys=nbr_embs[8] · mask=action_mask → logits[8]<br>w_vf learnable (init 1): il campo guida da subito, la rete può amplificarlo o ignorarlo</div></div>
+        <div class="pill">PointerHead<div class="t">logit_k = (q·k_k)/√d · τ + <b>w_vf·V_k</b> · keys = nbr_embs[8] · mask = action_mask → logits[8]<br>τ e w_vf learnable (init 1): il value-field guida da subito, la rete può amplificarlo o disimpararlo</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill"><b>Categorical → action [N,M]</b><div class="t">1 di 8 vicini · maschera finita + guardia NaN</div></div>
+        <div class="pill"><b>Categorical → action [N,M]</b><div class="t">1 di 8 vicini · maschera finita (−1e4, fp16-safe) + guardia NaN</div></div>
       </div>
-      <div class="note">Output: action, logp, entropy, hidden_actor. Il rendezvous entra qui via agent_scalars (urgenza) + feat[4]/[6] nei nbr_embs (direzione).<br>
-      Flag ablation: <code>--no-teammate-obs</code> (azzera agent_scalars/feat[4]/feat[6]) · <code>--no-gat-actor</code> (actor VF-only, GAT solo al critic) · <code>--no-gat</code> (encoder mai eseguito; critic = mean⊕max node_feat grezze → 4.5× sps, 2.1 vs 8.3 GB).</div>
+      <div class="note">Output: action, logp, entropy, hidden_actor. Il rendezvous entra qui via agent_scalars (urgenza) + feat[4]/feat[6] nei nbr_embs (direzione), entrambi ora derivati dal belief pathfront.</div>
     </div>
 
     <div class="col critic">
       <h3>③b CRITIC — CTDE (vede tutti gli agenti, solo in training)</h3>
       <div class="stack">
-        <div class="pill">pooling mean⊕max su M<div class="t">2·d · count-invariant (stessi pesi per qualsiasi M)</div></div>
+        <div class="pill">pooling mean ⊕ max su M<div class="t">2·d = 256 · permutation- e count-invariant (stessi pesi per qualunque M)</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">critic_pre (Linear+GELU)<div class="t">in: pool(2·d) ‖ critic_global[7] → d</div></div>
+        <div class="pill">critic_pre (Linear + GELU)<div class="t">in: pool(256) ‖ critic_global[7] → 128</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill"><b>GRUCell (critic)</b><div class="t">memoria valore congiunto · stato [N,d]</div></div>
+        <div class="pill off"><b>GRUCell (critic)</b> <span class="tag off">OFF</span><div class="t">bypassata come quella dell'actor</div></div>
         <div class="down" style="margin:0">↓</div>
-        <div class="pill">critic_head (MLP)<div class="t">→ V(s) [N] scalare condiviso</div></div>
+        <div class="pill">critic_head (MLP 128→64→1)<div class="t">→ V(s) [N] scalare condiviso dal team</div></div>
       </div>
-      <div class="note">critic_global[7] = [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance]. Buttato al deploy → nessun leak. redundancy spiega i cali del novel_scan → varianza vantaggio più bassa.</div>
+      <div class="note">critic_global[7] = [explored_frac, t/T, geo_pair, coverage_rate, redundancy, <b>sync_surplus, sync_staleness</b>]. Le ultime due hanno sostituito IN PLACE idle_frac/imbalance in v11 (dim invariata → i vecchi ckpt caricano ancora): servono a V(s) per prezzare un rendezvous, cosa che geo_pair da solo non può. Buttato al deploy → nessun leak.</div>
     </div>
   </div>
 
@@ -169,46 +234,150 @@ out: curr_emb [B,d] · nbr_embs [B,8,d]</span></div>
   <div class="lane">
     <div class="laneTitle">④ Training — MAPPO</div>
     <div class="row">
-      <div class="box train"><b>Rollout buffer</b><span class="io">store T step [T,N,M,…]
-+ h_actor/critic_init</span></div>
+      <div class="box train"><b>Rollout buffer</b><span class="io">T=256 step [T,N,M,…]
++ h_actor/critic_init per chunk</span></div>
       <span class="arrow">→</span>
-      <div class="box train"><b>compute_gae</b><span class="io">adv per-agente [T,N,M]
+      <div class="box train"><b>compute_gae</b><span class="io">γ=0.99 · λ=0.95
+adv per-agente [T,N,M]
 ret_team [T,N] (V condiviso)</span></div>
       <span class="arrow">→</span>
       <div class="box train"><b>ValueNormalizer</b><span class="io">Welford mean/var
-spazio normalizzato</span></div>
+loss di valore nello spazio normalizzato</span></div>
       <span class="arrow">→</span>
-      <div class="box train"><b>ppo_update</b><span class="io">encode_chunk (encoder 1×/chunk)
-evaluate_step_from_enc (TBPTT)
-clip + Huber V + entropy · bf16 AMP</span></div>
+      <div class="box train"><b>ppo_update</b><span class="io">encode_chunk (encoder 1× per chunk TBPTT=8)
+evaluate_step_from_enc (replay ricorrente)
+clip 0.15 · value loss Huber(δ=10) V_old-clipped
+4 epoch × 1 minibatch · bf16 AMP</span></div>
     </div>
-    <div class="note" style="text-align:center">∇ → aggiorna pesi del modello (loop: collect_rollout → ppo_update × n_iters)</div>
+    <div class="note" style="text-align:center">∇ → aggiorna i pesi (loop: collect_rollout → ppo_update, ripetuto fino a total_steps)</div>
   </div>
 
   <!-- REWARD -->
   <div class="lane">
-    <div class="laneTitle">Reward (per-agente, in env.step · unità map-independent, scan_norm≈1 disco sensore)</div>
+    <div class="laneTitle">⑤ Reward (per-agente, in env.step · unità map-independent, scan_norm_nodes = 50 ≈ 1 disco sensore)</div>
     <div class="row">
-      <div class="box env"><b>Esplorazione</b><span class="io">+ α·novel_scan (privilegiato: solo celle
-  nuove all'UNIONE del team → separarsi paga)
-− γ·revisit · − δ·stall
-+ completion (≥99%) · − step_penalty</span></div>
-      <span class="arrow">+</span>
-      <div class="box env"><b>Rendezvous denso <span class="tag new">RDV</span></b><span class="io">+ w·g·(φ_prev − φ_now)
-avvicinamento geodesico al compagno owed
-gate g = crescita RELATIVA della mia mappa
-  dall'ultimo sync (∆M / mappa-a-quel-sync)
-stesso g → agent_scalars (la policy decide)</span></div>
+      <div class="box env"><b>+ novel_scan</b><span class="io">α = 1.0
+SOLO celle nuove all'UNIONE del team
+(privilegiato, CTDE) → seguire la scia
+del compagno paga 0 → separarsi paga</span></div>
+      <span class="arrow">−</span>
+      <div class="box env"><b>revisit</b><span class="io">γ = 0.05 · W = 16 step
+graduato per recency
+streak β 0.5, decay 0.5, <b>NON cappato</b></span></div>
+      <span class="arrow">−</span>
+      <div class="box env"><b>stall</b><span class="io">δ = 0.10 (nessuno spostamento netto)
+streak β 0.5, cap ×4</span></div>
+      <span class="arrow">−</span>
+      <div class="box env"><b>step_penalty</b><span class="io">0.015 · (edge_len / nr)
+assiale 0.015, diagonale ×√2
+un pick invalido costa 0</span></div>
     </div>
-    <div class="note" style="text-align:center">Nessuna penalità di separazione/prossimità: il novel_scan privilegiato disperde già gli agenti (design constraint: mai "paura dell'unico corridoio").</div>
+    <div class="down">+</div>
+    <div class="row">
+      <div class="box env"><b>completion</b><span class="io">+10.0 allo step terminale
+se explored ≥ 99% — con done_mode=own
+significa: OGNI agente al 99% della SUA mappa</span></div>
+      <span class="arrow">+</span>
+      <div class="box env"><b>Rendezvous denso <span class="tag new">RDV</span></b><span class="io">w = <b>0.10</b> (non il default CLI 1.0)
++ w·g·(φ_prev − φ_now): avvicinamento
+geodesico al compagno a cui devo mappa
+g = gate content-driven: frazione richiesta
+frac(b) = 0.10 + 0.50·exp(−b/0.15)
++ nudge di staleness (max 0.25, T=200)
+lo STESSO g va in agent_scalars</span></div>
+      <span class="arrow">+</span>
+      <div class="box env off"><b>sync-event</b> <span class="tag off">OFF</span><span class="io">ζ_g = 0 (<code>--sync-weight 0</code>)
+v11 ha dimostrato che il bonus
+sull'EVENTO di sync è controproducente.
+sync_surplus/staleness restano però
+in critic_global.</span></div>
+    </div>
+    <div class="note" style="text-align:center">Nessuna penalità di separazione/prossimità: il novel_scan privilegiato disperde già gli agenti (design constraint: mai "paura dell'unico corridoio"). Termini rimossi e non più presenti: progress_reward (guidepost analitico), scan_self (resta solo come diagnostica), termine cooperativo di team.</div>
+  </div>
+
+  <!-- PIPELINE + EVAL -->
+  <div class="lane">
+    <div class="laneTitle">⑥ Pipeline di run &amp; valutazione</div>
+    <div class="row">
+      <div class="box train"><b>FASE 1 — easy</b><span class="io">train/easy · 2M step · da zero
+cap 1024 step, budget travel 0.06
+eval suite: test/hybrid</span></div>
+      <span class="arrow">→ <code>final.pt</code></span>
+      <div class="box train"><b>FASE 2 — difficult</b><span class="io">train/difficult · 4M step
+warm-start via --init-ckpt
+cap 2048 step, stesso budget travel
+eval suite: test/complex</span></div>
+      <span class="arrow">→</span>
+      <div class="box train"><b>Metriche</b><span class="io">runs/&lt;run&gt;/metrics.jsonl (una riga/iter)
+scripts/analyze_run.py --compare
+status.json → inspector web
+ckpt: 20/40/60/80/100% + ckpt_best</span></div>
+    </div>
+    <div class="note" style="text-align:center">
+      <code>eval/score</code> = coverage_auc − 0.5·contrib_imbalance<sub>norm</sub> − 0.25·sensing_overlap − 0.25·idle_rate_max &nbsp;(media su tutte le suite; seleziona <code>ckpt_best.pt</code>).<br>
+      Diagnostiche affiancate, NON nello score: <code>eval/score_own</code>, <code>own_coverage_auc</code>, <code>own_cov_gap</code> (il numero che v14 esiste per ridurre), <code>success_rate</code>, <code>score_std</code>.
+    </div>
+  </div>
+
+  <!-- TOOLING -->
+  <div class="lane">
+    <div class="laneTitle">⑦ Tooling in uso</div>
+    <div class="row">
+      <div class="box net"><b>eval/ckpt_loader.py</b><span class="io">auto-detect n_layers/n_hops dal ckpt.
+OBBLIGATORIO in ogni nuovo script che
+carica checkpoint (bug 2026-07-03: ckpt
+a 6 layer valutati come 2 → 1-4% invece di 56%)</span></div>
+      <div class="box net"><b>viz/web_server.py</b><span class="io">inspector: step-through su mappe REALI,
+campo <code>bel</code> (overlay frontier/in-comm/wrong),
+attenzione GAT per layer, componenti reward</span></div>
+      <div class="box net"><b>scripts/trace_belief_web.py</b><span class="io">genera le tracce per l'inspector
+(verifica del belief su mappe reali)</span></div>
+      <div class="box net"><b>scripts/pf_scenarios.py</b><span class="io">bench del belief a 8 casi scriptati,
+UNICO URL riscritto in place:
+runs/pf_scenarios/index.html</span></div>
+      <div class="box net"><b>scripts/pf_obs_diag.py</b><span class="io">diagnosi a policy FISSA: nodi frontiera,
+liveness del belief, copertura feat[4],
+massa sulle aperture reali</span></div>
+      <div class="box net"><b>scripts/analyze_run.py</b><span class="io">legge metrics.jsonl: --compare,
+--reward-budget, --own-coverage
+(sostituisce W&amp;B)</span></div>
+    </div>
+  </div>
+
+  <!-- SPENTO -->
+  <div class="lane">
+    <div class="laneTitle">⑧ Nel codice ma NON in uso in questa configurazione</div>
+    <div class="tblwrap">
+      <table>
+        <tr><th>Componente</th><th>Stato</th><th>Perché</th></tr>
+        <tr><td class="k">GRUCell actor + critic</td><td class="v">OFF</td><td>Default feed-forward; i moduli esistono solo per compatibilità di state_dict. Riattivabile con <code>--gru</code>.</td></tr>
+        <tr><td class="k">sync-event reward (ζ_g, ρ, sync_min_gap)</td><td class="v">ζ_g = 0</td><td>v11 ha dimostrato che il bonus sull'evento di sync ritorce. ρ=0.5 e gap=32 sono quindi inerti.</td></tr>
+        <tr><td class="k">--curriculum / --curriculum-gated / --stage</td><td class="v">non usati</td><td>Le due fasi sono lanciate a mano come processi separati con <code>--init-ckpt</code> (evita lo swap in-process + la ri-cattura del CUDA graph).</td></tr>
+        <tr><td class="k">Weights &amp; Biases</td><td class="v">OFF</td><td>Sostituito da <code>metrics.jsonl</code> + <code>analyze_run.py</code>. La dir <code>wandb/</code> è storia.</td></tr>
+        <tr><td class="k">--no-gat / --no-gat-actor (actor VF-only)</td><td class="v">ablation</td><td>Percorsi di ablation completi (actor_head + w_vf_direct, critic_feat_proj) costruiti sempre, mai attivi qui.</td></tr>
+        <tr><td class="k">--no-teammate-obs</td><td class="v">ablation</td><td>Azzererebbe agent_scalars, feat[4] e feat[6].</td></tr>
+        <tr><td class="k">--force-full-comm / -pos-sharing / -occupancy-sharing</td><td class="v">debug</td><td>Bypass della fisica del comm, solo per isolare bug.</td></tr>
+        <tr><td class="k">comm_range_px = 120</td><td class="v">inerte</td><td>Letto solo da <code>comm_model="los"</code>; con signal_strength il raggio emerge da ss_thresh + attenuazione + rumore per-episodio.</td></tr>
+        <tr><td class="k">max_travel_px</td><td class="v">0.0</td><td>Superato da <code>max_travel_frac</code>, che scala col numero di px liberi della mappa (train/difficult spazia 3.9× tra p50 e p90).</td></tr>
+        <tr><td class="k">belief_mode = "uniform" (palla geodesica)</td><td class="v">sostituito</td><td>Rimane <code>env/teammate_belief.py</code>; in uso è <code>teammate_belief_pathfront.py</code>.</td></tr>
+        <tr><td class="k">radar_team_source = "lkp"</td><td class="v">sostituito</td><td>Ora <code>belief</code>: il lkp da solo è cieco a dove il filtro pensa davvero che sia il compagno.</td></tr>
+        <tr><td class="k">belief_prune_util / belief_prune_min_cluster</td><td class="v">0 / 0 → OFF</td><td>Il pruning di plausibilità al freeze non è attivo; i 3 tentativi di gate di credibilità sono stati regressioni ed è stato fatto revert.</td></tr>
+        <tr><td class="k">rdv_offer_frac = 0.15</td><td class="v">degradato</td><td>Superato da rdv_frac_max/min/b0 per il gate; sopravvive solo come normalizzazione dell'obs ∆M.</td></tr>
+        <tr><td class="k">revisit_streak_cap</td><td class="v">inf</td><td>Deliberatamente NON cappato in v13/v14 (una modifica per esperimento).</td></tr>
+        <tr><td class="k">guidepost analitico / progress_reward / scan_self</td><td class="v">rimossi</td><td>Il guidepost è stato sostituito da radar + value-field; scan_self resta solo come telemetria.</td></tr>
+        <tr><td class="k">--compile (torch.compile encoder)</td><td class="v">OFF</td><td>Non passato nella pipeline.</td></tr>
+      </table>
+    </div>
   </div>
 
 </div>
 
 <footer>
-  Principi: (1) <b>policy appresa, non pianificata</b> — nessun target analitico né guidepost; la rete guida dalle feature del grafo (utility locale feat[2] + radar oltre-finestra feat[5]/[6]), da 2 scalari di rendezvous e dal value-field analitico V_k (input/bias confrontabile per direzione, MAI un target imposto);
+  Principi: (1) <b>policy appresa, non pianificata</b> — nessun target analitico né guidepost; la rete guida dalle feature del grafo (utility locale feat[2] + radar oltre-finestra feat[5]/[6]), da 2 scalari di rendezvous e dal value-field V_k (input + bias sui logit, MAI un target imposto);
   (2) encoder condiviso, due teste (actor decentralizzato / critic centralizzato CTDE count-invariant);
-  (3) <code>act()</code> (rollout, sampling) ≟ <code>evaluate_step_from_enc()</code> (update, replay) — stesso calcolo, due regimi.
+  (3) <code>act()</code> (rollout, sampling) ≟ <code>evaluate_step_from_enc()</code> (update, replay) — stesso calcolo, due regimi;
+  (4) <b>una modifica per esperimento</b>, e ogni flag che cambia semantica va passato esplicitamente così <code>params.json</code> lo registra (due run con semantiche di frontiera diverse erano indistinguibili a posteriori: è costato un run).
+  <br>Aggiornata il 2026-07-31 contro <code>runs/v14_frontier_easy_20260731_004306/params.json</code>.
 </footer>
 </body>
 </html>

@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 _REPO    = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))   # so `import scripts.train_args` resolves (torch-free)
+from jsonio import jsonable          # noqa: E402 — needs the sys.path line above; torch-free
 RUNS_DIR = _REPO / "runs"
 VIZ_DIR  = _REPO / "viz"
 DATA_DIR = _REPO / "data"
@@ -314,6 +315,33 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _pid_is_run(pid: int, run_name: str) -> bool:
+    """True if `pid` is STILL THE TRAINING PROCESS OF THIS RUN — not merely a live PID.
+
+    PID REUSE, and it is not a corner case here. The dashboard used to accept `_pid_alive`
+    alone, which only answers "is some process holding that number". This container is
+    long-lived and every `docker exec` burns PIDs, so the numbers recorded by killed runs get
+    handed out again — observed directly: two runs killed hours apart (pids 6044 and 93237)
+    both probed "alive", and the dashboard showed THREE trainings in progress when exactly one
+    was real. There is no timer that fixes this; the identity of the process has to be checked.
+
+    /proc/<pid>/cmdline carries `--out runs/<run_name>`, which is unique per run, so it
+    identifies the process rather than the slot. When /proc is unreadable (non-Linux, or a
+    process owned by another user) fall back to the bare liveness probe — being occasionally
+    optimistic on an exotic host is better than reporting a live run as stopped.
+    """
+    if not _pid_alive(pid):
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", "replace")
+    except Exception:
+        return True                                   # cannot verify → trust the liveness probe
+    if "run_train.py" not in cmdline and "driver" not in cmdline:
+        return False                                  # PID recycled into something unrelated
+    return run_name in cmdline
+
+
 def _scan_runs() -> list[dict]:
     runs: list[dict] = []
     if not RUNS_DIR.exists():
@@ -356,7 +384,7 @@ def _scan_runs() -> list[dict]:
         elif status and status.get("state") == "training":
             # Trust the PID only when the run is on THIS host (same container/namespace).
             same_host = status.get("host") == _HOST
-            if same_host and not _pid_alive(int(status.get("pid", 0))):
+            if same_host and not _pid_is_run(int(status.get("pid", 0)), d.name):
                 state = "stopped"  # process vanished without an exit event (hard kill)
             else:
                 state = "training"
@@ -536,7 +564,11 @@ class Handler(SimpleHTTPRequestHandler):
         self._send_json(_scan_runs())
 
     def _send_json(self, obj):
-        body = json.dumps(obj).encode()
+        # jsonable(): /api/argschema echoes argparse defaults, and --revisit-streak-cap defaults to
+        # +inf → json.dumps emits a bare `Infinity`, which JSON.parse rejects. The launch form was
+        # therefore failing to parse its own schema. Applied to every response, not just that one,
+        # since any NaN metric would break a client the same way.
+        body = json.dumps(jsonable(obj)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
