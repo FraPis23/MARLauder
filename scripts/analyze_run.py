@@ -25,7 +25,7 @@ from pathlib import Path
 # Reward-term taxonomy. `reward_terms` in env/explorer.py mixes actual summands of the reward with
 # pure diagnostics; averaging them together (or summing them) would be meaningless, so the split
 # is explicit here and drives --reward-budget.
-SUMMANDS = ["novel", "revisit", "stall", "step", "sync", "rdv", "completion", "own_cov"]
+SUMMANDS = ["novel", "revisit", "stall", "step", "sync", "comm_idle", "rdv", "completion", "own_cov"]
 DIAGNOSTICS = ["scan_self_diag", "sync_give_diag", "sync_recv_diag", "sync_events",
                "stall_streak", "revisit_streak"]
 
@@ -33,6 +33,16 @@ SUMMARY_KEYS = [
     "explore/ep_end", "explore/efficiency", "train/kl", "train/entropy", "train/clipfrac",
     "metric/own_cov_mean", "metric/own_cov_min", "metric/own_cov_gap",
     "metric/redundancy", "metric/sensing_overlap", "metric/comm_duty_cycle",
+    # idle_frac split into its two disjoint regimes. transit = walking through space the agent
+    # already mapped itself (an assignment problem); redundant = scanning ground a teammate
+    # already held (an information problem). They sum to idle_frac. idle_redundant_nocomm is the
+    # part the agent could not have avoided — no link, no way to know — and is what the multi-hop
+    # relay is expected to move.
+    "metric/idle_frac", "metric/idle_transit", "metric/idle_redundant",
+    "metric/idle_redundant_nocomm", "metric/stall_rate",
+    # comm_duty_cycle is the DIRECT radio duty; comm_connected is IR2's connectivity_rate (the
+    # whole team in one flock).
+    "metric/comm_group_duty", "metric/comm_connected",
     "eval/score", "eval/coverage_auc", "eval/own_coverage_auc", "eval/own_coverage_final",
     "eval/success_rate", "eval/steps_to_90", "eval/n_syncs", "eval/sync_gap",
 ]

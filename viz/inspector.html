@@ -92,7 +92,7 @@
       <option value="uv">util · detectable vol</option>
       <option value="age">age</option>
       <option value="team">teammate_pot</option>
-      <option value="bel">belief p (fixed 0→0.03 black→yellow→red · cyan○ transit dot · yellow○ frontier · blue○ in comm range · MAGENTA○ = belief inside comm on a non-frontier = wrong)</option>
+      <option value="bel">belief p (fixed 0→0.03, HUE = the teammate that owns the mass (same palette as the agent dots) · cyan○ transit dot · yellow○ frontier · blue○ in comm range · MAGENTA○ = belief inside comm on a non-frontier = wrong)</option>
       <option value="bu">radar · utility (out-of-window)</option>
       <option value="bt">radar · teammate (out-of-window)</option>
     </select></label>
@@ -246,6 +246,19 @@ function ramp(t){ // 0..1 -> dim blue -> amber
 // (bu/bt) share their base field's hue so "radar utility" looks like utility and "radar teammate"
 // like teammate — you can tell what you're looking at from the color alone.
 const BEL_VMAX = 0.03;   // FIXED probability scale for the pathfront belief field (match the gif)
+// Belief heat, HUE-LOCKED to the teammate that owns the mass (node.belw → acol). With M=2 there is
+// one teammate and this is just a recolour; with M>2 the merged field is unreadable without it.
+// Ramp: near-black → that agent's colour → pushed toward white at the top, so the peak still reads
+// as a peak within the agent's own hue instead of every agent sharing one black→yellow→red scale.
+function belColor(t, who){
+  t=Math.max(0,Math.min(1,t));
+  if(t<=0) return "rgb(18,18,26)";
+  const c=acol(who|0), r=parseInt(c.slice(1,3),16), g=parseInt(c.slice(3,5),16), b=parseInt(c.slice(5,7),16);
+  if(t<0.7){ const u=t/0.7;
+    return `rgb(${Math.round(18+(r-18)*u)},${Math.round(18+(g-18)*u)},${Math.round(26+(b-26)*u)})`; }
+  const u=(t-0.7)/0.3;
+  return `rgb(${Math.round(r+(255-r)*u)},${Math.round(g+(255-g)*u)},${Math.round(b+(255-b)*u)})`;
+}
 function rampField(f,t){
   t=Math.max(0,Math.min(1,t));
   const mix=(lo,hi)=>`rgb(${lo.map((c,i)=>Math.round(c+(hi[i]-c)*t)).join(",")})`;
@@ -384,7 +397,8 @@ function drawNodes(){
       // belief uses a FIXED absolute scale (0→BEL_VMAX) so the accumulation on frontiers is comparable
       // across frames (not per-frame min/max like the other fields).
       const tt = A.field==="bel" ? v/BEL_VMAX : (v-lo)/(hi-lo);
-      col = v===null? "#33405a" : rampField(A.field, tt);
+      col = v===null ? "#33405a"
+          : (A.field==="bel" ? belColor(tt, n.belw) : rampField(A.field, tt));
       rad = A.sel&&A.sel===n.i?5:3;
     }
     ctx.fillStyle=col;

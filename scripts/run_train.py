@@ -148,6 +148,7 @@ def main() -> None:
             args.eval_split if args.eval_split is not None
             else ("test/complex" if args.curriculum else args.split)
         ),
+        eval_every=args.eval_every,
         eval_steps=(args.max_episode_steps if args.eval_steps < 0 else args.eval_steps),
         trace_steps=args.trace_steps,
         curriculum=args.curriculum,
@@ -184,6 +185,7 @@ def main() -> None:
             sensor_range_px=args.sensor_range,
             comm_range_px=args.comm_range,
             comm_model=args.comm_model,
+            comm_relay=args.comm_relay,
             ss_thresh=args.ss_thresh,
             n_hops=args.n_hops,
             force_full_comm=args.force_full_comm,
@@ -194,11 +196,13 @@ def main() -> None:
             rdv_offer_frac=args.rdv_offer_frac,
             rdv_clamp_pos=args.rdv_clamp_pos,
             rdv_urgency_T=args.rdv_urgency_T,
+            comm_idle_pen=args.comm_idle_pen,
             rdv_urgency_mode=args.rdv_urgency_mode,
             rdv_urgency_start=args.rdv_urgency_start,
             completion_bonus=args.completion_bonus,
             step_penalty_coef=args.step_penalty,
             sync_give_weight=args.sync_weight,
+            sync_weight_m_scale=args.sync_weight_m_scale,
             sync_recv_ratio=args.sync_recv_ratio,
             sync_min_gap=args.sync_min_gap,
             teammate_obs=not args.no_teammate_obs,
@@ -229,6 +233,7 @@ def main() -> None:
             gamma=args.gamma,
             vf_coef=args.vf_coef,
             tbptt_steps=args.tbptt_steps,
+            diag_grad=args.diag_grad,
         ),
     )
     train(cfg, log_every=1,

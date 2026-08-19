@@ -39,6 +39,11 @@ class MAPPOCfg:
     # policy drift per update is safer). k_epochs stays low (4) for the same reason.
     clip_eps: float = 0.15
     ent_coef: float = 0.01
+    # Once per iteration, backprop the policy-gradient term and the entropy bonus SEPARATELY and
+    # log ||grad|| of each. Comparing the two loss VALUES is not enough to claim one dominates:
+    # pg is a clipped surrogate whose value can be near zero while its gradient is not. Costs two
+    # extra backward passes on one chunk per iteration; off by default.
+    diag_grad: bool = False
     vf_coef: float = 0.5
     k_epochs: int = 4
     tbptt_steps: int = 16
@@ -100,6 +105,19 @@ def ppo_update(
     advantages, returns = rollout.compute_gae(gamma=cfg.gamma, lam=cfg.lam)
     # advantages [T, N, M], returns [T, N] (team-mean target for shared V).
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # EXPLAINED VARIANCE of the value function, on the data the critic has NOT yet been updated on
+    # — so it measures prediction, not fit. ev = 1 - Var(returns - V)/Var(returns):
+    #   ~1.0  the critic explains the returns; advantages are informative
+    #   ~0.0  no better than predicting the mean return
+    #   <0    worse than the mean, i.e. the advantages fed to the policy gradient are mostly noise
+    # v_loss alone cannot say this: it is an absolute error whose scale depends on the return
+    # scale, so it is not comparable between M=2 and M=4 runs, and a "flat low" v_loss is equally
+    # consistent with a good critic and with a critic that has given up and predicts the mean.
+    with torch.no_grad():
+        _r = returns.flatten()
+        _v = rollout.values[:T].flatten()
+        _vr = _r.var()
+        explained_var = float(1.0 - (_r - _v).var() / _vr.clamp(min=1e-8)) if _vr > 1e-8 else 0.0
     vnorm.update(returns)
     returns_norm = vnorm.normalize(returns)
     use_amp = cfg.use_amp and device.startswith("cuda")
@@ -113,6 +131,7 @@ def ppo_update(
 
     stats = {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clipfrac": 0.0,
              "updates": 0, "nan_skips": 0}
+    diag_done = False        # cfg.diag_grad: measure the two gradient norms once per iteration
 
     for epoch in range(cfg.k_epochs):
         # Shuffle env indices each epoch for minibatching.
@@ -208,6 +227,28 @@ def ppo_update(
                     chunk_kl /= chunk_len
 
                     actor_loss = chunk_pg - cfg.ent_coef * chunk_ent
+                    if cfg.diag_grad and not diag_done:
+                        # Separate backward for each actor-loss term. retain_graph keeps the graph
+                        # alive for the real optimizer step below, so this only costs compute.
+                        params = [p for p in model.parameters() if p.requires_grad]
+
+                        def _gnorm(term: torch.Tensor) -> float:
+                            gs = torch.autograd.grad(term, params, retain_graph=True,
+                                                     allow_unused=True)
+                            sq = sum(float((g.detach().float() ** 2).sum().item())
+                                     for g in gs if g is not None)
+                            return sq ** 0.5
+
+                        try:
+                            g_pg = _gnorm(chunk_pg)
+                            g_ent = _gnorm(cfg.ent_coef * chunk_ent)
+                            stats["g_pg"] = g_pg
+                            stats["g_ent"] = g_ent
+                            stats["g_ent_over_pg"] = g_ent / max(g_pg, 1e-12)
+                        except RuntimeError as exc:
+                            stats["g_pg"] = stats["g_ent"] = stats["g_ent_over_pg"] = float("nan")
+                            print(f"[diag_grad] skipped ({exc})")
+                        diag_done = True
                     critic_loss = cfg.vf_coef * chunk_vl
                     # Scale loss by chunk_len/T for unbiased multi-chunk gradients,
                     # and divide by n_mb*k_epochs so total magnitude is invariant
@@ -244,4 +285,6 @@ def ppo_update(
     n = max(1, stats["updates"])
     for k in ("pg_loss", "v_loss", "entropy", "kl", "clipfrac"):
         stats[k] /= n
+    # Computed once per rollout, before any gradient step — not an average over minibatches.
+    stats["explained_var"] = explained_var
     return stats

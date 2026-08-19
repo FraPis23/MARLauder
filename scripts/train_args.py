@@ -81,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LiDAR sensor range in pixels (realistic 2D-LiDAR reach)")
     g_sense.add_argument("--ss-thresh", type=float, default=-70.0,
                     help="[comm-model=signal_strength] rx sensitivity (dBm): connect iff received power > this. Lower = longer comm range")
+    g_sense.add_argument("--no-comm-relay", dest="comm_relay", action="store_false",
+                    help="Exchange state only over a DIRECT link. Default is multi-hop relay: with "
+                         "A-B-C, A and C share maps, positions and staleness through B, as IR2 does "
+                         "(connected components of the comm graph). Pre-v20 behaviour, for a control "
+                         "arm. The sync REWARD is on the direct link either way.")
+    g_sense.set_defaults(comm_relay=True)
     g_sense.add_argument("--force-full-comm", action="store_true",
                     help="A2 debug: bypass dist/LOS check; every pair communicates every step")
     g_sense.add_argument("--force-full-pos-sharing", action="store_true",
@@ -106,7 +112,16 @@ def build_parser() -> argparse.ArgumentParser:
     g_curr.add_argument("--eval-split", default=None,
                     help="H.5: eval split for eval-on-ckpt (default = --split or test/complex when curriculum)")
     g_curr.add_argument("--eval-suite-splits", default="",
-                    help="comma-separated extra splits for the multi-split eval suite (e.g. test/corridor,test/complex,test/hybrid). Empty = single suite on the training split")
+                    help="comma-separated splits for the eval suite (e.g. train/difficult,test/complex). "
+                         "NOT 'extra': this REPLACES the default single suite on the training split, so "
+                         "listing only test splits leaves the run with NO deterministic episodic eval on "
+                         "the split it is training on — list the training split explicitly if you want it. "
+                         "v19 passed only test/complex and was therefore blind to a policy that degraded on "
+                         "BOTH splits (ckpt_020: success 0.41 on train/difficult, 0.09 on test/complex) while "
+                         "every per-step training metric stayed flat. Those metrics are rollout MEANS that "
+                         "include early-episode states, so they cannot represent episode outcomes and cannot "
+                         "show this. Each extra split costs a full suite per eval tick — pair with --eval-every. "
+                         "Empty = single suite on the training split")
 
     g_reward = ap.add_argument_group("Reward shaping")
     g_reward.add_argument("--novel-scan-weight", type=float, default=1.0, help="α_novel: privileged team-union novel-scan credit (v2 core reward)")
@@ -114,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     g_reward.add_argument("--rdv-offer-frac",  type=float, default=0.15, help="Rendezvous gate saturates (g→1) when the map gained since last sync reaches this fraction of the OWN map size AT that sync (relative growth, floored by scan_norm_nodes); also normalizes the ∆M actor obs")
     g_reward.add_argument("--rdv-clamp-pos", action="store_true",
                     help="Pay only the APPROACH half of the rdv term: Δφ clamped to ≥0, so moving AWAY from the teammate is never taxed. Measured on v15, reward/rdv was −0.20/episode — a standing tax on exactly the divergence exploration requires. This does break the telescoping property, but that property was already gone: g·(φ_prev−φ_now) with a state-dependent gate and no γ was never potential-based shaping. Safe while --rdv-weight < step_penalty_coef·scan_norm_nodes = 0.75, above which approach→retreat→approach becomes free money")
+    g_reward.add_argument("--comm-idle-pen", type=float, default=0.0,
+                    help="Cost of STAYING in radio contact on a step that delivered no map. Free on the step a sync is actually PAID, and free near the deadline (same budget ramp as --rdv-urgency-mode budget) so the terminal rendezvous is never taxed. Measured on v16: after the first sync the pair closes 472->342 px and sensor overlap goes 0.089->0.247, because contact fuses the maps, identical maps give identical utility fields, and identical fields pick the same frontier — a self-reinforcing loop that nothing priced. 81.8%% of contact steps are sustained rather than paying. Gated on sync_paid and NOT on the g gate: `offer` is computed after fusion resets its baseline, so g is ~0 on every contact step by construction and would punish the legitimate meeting just as hard. Training-time shaping only — the radio physics stays exactly IR2's. 0 disables")
     g_reward.add_argument("--rdv-urgency-mode", choices=["time", "budget"], default="time",
                     help="What makes a rendezvous urgent. 'time' (legacy) ramps on steps-since-last-sync, so the gate opens merely because the two have been apart — pulling them together mid-episode, when they should still be splitting. 'budget' ramps on the fraction of the episode budget spent (the same travel_frac the actor observes), so the pull appears only near the deadline. Under --done-mode own the terminal meeting is what completes both maps, and there is no reason to pay for it early. Changes what `g` means, and `g` is both agent_scalars[0] and the rdv reward gate — switch it only at a phase boundary")
     g_reward.add_argument("--rdv-urgency-start", type=float, default=0.5,
@@ -184,7 +201,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     g_ppo = ap.add_argument_group("PPO / learning")
     g_ppo.add_argument("--lr", type=float, default=3e-4, help="learning rate")
+    g_ppo.add_argument("--sync-weight-m-scale", type=float, default=0.0,
+                    help="Scale the sync bonus by (2/M)^THIS. 0 = off (exact no-op at every M). "
+                         "Identically 1 at M=2 for any exponent, so M=2 history cannot move. "
+                         "MEASURED motivation: v16 M=2 vs v19 M=4 realized reward shares put sync at "
+                         "5.5%% vs 9.8%% (x1.78) and sync_rate at 0.0068 vs 0.0206 (x3.03) — meetings "
+                         "are ~3x more frequent with 4 robots, so the same per-event bonus buys a "
+                         "much bigger slice of the budget. novel needs NO such scaling (already at "
+                         "parity, 27.2%% vs 27.3%%, via --novel-scan-weight) and rdv is 0.6-0.7%% at "
+                         "both M, i.e. nothing to scale. 1.0 gives 0.5 at M=4 (share-match target "
+                         "0.56). WATCH eval/own_coverage_final and eval/sync_gap: under done_mode=own "
+                         "every robot needs the others' maps, so under-paying sync breaks completion "
+                         "before it shows up in eval/score.")
     g_ppo.add_argument("--ent-coef", type=float, default=0.01, help="entropy bonus coefficient")
+    g_ppo.add_argument("--diag-grad", action="store_true",
+                    help="Log train/g_pg, train/g_ent and their ratio: ||grad|| of the "
+                         "policy-gradient term vs of the entropy bonus, measured with two extra "
+                         "backward passes on one chunk per iteration. Comparing the two LOSS "
+                         "values cannot settle which one drives the actor (pg is a clipped "
+                         "surrogate whose value can be near zero while its gradient is not); on "
+                         "v19 the entropy bonus exceeded |pg_loss| in 94%% of iterations, which is "
+                         "suggestive but not conclusive without this.")
     g_ppo.add_argument("--clip-eps", type=float, default=0.15, help="PPO clip ε (≤0.2; 0.15 default — this task is more non-stationary than the paper's benchmarks)")
     g_ppo.add_argument("--k-epochs", type=int, default=4, help="PPO epochs per rollout (keep low: intra-episode obs shift + dense shaping = high non-stationarity)")
     g_ppo.add_argument("--max-grad-norm", type=float, default=2.0, help="gradient clip norm (paper 10.0; 2.0 here — dense shaping spikes gradients)")
@@ -200,6 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "dashboard's on-demand 'checkpoint + eval' button to avoid useless ckpts.")
     g_flags.add_argument("--eval-on-ckpt", action="store_true",
                     help="Emit 2 eval GIFs at each milestone (25/50/75/100%%)")
+    g_flags.add_argument("--eval-every", type=int, default=10,
+                    help="Iterations between eval-suite ticks. The suite is 32 maps x full episodes "
+                         "on ONE env and renders nothing: measured on v19 (M=4, 768 steps) it costs "
+                         "~19 min, i.e. 27%% of wall time at 10. It is also the only writer of "
+                         "ckpt_best.pt and the only place a gated curriculum can advance, so a "
+                         "larger value coarsens best-checkpoint resolution and lengthens dwell.")
     g_flags.add_argument("--eval-steps", type=int, default=-1,
                     help="G.2: episode length for eval-on-ckpt GIFs/traces. -1 = same as --max-episode-steps")
     g_flags.add_argument("--trace-steps", type=int, default=512,

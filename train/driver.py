@@ -410,8 +410,16 @@ def _eval_map_idxs(eval_env: Explorer, k: int) -> tuple[int, ...]:
 
 @torch.no_grad()
 def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
-                    map_idxs: tuple[int, ...] | None = None) -> dict:
+                    map_idxs: tuple[int, ...] | None = None,
+                    deterministic: bool = True) -> dict:
     """Deterministic episodes on `map_idxs` (default EVAL_MAP_IDX) → eval/* metrics + eval/score.
+
+    `deterministic=False` samples from the policy instead of taking the argmax. Training NEVER
+    passes it (the default keeps every historical eval/score comparable); it exists so an offline
+    harness can ask whether a collapsed eval is the POLICY degrading or only its greedy readout
+    degenerating into a limit cycle — the two look identical here but differ everywhere else, and
+    training rollouts (driver.py:291) sample, so a greedy-only failure is invisible to every
+    train/* metric by construction.
 
     Coverage AUC pads an early (successful) finish with its final explored_rate so finishing
     sooner scores strictly higher. contrib_imbalance = max agent share − 1/M of union-new
@@ -438,6 +446,11 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
     # actions the policy sampled earlier, so eval/comm_duty (the tether detector) drifts ~30%
     # between two evaluations of the SAME checkpoint.
     eval_env.reseed_channel_noise(cfg.seed + 777)
+    # ...and the SPAWN stream, which matters more. Without it the eval env's map RNG keeps
+    # advancing across ticks, so every tick scores the same 32 maps from different start
+    # positions: measured +-9 points of success_rate on identical weights. Since eval/score is the
+    # only writer of ckpt_best, that noise was going straight into checkpoint selection.
+    eval_env.reseed_map_rng(cfg.seed + 4242)
     for midx in eval_map_idx:
         eval_env.reload_map(env_idx=0, map_idx=int(midx))
         h_act, h_crit = model.init_hidden(1, cfg.device)
@@ -455,7 +468,7 @@ def _run_eval_suite(model: MarlActorCritic, eval_env: Explorer, cfg: TrainCfg,
         s90 = float(T)
         for t in range(T):
             with torch.amp.autocast("cuda", dtype=AMP_DTYPE, enabled=cfg.device.startswith("cuda")):
-                out = model.act(obs, h_act, h_crit, deterministic=True)
+                out = model.act(obs, h_act, h_crit, deterministic=deterministic)
             obs, _r, done, info = eval_env.step(out["action"])
             h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
             er = float(info["explored_rate"][0].item())
@@ -887,6 +900,13 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
         stall_rate = agg.get("metric/stall_rate", 0.0)
         efficiency = (ep_for_eff - cfg.eff_w_redundancy * redundancy
                       - cfg.eff_w_stall * stall_rate)
+        # metric/redundancy is (Σ_a own_free − union)/union, which SATURATES AT M−1 when every map
+        # is identical — so its scale depends on the agent count and a raw M=4 number (≈2.3) cannot
+        # be compared against an M=2 one (≈0.85). Divide by M−1 for the console, where the number is
+        # read live and across runs. The logged `metric/redundancy` stays raw so it remains
+        # comparable with every run recorded so far, and `efficiency` keeps its historical
+        # definition; critic_global already carries its own /(M−1) copy.
+        redun_norm = redundancy / max(1, cfg.n_agents - 1)
         if it % log_every == 0:
             # H.1 — ep_end: mean explored_rate at terminal step over episodes that ENDED.
             ep_str = f"ep_end={ep_end_mean*100:5.1f}%(ended={ep_end_n:3d})" if ep_end_n > 0 else "ep_end=   n/a       "
@@ -894,8 +914,10 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"{ep_str}  "
                   f"pg={stats['pg_loss']:+.4f}  v={stats['v_loss']:.4f}  "
                   f"ent={stats['entropy']:.3f}  kl={stats['kl']:+.4f}  "
-                  f"clip={stats['clipfrac']*100:.1f}%  "
-                  f"redun={redundancy:.2f} stall={stall_rate*100:.0f}% "
+                  f"clip={stats['clipfrac']*100:.1f}%  ev={stats.get('explained_var', 0.0):+.2f}  "
+                  + (f"gEnt/gPg={stats['g_ent_over_pg']:.2f}  " if "g_ent_over_pg" in stats else "")
+                  + f""
+                  f"redun={redun_norm:.2f} stall={stall_rate*100:.0f}% "
                   f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
                   # v11 coordination at a glance: reward paid for map exchange, syncs per 1k
                   # agent-steps, and the union-vs-weakest-robot coverage gap this rollout.
@@ -1002,6 +1024,14 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
             "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
             "train/entropy": stats["entropy"], "train/kl": stats["kl"],
             "train/clipfrac": stats["clipfrac"], "train/nan_skips": stats.get("nan_skips", 0),
+            # 1 = the critic explains the returns, 0 = no better than their mean, <0 = worse.
+            # Unlike v_loss this is scale-free, so it IS comparable between M=2 and M=4 runs.
+            "train/explained_var": stats.get("explained_var", 0.0),
+            # --diag-grad only: ||grad|| of the entropy bonus vs of the policy-gradient term.
+            # >1 means the actor is being pushed toward a uniform policy harder than toward
+            # return, which is what a SATURATED objective looks like from the optimizer's side.
+            **({"train/g_pg": stats["g_pg"], "train/g_ent": stats["g_ent"],
+                "train/g_ent_over_pg": stats["g_ent_over_pg"]} if "g_pg" in stats else {}),
             "perf/sps": sps_iter,
             "perf/coll_sps": coll_sps, "perf/upd_sps": upd_sps,
             "explore/ep_end": ep_end_mean, "explore/ep_end_n": ep_end_n,

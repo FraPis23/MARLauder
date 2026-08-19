@@ -213,12 +213,19 @@ def _run_chunk(model, env: Explorer, map_idxs: list[int], cap: int, device: str,
 
 def _run_cell(ckpt: Path, split_name: str, M: int, entries: list[dict], cap: int,
               batch: int, device: str, noise_seed: int, map_seed: int,
-              max_travel_px: float = 0.0) -> list[dict]:
+              max_travel_px: float = 0.0, comm_relay: bool | None = None) -> list[dict]:
     """One (split, M) cell of the comparison grid → 100 episode rows."""
     pack_idxs = [int(e["pack_idx"]) for e in entries]
     split = load_split(f"test/{split_name}", device=device)
     peek = torch.load(ckpt, map_location="cpu", weights_only=False)
-    penv = (peek.get("cfg", {}) or {}).get("env", {}) or {}
+    penv = dict((peek.get("cfg", {}) or {}).get("env", {}) or {})
+    # comm_relay must be PINNED when two checkpoints from different pipelines are compared:
+    # from_ckpt_dict falls back to the dataclass default (False) for a pre-relay ckpt while a
+    # post-relay one restores True, so the two would be scored on DIFFERENT radio physics — and
+    # `connectivity` is a published CSV column, which relay changes directly. None = whatever the
+    # checkpoint says, so every CSV produced before this flag existed still reproduces bit-exact.
+    if comm_relay is not None:
+        penv["comm_relay"] = bool(comm_relay)
 
     rows: list[dict] = []
     for start in range(0, len(pack_idxs), batch):
@@ -273,6 +280,13 @@ def main() -> None:
                     help="override the per-episode STEP cap (0 = IR2 native, or auto when "
                          "--max-travel-px is set). With a travel budget the step cap is only a "
                          "safety net for a stalling policy, which burns no distance.")
+    ap.add_argument("--comm-relay", dest="comm_relay", action="store_true", default=None,
+                    help="PIN multi-hop relay ON for this run instead of taking it from the "
+                         "checkpoint. Required when comparing a pre-relay checkpoint against a "
+                         "post-relay one, or the two meet different radio physics and the "
+                         "`connectivity` column is not comparable. IR2 itself relays (env.py:424), "
+                         "so ON is the faithful setting. Default (unset) = whatever the ckpt says.")
+    ap.add_argument("--no-comm-relay", dest="comm_relay", action="store_false", default=None)
     ap.add_argument("--tag", default="", help="suffix for the output CSVs, e.g. --tag v10")
     ap.add_argument("--out-dir", type=Path, default=_COMPARISON_DIR / "results")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -307,7 +321,8 @@ def main() -> None:
                   f"(step cap {cap} = safety net; IR2 native was {IR2_CAPS[split_name]})", flush=True)
         for M in args.agents:
             rows = _run_cell(args.ckpt, split_name, M, entries, cap, args.batch,
-                             args.device, args.noise_seed, args.map_seed, args.max_travel_px)
+                             args.device, args.noise_seed, args.map_seed, args.max_travel_px,
+                             comm_relay=args.comm_relay)
             out = args.out_dir / f"marlauder_{split_name}_M{M}{suffix}.csv"
             with out.open("w", newline="") as fh:
                 w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)

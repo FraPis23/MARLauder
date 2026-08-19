@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 
+import math
 import os
 import numpy as np
 import torch
@@ -105,6 +106,22 @@ class EnvCfg:
     # back here and their eval still mirrors how they trained. run_train.py's CLI default is
     # "signal_strength", so NEW trainings opt into the realistic model and persist it in the ckpt.
     comm_model: str = "los"
+    # MULTI-HOP RELAY. The comm check is pairwise: with A—B—C (B in range of both, A and C out of
+    # range of each other) A and C exchanged nothing, because no consumer of comm_mask ever closed
+    # it transitively. IR2 does (recursive DFS over the comm graph, env.py:424-446, then one merged
+    # belief written to every member of the flock, env.py:239-248) and that is the behaviour this
+    # restores: A, B and C hold the same map, the same teammate positions and the same staleness
+    # clocks after a single step, symmetrically.
+    #
+    # Default False on PURPOSE. from_ckpt_dict restores the checkpoint's env cfg and a key absent
+    # from an old ckpt falls back to the dataclass default, so every pre-v20 checkpoint, trace and
+    # eval keeps reproducing exactly what it trained under. train_args.py defaults the CLI to True,
+    # so new runs get the relay and `--no-comm-relay` is the control arm.
+    #
+    # The sync REWARD deliberately stays on the direct mask: at M=4 the reward budget is the known
+    # cause of v18's failure, and moving its scale in the same change as the connectivity fix would
+    # leave v19 with no valid control.
+    comm_relay: bool = False
     ss_p_t: float = -20.0               # tx power (dBm)
     ss_thresh: float = -70.0            # rx sensitivity threshold (dBm): connect iff P_R > this
     ss_gamma: float = 2.0               # path-loss exponent, free space
@@ -207,6 +224,23 @@ class EnvCfg:
     # boundary (the split/cap/budget all change there anyway); do not flip it mid-phase.
     rdv_urgency_mode: str = "time"          # "time" | "budget"
     rdv_urgency_start: float = 0.5          # budget mode: fraction of budget spent before urgency starts
+    # ---- IDLE-CONTACT penalty: the cost of STAYING in radio contact with nothing to exchange.
+    # WHY. Measured on v16: after the first paid sync the pair closes from 472 to 342 px, sensor
+    # overlap goes 0.089 -> 0.247 and comm duty 0.030 -> 0.120. The cause is a self-reinforcing loop:
+    # contact fuses the maps, identical maps produce identical utility fields, identical fields pick
+    # the same frontier, co-location produces more contact. Nothing in the reward priced the LINGER —
+    # novel merely declines to pay the follower, and a zero is not a penalty.
+    # WHY sync_paid AND NOT the g gate. `offer` is computed in _refresh_obs, i.e. AFTER fusion has
+    # already reset _own_expl_at_comm, so g is ~0 on EVERY contact step by construction (measured:
+    # mean 0.026 on rising edges and on sustained contact alike) — gating on g would punish the
+    # legitimate meeting exactly as hard as the tether. `sync_paid` is the pre-fusion rising edge that
+    # actually delivered map, so it isolates the productive step. Measured: 81.8% of contact steps are
+    # sustained rather than paying, and contact bursts average 3.1 steps.
+    # The late-episode exemption reuses the budget urgency ramp, so the terminal rendezvous — which
+    # done_mode="own" REQUIRES — is never taxed.
+    # Training-time shaping only: the radio physics stays exactly IR2's (signal_strength, ss_thresh
+    # -70, sensor 80), so the comparison is untouched.
+    comm_idle_pen: float = 0.0
     # ---- SYNC-EVENT reward (the OBJECTIVE term rendezvous was missing). rdv_dense above is
     # TELESCOPING shaping: its net payoff over a full separate→approach→meet cycle is only
     # w·g·φ_sep (measured φ_sep≈0.45 → 0.045 at w=0.10, 1.13 even at w=2.5) against a measured
@@ -241,6 +275,21 @@ class EnvCfg:
     sync_give_weight: float = 0.0           # ζ_g (0 = OFF, pre-v11 behavior). Per scan_norm_nodes delivered.
     sync_recv_ratio: float = 0.5            # ρ: ζ_recv = ρ·ζ_g
     sync_min_gap: int = 32                  # steps since the last PAID sync before a contact pays again
+    # M-SCALING of the sync bonus: ζ_g_eff = ζ_g · (2/M)^sync_weight_m_scale.
+    # 0.0 = OFF (exact no-op at every M, so every pre-existing checkpoint reproduces bit-for-bit).
+    # The exponent form is (2/M)^a, so it is identically 1 at M=2 for ANY exponent — the whole M=2
+    # history is untouched by construction and only M>2 runs can move.
+    # WHY: encounters are not M-invariant. MEASURED v16 (M=2) vs v19 (M=4), realized reward shares
+    # over the whole run: sync 5.5% -> 9.8% (x1.78) and metric/sync_rate 0.0068 -> 0.0206 (x3.03),
+    # while novel is already at parity (27.2% vs 27.3%, thanks to --novel-scan-weight 1.65) and rdv
+    # is 0.6% vs 0.7% — negligible at both M, so DO NOT bother scaling rdv, there is nothing there.
+    # a=1 gives 0.5 at M=4; the share-matching target is 5.5/9.8 = 0.56, and the realized share
+    # falls further than the weight because syncing less is also a behavioural change (feedback),
+    # so do not expect share ∝ weight.
+    # RISK TO WATCH: under done_mode=own the episode ends only when the WEAKEST robot holds 99%, and
+    # at M=4 each robot needs the maps of THREE others, not one. Cut this too far and
+    # eval/own_coverage_final + eval/sync_gap go first — they are the abort signal, not eval/score.
+    sync_weight_m_scale: float = 0.0
     revisit_penalty_coef: float = 0.10      # γ: penalty per step on a node visited in last W steps.
                                             # Raised 0.05→0.10 (2×): a tight 2-node ping-pong (age=2,
                                             # graduated ≈0.75 → 0.075/step) now costs ≈1.5× a novel step,
@@ -447,6 +496,12 @@ class Explorer:
         self._rdv_dbg: dict | None = None
         # φ evaluated at the K candidate moves [N, M, K] (inspector only; None during training).
         self._phi_nbr: torch.Tensor | None = None
+        # Per-teammate φ, [N, M, M] at curr and [N, M, M, K] at the candidate moves. Kept whole so
+        # the rendezvous term can select the teammate `g` is actually about (j_star) instead of the
+        # nearest one — see the geo block in _refresh_obs. The _nbr one is inspector-only.
+        self._phi_all: torch.Tensor | None = None
+        self._phi_nbr_all: torch.Tensor | None = None
+        self._curr_nbr_valid_dbg: torch.Tensor | None = None
         self.P_max = self.graph.guidepost_path_max
         self.K = 8
 
@@ -562,6 +617,9 @@ class Explorer:
         # critic_global build; init here so reset()'s first _refresh_obs reads valid tensors.
         self._prev_expl_frac = torch.zeros((self.N,), dtype=torch.float32, device=self.dev)
         self._idle_now = torch.zeros((self.N, self.M), dtype=torch.bool, device=self.dev)
+        # Per-agent idle regime, 0=productive 1=redundant 2=transit (see _compute_metrics).
+        self._idle_bucket = torch.zeros((self.N, self.M), dtype=torch.int8, device=self.dev)
+        self._idle_flags = torch.zeros((self.N, self.M), dtype=torch.int8, device=self.dev)
         # Rendezvous term: previous step's φ (geodesic curr→owed-teammate /diam) per agent, for the
         # telescoping reward. +inf = cold (first post-reset step → that step's rdv masked to 0).
         self._rdv_phi_prev = torch.full((self.N, self.M), float("inf"), dtype=torch.float32, device=self.dev)
@@ -649,11 +707,20 @@ class Explorer:
         # on a real or pos-share comm), so the rendezvous staleness scalar stays meaningful.
         if self.cfg.force_full_occupancy_sharing:
             comm_mask = torch.ones_like(comm_mask)
+        # comm_mask is the DIRECT radio link; comm_group is the connected component it belongs to
+        # (EnvCfg.comm_relay). Everything that is STATE or OBSERVATION uses the group — the whole
+        # flock is one radio network, so a relayed map, position and staleness clock are as real as
+        # a direct one. The sync REWARD stays on the direct mask: see EnvCfg.comm_relay.
+        comm_group = self._comm_closure(comm_mask) if self.cfg.comm_relay else comm_mask
         # SYNC-EVENT reward — MUST be computed here, on the PRE-fusion maps: one line later the
         # fusion makes M_i == M_j and the set difference is identically empty. Also updates
         # _comm_prev_sync / _sync_t_last_paid, so it has to run exactly once per step.
         sync_give, sync_recv, sync_paid = self._sync_rewards(comm_mask, free_node_pre)
-        self.world.fuse_maps(comm_mask)
+        # fuse_maps walks pairs in-place, so a transitively-closed mask converges in ONE pass:
+        # every j is paired with M-1, which already holds the component's union after (0, M-1).
+        # (That in-place ordering is also why the pre-relay code leaked a partial one-hop relay —
+        # the higher-index leaf got the far map in the same step, the lower-index one a step late.)
+        self.world.fuse_maps(comm_group)
         # ---- ONE pass over the post-fusion occupancy. Occupancy does not change again until the
         # end-of-step auto-reset, and _update_last_known_pos / _refresh_obs both need the same three
         # counts, so they are computed here once and cached. Before this they were recomputed
@@ -661,7 +728,7 @@ class Explorer:
         # instead of 2 and 3 (at N=32 that is ~130M redundant element-comparisons every step).
         self._occ_counts = self._count_occupancy()
         own_free_px, union_free, own_known_px = self._occ_counts
-        self._update_last_known_pos(comm_mask)
+        self._update_last_known_pos(comm_group)
 
         # Post-fusion node-level FREE.
         occ_post_flat = self.world.occupancy_torch.view(self.N, self.M, -1)
@@ -697,6 +764,7 @@ class Explorer:
         scan_norm = float(max(1.0, self.cfg.scan_norm_nodes))
         union_prev = self.union_node_mask                                                  # [N, N_max]
         my_new = free_node_pre & ~self.own_node_mask_prev                                  # [N, M, N_max]
+        my_new_count = my_new.float().sum(-1)                                              # [N, M]
         novel_count = (my_new & ~union_prev.unsqueeze(1)).float().sum(-1)                  # [N, M]
         novel_scan = novel_count / scan_norm
         self.novel_cells_ep = self.novel_cells_ep + novel_count
@@ -704,6 +772,18 @@ class Explorer:
         # than the 3-clause refined idle (counts productive transit as idle) but enough as a
         # descriptive critic signal — no penalty semantics, no extra BF flood.
         self._idle_now = novel_count <= 0.0                                                # [N, M] bool
+        # idle_frac collapses TWO regimes with opposite fixes; _compute_metrics splits them using
+        # my_new_count (how much MY lidar added, regardless of who else already had it):
+        #   my_new_count == 0                    → TRANSIT   — walking through space I already
+        #                                          mapped. A routing/assignment problem, nothing
+        #                                          to do with teammates.
+        #   my_new_count > 0, novel_count == 0   → REDUNDANT — I scanned real ground a teammate
+        #                                          already held. An INFORMATION problem: out of
+        #                                          comm the agent has no way to know.
+        # novel_count is measured against the PRIVILEGED union, which holds more of the map at any
+        # t the more agents there are — so idle_frac is not behaviourally comparable across M even
+        # though it is a plain mean. coverage_per_dist is.
+        self._my_new_count = my_new_count
         # Advance the union mask (needed next step for novel-scan attribution). The β·team_delta
         # reward term was REMOVED: a union-new cell is already paid once via novel_scan to its
         # discoverer; adding the shared union-delta to everyone double-counted it and reintroduced
@@ -778,13 +858,37 @@ class Explorer:
         delta_stall = self.cfg.stall_penalty_coef
         # SYNC-EVENT payoff, already normalized by scan_norm_nodes inside _sync_rewards.
         z_sync = float(self.cfg.sync_give_weight)
+        if self.cfg.sync_weight_m_scale != 0.0 and self.M != 2:
+            # (2/M)^a — identically 1 at M=2, so M=2 runs are untouched. See EnvCfg.
+            z_sync *= (2.0 / float(self.M)) ** float(self.cfg.sync_weight_m_scale)
         sync_bonus = z_sync * (sync_give + float(self.cfg.sync_recv_ratio) * sync_recv)   # [N, M]
+        # IDLE-CONTACT penalty (see EnvCfg.comm_idle_pen): charged for BEING in contact on a step
+        # that did not actually deliver map. Free on the paying step, and free near the deadline so
+        # the terminal rendezvous is never taxed. travel_px is already updated for this step above,
+        # so the budget ramp here matches the one _refresh_obs feeds the actor as travel_frac.
+        comm_idle = None
+        if self.M > 1 and float(self.cfg.comm_idle_pen) > 0.0:
+            eye_ci = torch.eye(self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M)
+            in_contact = (comm_group & ~eye_ci).any(dim=2).float()                        # [N, M]
+            if self.cfg.max_travel_frac > 0.0:
+                bud = (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0).unsqueeze(1)
+                tfrac = (self.travel_px / bud).clamp(0.0, 1.0)
+            elif self.cfg.max_travel_px > 0.0:
+                tfrac = (self.travel_px / max(1.0, float(self.cfg.max_travel_px))).clamp(0.0, 1.0)
+            else:
+                tfrac = torch.zeros_like(in_contact)
+            t0_ci = float(self.cfg.rdv_urgency_start)
+            late = ((tfrac - t0_ci) / max(1e-6, 1.0 - t0_ci)).clamp(0.0, 1.0)              # [N, M]
+            comm_idle = (float(self.cfg.comm_idle_pen) * in_contact
+                         * (1.0 - sync_paid.float()) * (1.0 - late))                      # [N, M]
         reward = (a_novel * novel_scan
                   - gamma   * revisit_pen
                   - delta_stall * stall_pen
                   + sync_bonus
                   + terminated_now.float().unsqueeze(-1) * self.cfg.completion_bonus
                   - step_penalty)
+        if comm_idle is not None:
+            reward = reward - comm_idle
         # NOTE: the dense RENDEZVOUS term (rdv_dense) is added AFTER _refresh_obs below, because it
         # needs the fresh geodesic-to-teammate field + surplus gate that _refresh_obs computes.
 
@@ -797,6 +901,10 @@ class Explorer:
             "stall":         (-delta_stall * stall_pen).mean(),
             "step":          (-step_penalty).mean(),
             "sync":          sync_bonus.mean(),
+            # Identically 0 unless --comm-idle-pen is set. When it is, this is the whole story of
+            # whether the term bit: compare it against reward/novel, and watch metric/comm_duty_cycle.
+            "comm_idle":     (-comm_idle).mean() if comm_idle is not None
+                             else torch.zeros((), device=self.dev),
             # The terminal payout was the ONE summand with no telemetry, so "did the completion
             # bonus ever fire?" could only be answered indirectly via eval/success_rate — which is
             # measured on the eval suite, not on the training distribution. Under done_mode="own"
@@ -831,15 +939,18 @@ class Explorer:
                 # entry here reads fine for agent 0 and throws for every other agent.
                 "completion":    (terminated_now.float().unsqueeze(-1)
                                   * self.cfg.completion_bonus).expand(-1, self.M).detach(),
+                "comm_idle":     ((-comm_idle) if comm_idle is not None
+                                  else torch.zeros_like(step_penalty)).detach(),
             }
 
         # ---- Exploration-quality metrics (per-step scalars; driver aggregates) ----
         metrics = self._compute_metrics(
             free_node_pre, comm_mask, team_delta, step_disp,
             stall_pen, is_recent_revisit, novel_count, own_cov, explored_rate, sync_paid,
+            my_new_count, comm_group,
         )
 
-        self._refresh_obs(comm_mask)
+        self._refresh_obs(comm_group)
 
         # ---- Dense RENDEZVOUS reward (needs the post-refresh geodesic-to-teammate + surplus gate).
         # rdv = w · g · (φ_prev − φ_now): reward NET geodesic approach toward the owed teammate,
@@ -914,6 +1025,12 @@ class Explorer:
             # PER ENV: eval_best.py runs K maps as K parallel envs.
             "own_cov":       own_cov,
             "sync_paid":     sync_paid,
+            # Per-agent idle regime this step [N, M] int8: 0=productive, 1=redundant, 2=transit.
+            # info["metrics"] carries the same split already reduced to scalars over N and M, which
+            # cannot answer "is ONE agent carrying the idle" — scripts/idle_diag.py needs the raw
+            # per-agent codes to cross them with contact / travel_frac / episode phase.
+            "idle_bucket":   self._idle_bucket.clone(),
+            "idle_flags":    self._idle_flags.clone(),   # bit0 stalled, bit1 revisit, bit2 contact
             # Per-env "is any pair in contact this step" — comm_duty_cycle in info["metrics"] is
             # already reduced to a scalar over N, and the batched eval scores K maps as K envs.
             "comm_any":      (comm_mask.sum(dim=(1, 2)) > self.M) if self.M > 1
@@ -923,6 +1040,10 @@ class Explorer:
             # single connected "flock" at the final step (their connectivity metric is transitive,
             # so any-pair-in-contact is not the same question).
             "comm_mask":     comm_mask,
+            # The transitive closure of the above (== comm_mask when cfg.comm_relay is off). Kept
+            # as a SEPARATE key so no existing consumer of comm_mask — eval_comparison.py,
+            # eval_best.py, eval/trace.py, the inspector — silently changes what it measures.
+            "comm_group":    comm_group,
         }
         if bool(done.any().item()):
             idx = torch.nonzero(done, as_tuple=False).flatten().cpu().numpy().tolist()
@@ -1025,6 +1146,7 @@ class Explorer:
     def _compute_metrics(
         self, free_node_pre, comm_mask, team_delta, step_disp,
         stall_pen, is_recent_revisit, novel_count, own_cov, explored_rate, sync_paid,
+        my_new_count, comm_group,
     ) -> dict:
         """Exploration-quality telemetry (per-step scalars; driver aggregates). Diagnostic
         only — never enters the reward."""
@@ -1049,17 +1171,57 @@ class Explorer:
         # overlap (dist < 2·sensor_range) — MARVEL's overlap ratio; immune to fusion history.
         if self.M > 1:
             offdiag = ~torch.eye(self.M, dtype=torch.bool, device=self.dev)
+            # comm_duty stays on the DIRECT mask — it is the radio duty cycle and the tether
+            # detector, and every past run's value means that. comm_group_duty is its transitive
+            # twin; comm_connected is IR2's connectivity_rate (env.py:386): the whole team in one
+            # flock, which is the semantics scripts/eval_comparison.py already reports.
             comm_duty = comm_mask[:, offdiag].float().mean()
+            comm_group_duty = comm_group[:, offdiag].float().mean()
+            comm_connected = comm_group[:, 0, :].all(dim=-1).float().mean()
             sens_overlap = (pd[:, triu] < 2.0 * self.cfg.sensor_range_px).float().mean()
         else:
             comm_duty = torch.zeros((), device=self.dev)
+            comm_group_duty = torch.zeros((), device=self.dev)
+            comm_connected = torch.zeros((), device=self.dev)
             sens_overlap = torch.zeros((), device=self.dev)
+        # ---- idle decomposition. self._idle_now is "scanned nothing TEAM-new"; my_new_count is
+        # "how much MY lidar added". The two together separate an assignment failure (transit) from
+        # an information failure (redundant), which have opposite fixes.
+        idle_transit   = my_new_count <= 0.0                                                 # [N, M]
+        idle_redundant = (my_new_count > 0.0) & self._idle_now                               # [N, M]
+        if self.M > 1:
+            eye_m = torch.eye(self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M)
+            # Group, not direct link: the question these crosses answer is "could this agent have
+            # KNOWN the ground was already the team's", and a relayed link informs it just as well.
+            in_contact = (comm_group & ~eye_m).any(dim=2)                                    # [N, M]
+        else:
+            in_contact = torch.zeros_like(idle_transit)
+        # Same budget ramp the actor observes as travel_frac (see the comm_idle block in step()).
+        if self.cfg.max_travel_frac > 0.0:
+            bud_m = (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0).unsqueeze(1)
+            tfrac_m = (self.travel_px / bud_m).clamp(0.0, 1.0)                               # [N, M]
+        elif self.cfg.max_travel_px > 0.0:
+            tfrac_m = (self.travel_px / max(1.0, float(self.cfg.max_travel_px))).clamp(0.0, 1.0)
+        else:
+            tfrac_m = torch.zeros_like(self.travel_px)
+        # Per-agent bucket code for offline diagnostics (the metrics above are means over N and M,
+        # so they cannot answer "is one agent carrying the idle"): 0=productive, 1=redundant,
+        # 2=transit. Exported in info["idle_bucket"], with the conditioning bits alongside it in
+        # info["idle_flags"] (bit0 stalled, bit1 recent-revisit, bit2 in contact) so a diagnostic
+        # can cross them per agent instead of re-deriving them from tensors step() does not export.
+        self._idle_bucket = (idle_transit.to(torch.int8) * 2
+                             + idle_redundant.to(torch.int8))                                # [N, M]
+        self._idle_flags = ((stall_pen > 0).to(torch.int8)
+                            + is_recent_revisit.to(torch.int8) * 2
+                            + in_contact.to(torch.int8) * 4)                                 # [N, M]
         return {
             "redundancy":     redundancy.mean(),
             "stall_rate":     stall_pen.mean(),
             "revisit_rate":   is_recent_revisit.float().mean(),
             "mean_pair_dist": mean_pair_dist.mean(),
             "comm_duty_cycle":     comm_duty,
+            "comm_group_duty":     comm_group_duty,
+            "comm_connected":      comm_connected,
             "sensing_overlap":     sens_overlap,
             "team_delta_sum": team_delta.sum(),                   # Σ_N Δunion frac this step (efficiency num)
             "step_disp_sum":  step_disp.sum(),                    # Σ_{N,M} displacement px (efficiency denom)
@@ -1078,6 +1240,23 @@ class Explorer:
             "sync_rate":      sync_paid.mean(),
             # Still computed for telemetry although they left critic_global in v11.
             "idle_frac":      self._idle_now.float().mean(),
+            # ---- idle_frac split into DISJOINT regimes (see the comment at the novel-scan block).
+            # transit + redundant == idle_frac and productive + idle_frac == 1, exactly — the
+            # historical metric is unchanged and stays comparable with every past run.
+            "idle_transit":   idle_transit.float().mean(),
+            "idle_redundant": idle_redundant.float().mean(),
+            # Redundant scanning while OUT of comm is the share of the waste the agent could not
+            # possibly have avoided: it had no way to learn that ground was already the team's.
+            # This is the number the multi-hop relay (EnvCfg.comm_relay) is expected to move.
+            "idle_redundant_nocomm": (idle_redundant & ~in_contact).float().mean(),
+            "idle_transit_nocomm":   (idle_transit & ~in_contact).float().mean(),
+            # Immobile-while-idle: the 3-clause split says WHY nothing was found, stall_rate says
+            # whether the agent was even moving. Cross them so "parked" is separable from "walking
+            # over old ground" without re-running a diagnostic.
+            "idle_stalled":   (self._idle_now & (stall_pen > 0)).float().mean(),
+            "idle_revisit":   (self._idle_now & is_recent_revisit).float().mean(),
+            # Mean travel-budget fraction spent, so the split can be read against the deadline.
+            "travel_frac_mean": tfrac_m.mean(),
         }
 
     @property
@@ -1139,6 +1318,20 @@ class Explorer:
         return ((give_ij * paid_f).sum(2) / denom,
                 (recv_ij * paid_f).sum(2) / denom,
                 paid.any(dim=2).float())
+
+    def reseed_map_rng(self, seed: int) -> None:
+        """Reset the MAP/SPAWN RNG stream. Call at the start of an eval suite, for the same reason
+        reseed_channel_noise exists — and it is the bigger of the two effects.
+
+        `self.rng` is seeded once at construction and then ADVANCES on every reload_map/_reset_envs,
+        so a persistent eval env scores the same maps from DIFFERENT SPAWN POSITIONS at every tick.
+        Measured on v19 ckpt_stop, three back-to-back suites over the same 32 test/complex maps:
+        success_rate 0.781 / 0.844 / 0.750 and eval/score 0.367 / 0.388 / 0.384 — about +-9 points
+        of success from spawn luck alone, on identical weights. eval/score is the ONLY writer of
+        ckpt_best, so without this the best-checkpoint pick is substantially a lottery and two
+        ticks of the same run are not comparable.
+        """
+        self.rng = np.random.default_rng(int(seed))
 
     def reseed_channel_noise(self, seed: int) -> None:
         """Reset the radio-shadowing RNG stream. Call at the start of an eval suite so the comm
@@ -1233,6 +1426,22 @@ class Explorer:
                 comm_mask[:, j, i] = can
 
         return comm_mask
+
+    def _comm_closure(self, comm_mask: torch.Tensor) -> torch.Tensor:
+        """Transitive closure of the comm graph → [N, M, M] bool, True at (n,i,j) iff i and j are
+        in the same connected component ("flock" in IR2, env.py:424-446 — a recursive DFS there,
+        boolean matrix squaring here because M is tiny and this runs every step of every env).
+
+        _comm_check already sets the diagonal, so `reach` starts reflexive and each squaring
+        doubles the hop radius: ceil(log2(M)) rounds saturate reachability (2 matmuls on [N,4,4]
+        at M=4). Below M=3 the closure is the identity, hence the exact early return.
+        """
+        if self.M < 3:
+            return comm_mask
+        reach = comm_mask
+        for _ in range(int(math.ceil(math.log2(self.M)))):
+            reach = (reach.float() @ reach.float()) > 0
+        return reach
 
     def _count_occupancy(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The three occupancy reductions everything downstream needs, from ONE pass.
@@ -1716,6 +1925,11 @@ class Explorer:
         Pass 1: build global graph + BF-from-curr + radar (feat[5]/feat[6]) per agent.
         Pass 2: cross-agent feat[4] (teammate-proximity potential) — writes to global node_feat.
         Pass 3: extract local (2·n_hops + 3)² window per agent; this is what the model sees.
+
+        NOTE `comm_mask` here is the CONNECTIVITY mask, which step() passes as the transitively
+        closed one (comm_group) whenever EnvCfg.comm_relay is set — everything observational is a
+        question of what the agent can know, and a relayed link answers it the same as a direct
+        one. It equals the direct mask when the relay is off. The reset path still passes None.
         """
         # ---- Pass 1 (BATCHED over N·M): build + warm-started BF-from-curr (feeds the radar) ----
         # Every GraphLattice op is batch-agnostic on its leading dim, so the M agents are folded
@@ -1747,6 +1961,11 @@ class Explorer:
         self._dist_curr_prev.copy_(bf_dist_from_curr.view(self.N, self.M, self.N_max))
         info["bf_dist_from_curr"]  = bf_dist_from_curr
         info["bf_parent_from_curr"] = bf_parent_from_curr   # [B, N_max] predecessor on path from curr
+        # Diagnostics-only mirror of the GLOBAL utility field, kept per agent like _dist_curr_prev.
+        # _last_obs carries only the LOCAL window (half-width n_hops*NR px), which cannot answer
+        # "was the target the agent walked 400 px to actually worth more than the one it left
+        # behind" — the destination is outside the window by construction.
+        self._utility_global = info["utility"].view(self.N, self.M, self.N_max)
         # ---- VALUE-FIELD [B, K]: discounted utility mass per first-step branch (see EnvCfg.vf_gamma).
         vf = self.graph.value_field(info, gamma_vf=float(self.cfg.vf_gamma))
         self._vf = vf.view(self.N, self.M, self.K)
@@ -1851,6 +2070,16 @@ class Explorer:
                     would_comm = (c.ss_p_t - pl) > c.ss_thresh
                 else:
                     would_comm = (eucl < float(self.cfg.comm_range_px)) & ~obst.any(dim=-1)
+                # RELAY. `would_comm` above is "if the teammate stood on that node, would *I* hear
+                # him" — evaluated observer→node, a second, independent copy of the pairwise comm
+                # predicate. Under multi-hop that under-claims: a teammate parked inside a
+                # GROUP-MATE's radio footprint is just as audible to me, so leaving this direct
+                # would let the belief keep mass on ground the flock has already ruled out.
+                # OR the footprint over the observer's component. Exactly a no-op when the closure
+                # is the identity (comm_relay off, or M<3), since the diagonal is always set.
+                if self.cfg.comm_relay and self.M > 2 and comm_mask is not None:
+                    wc = would_comm.view(self.N, self.M, -1)                       # [N, M, N_max]
+                    would_comm = (wc.unsqueeze(1) & comm_mask.unsqueeze(-1)).any(dim=2).view(B, -1)
                 seen_nodes = node_free & would_comm
                 self._pf_seen = seen_nodes                                       # [B, N_max] for the trace
                 # The openings themselves, exported alongside `seen`: "belief mass on ground that
@@ -1926,8 +2155,17 @@ class Explorer:
                 # Normalize by the GLOBAL peak, not the in-window one: if the belief mode sits far
                 # outside the window the in-window values SHOULD stay small — that is the
                 # information "he is probably not here".
-                pot = self._belief_p.amax(dim=1)                                  # [B, N_max]
-                pot = pot / pot.amax(dim=-1, keepdim=True).clamp(min=1e-8)        # → plateau ∈[0,1]
+                # PER-TEAMMATE, BEFORE the max over teammates. `_belief_p` is Σ=1 PER TEAMMATE, so
+                # each row already lives on its own scale: a teammate lost 5 steps ago has a sharp
+                # peak, one lost 200 steps ago a wide shallow plateau. Normalizing AFTER the max
+                # divides every teammate by the sharpest one's peak, which at M>2 erases exactly the
+                # teammates that are hardest to find — the ones the channel exists for. At M=2 there
+                # is a single non-self row (the self slot is all-zero, masked by comm_bm), so
+                # max-then-normalize and normalize-then-max are identical: this is a no-op for every
+                # 2-agent run and a fix for M>2.
+                pot = self._belief_p / self._belief_p.amax(
+                    dim=-1, keepdim=True).clamp(min=1e-8)                         # [B, M, N_max] each ∈[0,1]
+                pot = pot.amax(dim=1)                                             # [B, N_max] plateau ∈[0,1]
             else:
                 scale_px = max(1.0, 4.0 * float(self.cfg.nr))
                 d_min = info["bf_dist_team"].min(dim=1).values                    # [B, N_max]
@@ -2060,7 +2298,18 @@ class Explorer:
             geo = d_at.min(dim=2).values                                                             # [N, a] nearest teammate
             geo = torch.where(torch.isfinite(geo), geo, torch.full_like(geo, diam))
             geo_pair = (geo.mean(dim=1) / max(1.0, diam)).clamp(0.0, 1.0)                            # [N]
-            self._geo_curr_team = (geo / phi_norm_px).clamp(0.0, 1.0)                                # [N, M]
+            # φ TOWARD THE TEAMMATE THE GATE IS ABOUT. `g` is built from the surplus owed to
+            # `j_star` (the teammate owed the most map, computed further down), so φ must measure
+            # the distance to THAT teammate. Reducing by min-over-teammates instead means that at
+            # M>2 the gate can open because A3 is owed half the map while the dense term pays for
+            # approaching A1 — two different robots, one reward. Keep the full per-teammate φ here
+            # and select it with j_star once the offer is known; `geo_pair` (CTDE critic) stays on
+            # the min, where "how spread is the team" is the intended reading. At M=2 the only
+            # finite slot IS j_star (the self slot is left at +inf by _bf_from_teammates), so the
+            # gather below reproduces the min exactly — no-op for every 2-agent run.
+            self._phi_all = (d_at.where(torch.isfinite(d_at), torch.full_like(d_at, diam))
+                             / phi_norm_px).clamp(0.0, 1.0)                                          # [N, a, j]
+            self._geo_curr_team = (geo / phi_norm_px).clamp(0.0, 1.0)                                # [N, M] (min; re-aimed below)
             # φ at each of the K CANDIDATE moves, not just at curr — inspector only, so it is gated
             # on store_render_global and costs training exactly nothing. This is what makes the rdv
             # gate legible: `g` alone says "the gate is hot", it never says WHICH move the gate is
@@ -2070,18 +2319,25 @@ class Explorer:
                 nb = curr_nbr_global.clamp(min=0)                                                    # [N, M, K]
                 K_ = nb.shape[-1]
                 d_nb = bt.gather(3, nb.view(self.N, self.M, 1, K_).expand(-1, -1, self.M, -1))       # [N, a, j, K]
-                geo_nb = d_nb.min(dim=2).values                                                      # [N, a, K]
-                geo_nb = torch.where(torch.isfinite(geo_nb), geo_nb, torch.full_like(geo_nb, diam))
-                phi_nb = (geo_nb / phi_norm_px).clamp(0.0, 1.0)
+                d_nb = torch.where(torch.isfinite(d_nb), d_nb, torch.full_like(d_nb, diam))
+                # Per-teammate, same reason as _phi_all above; selected by j_star with the reward.
+                self._phi_nbr_all = (d_nb / phi_norm_px).clamp(0.0, 1.0)                             # [N, a, j, K]
                 # Invalid neighbour slots carry a meaningless index; blank them rather than show a
                 # number that looks like a real option.
-                self._phi_nbr = torch.where(curr_nbr_valid.bool(), phi_nb,
-                                            torch.full_like(phi_nb, float("nan")))                   # [N, M, K]
+                self._curr_nbr_valid_dbg = curr_nbr_valid.bool()                                     # [N, M, K]
+                self._phi_nbr = torch.where(self._curr_nbr_valid_dbg,
+                                            self._phi_nbr_all.min(dim=2).values,
+                                            torch.full((), float("nan"), device=self.dev))           # [N, M, K]
             else:
                 self._phi_nbr = None
+                self._phi_nbr_all = None
+                self._curr_nbr_valid_dbg = None
         else:
             geo_pair = torch.zeros(self.N, device=self.dev)
             self._geo_curr_team = torch.zeros((self.N, self.M), device=self.dev)
+            self._phi_all = None
+            self._phi_nbr_all = None
+            self._curr_nbr_valid_dbg = None
         # coverage_rate: union-explored growth THIS step, scaled to "fraction-of-map per episode"
         # units (Δ·T), clamped [0,5]→[0,1]. Distinguishes "still progressing" from "stalled late".
         # On a per-env reset explored drops → Δ<0 → clamp(min=0) reads 0 (no spurious spike).
@@ -2154,6 +2410,21 @@ class Explorer:
             offer = offer.masked_fill(eye, -1.0)                                                     # mask self slot
             j_star = offer.argmax(dim=2)                                                             # [N, M] teammate owed most
             offer_max = offer.gather(2, j_star.unsqueeze(2)).squeeze(2).clamp(min=0.0)               # [N, M]
+            # RE-AIM φ ONTO j_star (see the _phi_all comment in the geo block above). The dense rdv
+            # term is w·g·(φ_prev − φ_now) and `g` is entirely about j_star, so φ has to be the
+            # distance to the same robot or the two halves of the term describe different targets.
+            # No-op at M=2 (one finite slot). NOTE this makes φ piecewise: if j_star switches
+            # between steps, φ_prev and φ_now measure different teammates and Δφ is meaningless for
+            # that one step — the same discontinuity the lkp jump already has, and `g` collapses on
+            # a switch anyway (the new j_star's surplus starts from its own baseline).
+            self._geo_curr_team = self._phi_all.gather(2, j_star.unsqueeze(2)).squeeze(2)            # [N, M]
+            if self._phi_nbr_all is not None:
+                K_dbg = self._phi_nbr_all.shape[-1]
+                self._phi_nbr = torch.where(
+                    self._curr_nbr_valid_dbg,
+                    self._phi_nbr_all.gather(
+                        2, j_star.view(self.N, self.M, 1, 1).expand(-1, -1, 1, K_dbg)).squeeze(2),
+                    torch.full((), float("nan"), device=self.dev))                                   # [N, M, K]
             # Gate on RELATIVE growth: surplus / (frac · own map size AT THE LAST SYNC with j_star),
             # not a fixed fraction of the whole canvas. g→1 when I have grown my known map by
             # rdv_offer_frac SINCE we last met — i.e. I now hold a meaningful fraction of NEW content

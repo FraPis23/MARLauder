@@ -256,8 +256,14 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
             # FIXED absolute scale (BEL_VMAX) and the frontier accumulation magnitude is comparable
             # across frames. Σ p = 1 per teammate.
             bel_disp = bp0.max(axis=1)                      # [M, N_max]
+            # WHICH teammate owns that maximum. With M=2 there is only one non-self row so this is
+            # constant and the viewer ignores it; with M>2 the merged heat field is unreadable
+            # without it — you cannot tell whether the mass on a door is "A1 went through" or
+            # "A3 went through". One small int per drawn node, so the trace barely grows.
+            bel_who = bp0.argmax(axis=1)                    # [M, N_max]
         else:
             bel_disp = None
+            bel_who = None
         # Pathfront TRANSIT dots (uniform 1.0 markers) — the travelling hypotheses BEFORE they bloom.
         # Rendered as distinct points so the viewer sees each dot depart lkp→frontier (viz only).
         seen_rg = rg.get("belief_seen")
@@ -282,6 +288,10 @@ def capture_trace(model, split, env_cfg_dict: dict, n_agents: int, map_idx: int,
                 "team": _r(nf[a, n, 4], 3),
                 # bel = RAW belief posterior (incl. unknown nodes) → the propagation field.
                 "bel": _r(float(belj[n]), 4) if belj is not None else 0.0,   # RAW p (fixed-scale in web)
+                # belw = index of the teammate that owns `bel` at this node → the inspector tints
+                # the belief heat with that agent's palette colour (acol), so at M>2 each teammate's
+                # probability mass is identifiable on sight.
+                "belw": int(bel_who[a, n]) if bel_who is not None else 0,
                 # belt = 1 when a still-travelling transit dot sits on this node (pathfront, viz only).
                 "belt": 1 if (beltj is not None and beltj[n] > 0.5) else 0,
                 # sn = the observer can see this node right now (comm would have fired) → belief here
