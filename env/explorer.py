@@ -194,6 +194,31 @@ class EnvCfg:
     # so near-weak vs far-strong frontier choices are resolved analytically instead of asking the
     # GAT to integrate window + radar. Fed to the actor (obs["value_field"] [N, M, K]).
     vf_gamma: float = 0.97                  # per-hop discount of utility mass (mirrors radar_gamma)
+    # ---- FRONTIER-DIVERSITY overlap tensor (CTDE, training only). When True, _refresh_obs also
+    # emits obs["div_overlap"] [N, M, M, K, K]: how much DISCOUNTED FRONTIER MASS agent i's exit k
+    # and agent j's exit l lead to IN COMMON, on the shared lattice index. The training loss then
+    # contracts it with the two policies (see MAPPOCfg.div_weight) to price two agents committing
+    # to the same work.
+    # WHY not a penalty on the local logits: that port is v17/J.1/J.2 and it failed for a reason —
+    # the logits are over the 8 neighbours of the agent's OWN node, so two agents 300 px apart
+    # share no action index and the penalty is identically zero exactly when the duplication is
+    # being decided. Frontiers are a SHARED index; branches are not.
+    # WHY not a reward term: v18 died by moving the reward budget at M=4 (novel/completion
+    # inverted). An auxiliary policy loss leaves the return, the advantage and the critic alone.
+    # Default False so every pre-existing checkpoint, trace and eval reproduces unchanged.
+    div_overlap: bool = False
+    # ---- ATTRIBUTION PARITY (eval only). Recompute the per-agent union-new credit under IR2's
+    # OWN two accounting rules, alongside ours, so "is our contribution imbalance a real behaviour
+    # difference or an artefact of how the credit is counted?" gets a number instead of an argument.
+    #   ours   : every agent is compared against the PREVIOUS step's union, simultaneously, so a
+    #            cell two agents scan in the same step is credited to BOTH (shares are then
+    #            renormalised). Multi-claimant, one attribution event per lattice hop (<=22.63 px).
+    #   IR2    : compat/env.py:163-166 loops over robots and folds each one into the merged belief
+    #            BEFORE the next is measured, so every pixel has exactly ONE claimant; and it only
+    #            senses at hop endpoints, so credit lands in chunks of one graph edge.
+    # Two extra accumulators isolate the two rules: `seq` = single-claimant at OUR cadence,
+    # `ir2` = single-claimant at IR2's stride (Explorer.attr_stride_px, per map).
+    attr_ir2_parity: bool = False
     rdv_offer_frac: float = 0.15            # gate saturates (g→1) when the map gained since last sync
     #                                         reaches this fraction of the OWN map size AT that sync
     #                                         (relative growth, floored by scan_norm_nodes). Also the ∆M obs norm.
@@ -511,6 +536,11 @@ class Explorer:
         # Cumulative px travelled per robot this episode (EnvCfg.max_travel_px budget + the
         # max_dist column of the IR2 comparison). Reset with self.t at every episode boundary.
         self.travel_px    = torch.zeros((self.N, self.M),              dtype=torch.float32, device=self.dev)
+        # PER-ENV travel budget override, [N] px (comparison v2, PROTOCOL_V2_DISTANZA.md §7.1).
+        # None = fall back to the cfg-level budgets, so every existing run and eval is unchanged.
+        # Set by eval_comparison.py to IR2's per-map distance D_k, which is a DIFFERENT number for
+        # every map in the batch and therefore cannot be expressed as an EnvCfg scalar.
+        self.travel_budget_px: torch.Tensor | None = None
         self.last_union   = torch.zeros(self.N,                        dtype=torch.float32, device=self.dev)
         self.curr_idx     = torch.zeros((self.N, self.M),              dtype=torch.long,    device=self.dev)
         self.curr_idx_global = torch.zeros((self.N, self.M),           dtype=torch.long,    device=self.dev)
@@ -612,6 +642,15 @@ class Explorer:
         self.union_node_mask = torch.zeros((self.N, self.N_max), dtype=torch.bool, device=self.dev)
         self.own_node_mask_prev = torch.zeros((self.N, self.M, self.N_max), dtype=torch.bool, device=self.dev)
         self.novel_cells_ep = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        # Attribution-parity accumulators + their private unions (see EnvCfg.attr_ir2_parity).
+        self.novel_cells_seq_ep = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        self.novel_cells_ir2_ep = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        self._seq_union = torch.zeros((self.N, self.N_max), dtype=torch.bool, device=self.dev)
+        self._attr_union = torch.zeros((self.N, self.N_max), dtype=torch.bool, device=self.dev)
+        self._attr_last_px = torch.zeros((self.N, self.M), dtype=torch.float32, device=self.dev)
+        # Per-map attribution stride in px, set from outside like travel_budget_px. None = fall
+        # back to one hop, i.e. our own cadence (which makes `ir2` collapse onto `seq`).
+        self.attr_stride_px: torch.Tensor | None = None
         # CTDE critic_global extras: prev-step union-explored frac (coverage_rate derivative) and
         # this-step simple-idle mask (agent scanned no team-new cells). Set each step before the
         # critic_global build; init here so reset()'s first _refresh_obs reads valid tensors.
@@ -870,11 +909,9 @@ class Explorer:
         if self.M > 1 and float(self.cfg.comm_idle_pen) > 0.0:
             eye_ci = torch.eye(self.M, dtype=torch.bool, device=self.dev).view(1, self.M, self.M)
             in_contact = (comm_group & ~eye_ci).any(dim=2).float()                        # [N, M]
-            if self.cfg.max_travel_frac > 0.0:
-                bud = (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0).unsqueeze(1)
-                tfrac = (self.travel_px / bud).clamp(0.0, 1.0)
-            elif self.cfg.max_travel_px > 0.0:
-                tfrac = (self.travel_px / max(1.0, float(self.cfg.max_travel_px))).clamp(0.0, 1.0)
+            _bud = self.budget_px()
+            if _bud is not None:
+                tfrac = (self.travel_px / _bud.unsqueeze(1)).clamp(0.0, 1.0)
             else:
                 tfrac = torch.zeros_like(in_contact)
             t0_ci = float(self.cfg.rdv_urgency_start)
@@ -996,11 +1033,9 @@ class Explorer:
         # truncate. max over robots, matching IR2's max_dist: the mission ends when the FIRST
         # robot exhausts its budget, not the average one.
         truncated  = self.t >= self.cfg.max_episode_steps
-        if self.cfg.max_travel_frac > 0.0:                      # per-map budget (training)
-            budget = self.cfg.max_travel_frac * self.free_total                  # [N]
-            truncated = truncated | (self.travel_px.amax(dim=1) >= budget)
-        elif self.cfg.max_travel_px > 0.0:                      # flat budget (comparison cells)
-            truncated = truncated | (self.travel_px.amax(dim=1) >= self.cfg.max_travel_px)
+        _budget = self.budget_px()                             # None = step cap only
+        if _budget is not None:
+            truncated = truncated | (self.travel_px.amax(dim=1) >= _budget)
         if self.cfg.ignore_budget_truncation:
             # Trace/inspector only. Suppress the truncation but NOT the budget itself, so
             # agent_scalars[2] (travel_frac) keeps the value the policy trained against. The old
@@ -1009,17 +1044,28 @@ class Explorer:
             truncated = torch.zeros_like(truncated)
         terminated = done_frac >= self.cfg.done_explored_thresh
         done = truncated | terminated
+        if self.cfg.attr_ir2_parity:
+            self._attribute_ir2_parity(free_node_pre, union_prev, done)
         info = {
             "explored_rate": explored_rate,
             "terminated":    terminated,
             "truncated":     truncated,
             "travel_px":     self.travel_px.clone(),   # [N, M] cumulative px, pre-auto-reset
+            # [N, M, 2] agent positions, ALSO pre-auto-reset. Anything measured from `env.pos`
+            # after step() returns reads the RESPAWNED positions on the step an episode ends,
+            # because _reset_envs runs at the tail of step(). That silently turned the last step
+            # of every episode into a 200-800 px teleport in the comparison harness's distance
+            # accumulator. Read positions from here, not from env.pos.
+            "pos":           self.pos.clone(),
             "step":          self.t.clone(),
             "reward_terms":  reward_terms,
             "metrics":       metrics,
             # Per-agent union-new cells found so far this episode [N, M] — snapshot taken
             # BEFORE auto-reset so episode-end contribution shares are readable at done.
             "novel_cells_ep": self.novel_cells_ep.clone(),
+            # Attribution-parity twins (EnvCfg.attr_ir2_parity); zeros when the flag is off.
+            "novel_cells_seq_ep": self.novel_cells_seq_ep.clone(),
+            "novel_cells_ir2_ep": self.novel_cells_ir2_ep.clone(),
             # Per-agent OWN-map coverage [N, M] and paid-sync flags [N, M], top-level (not inside
             # "metrics", whose values are reduced to scalars) because the eval suites need them
             # PER ENV: eval_best.py runs K maps as K parallel envs.
@@ -1197,11 +1243,9 @@ class Explorer:
         else:
             in_contact = torch.zeros_like(idle_transit)
         # Same budget ramp the actor observes as travel_frac (see the comm_idle block in step()).
-        if self.cfg.max_travel_frac > 0.0:
-            bud_m = (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0).unsqueeze(1)
-            tfrac_m = (self.travel_px / bud_m).clamp(0.0, 1.0)                               # [N, M]
-        elif self.cfg.max_travel_px > 0.0:
-            tfrac_m = (self.travel_px / max(1.0, float(self.cfg.max_travel_px))).clamp(0.0, 1.0)
+        _bud_m = self.budget_px()
+        if _bud_m is not None:
+            tfrac_m = (self.travel_px / _bud_m.unsqueeze(1)).clamp(0.0, 1.0)                  # [N, M]
         else:
             tfrac_m = torch.zeros_like(self.travel_px)
         # Per-agent bucket code for offline diagnostics (the metrics above are means over N and M,
@@ -1427,6 +1471,84 @@ class Explorer:
 
         return comm_mask
 
+    @torch.no_grad()
+    def _attribute_ir2_parity(self, free_node_pre: torch.Tensor, union_prev: torch.Tensor,
+                              done: torch.Tensor) -> None:
+        """Re-credit this step's discoveries under IR2's accounting, in two separable arms.
+
+        `free_node_pre` [N, M, N_max] is each agent's OWN free-node mask this step, pre-fusion —
+        the same quantity IR2 reads as all_robot_belief[id][id] == 255. `union_prev` is our shared
+        previous-step union, used only to seed nothing: both arms carry their own running union so
+        the two rules cannot contaminate each other or our headline number.
+
+        ARM `seq`: strictly IR2's claim rule at OUR cadence — loop the agents in index order and
+        fold each into the running union BEFORE measuring the next, so a cell scanned by two
+        agents in the same step goes to the LOWER index only. Isolates "one claimant vs many".
+
+        ARM `ir2`: the same claim rule, but an agent is only measured once it has travelled
+        `attr_stride_px` since its last measurement — IR2 senses at hop endpoints, so its credit
+        arrives one graph edge at a time rather than one lattice hop at a time. Isolates
+        "coarse vs fine crediting". Every agent of a finishing episode is flushed on its done step,
+        because IR2 credits its final step too and dropping the tail would bias whoever happened
+        to be mid-stride.
+
+        Both arms are pure measurement: nothing here feeds a reward, an observation or a
+        termination test.
+        """
+        M = self.M
+        stride = self.attr_stride_px
+        if stride is None:
+            stride = torch.full((self.N,), float(self.graph.NR), device=self.dev)
+        trig = (self.travel_px - self._attr_last_px) >= stride.unsqueeze(1)          # [N, M]
+        trig = trig | done.unsqueeze(1)
+        for m in range(M):
+            own = free_node_pre[:, m]                                                # [N, N_max]
+            # --- seq: every step, single claimant, index order
+            self.novel_cells_seq_ep[:, m] += (own & ~self._seq_union).sum(-1).float()
+            self._seq_union |= own
+            # --- ir2: same, but gated on the agent's own stride
+            t = trig[:, m]
+            self.novel_cells_ir2_ep[:, m] += ((own & ~self._attr_union).sum(-1).float()
+                                              * t.float())
+            self._attr_union |= own & t.unsqueeze(-1)
+            self._attr_last_px[:, m] = torch.where(t, self.travel_px[:, m],
+                                                   self._attr_last_px[:, m])
+        _ = union_prev          # kept in the signature: the arms deliberately do NOT read it
+
+    @torch.no_grad()
+    def _branch_overlap(self, label: torch.Tensor, mass: torch.Tensor) -> torch.Tensor:
+        """[N, M, M, K, K] shared discounted-frontier mass between agent i's exit k and j's exit l.
+
+        `label` [B, N_max] is the first-step branch each lattice node hangs off in the agent's own
+        BF tree and `mass` [B, N_max] is gamma_vf^hops * utility there (both from
+        graph.value_field(..., return_branch=True)). Scattering mass onto the branch axis gives
+        w[n, m, k, v] = the discounted frontier mass exit k of agent m leads to at NODE v; the
+        node axis is the LATTICE index, which every agent shares, so
+
+            O[n, i, j, k, l] = sum_v w[n, i, k, v] * w[n, j, l, v]
+
+        is "if i goes k and j goes l, how much of the same ground are they going for".
+
+        Each agent is normalised to unit total mass FIRST, so O is scale-free: an agent standing in
+        a utility-rich region does not dominate the term simply by having more mass, and the value
+        is comparable across steps, maps and M. An agent whose reachable utility is zero (the
+        `desert` case value_field already signals) contributes exactly 0 rather than a NaN.
+
+        Cost at N=32, M=4, K=8, N_max=961: a [32, 32, 961] x [32, 961, 32] batched matmul, ~2 GFLOP
+        per env-step, and a transient [N, M, K, N_max] of 3.9 MB. Kept under no_grad: the tensor is
+        a fixed property of the state, and the loss differentiates only through the policies.
+        """
+        N, M, K, V = self.N, self.M, self.K, self.N_max
+        lab = label.view(N, M, V)
+        m = mass.view(N, M, V).clamp(min=0.0)
+        m = m / m.sum(dim=-1, keepdim=True).clamp(min=1e-6)                 # per-agent unit mass
+        w = torch.zeros((N, M, K, V), dtype=m.dtype, device=m.device)
+        w.scatter_(2, lab.clamp(min=0).unsqueeze(2), m.unsqueeze(2))
+        # scatter_ wrote every branch row for unreachable nodes (label -1 -> row 0); zero them.
+        w = w * (lab >= 0).unsqueeze(2)
+        wf = w.reshape(N, M * K, V)
+        return torch.bmm(wf, wf.transpose(1, 2)).view(N, M, K, M, K).permute(0, 1, 3, 2, 4)
+
     def _comm_closure(self, comm_mask: torch.Tensor) -> torch.Tensor:
         """Transitive closure of the comm graph → [N, M, M] bool, True at (n,i,j) iff i and j are
         in the same connected component ("flock" in IR2, env.py:424-446 — a recursive DFS there,
@@ -1599,6 +1721,62 @@ class Explorer:
             out[i] = node_xy[flat]
         return out
 
+    def _snap_to_lattice(self, pts_xy, env_idx: int) -> torch.Tensor:
+        """Map M arbitrary (x, y) pixel positions onto the nearest FREE lattice nodes → [M, 2].
+
+        Used to pin MARLauder's agents to IR2's actual start positions (PROTOCOL_V2_DISTANZA.md
+        §6.2). The two systems discretise space differently — IR2 puts robot i on the i-th node of
+        its own k-NN graph, we move on a fixed lattice — so NO pixel is a valid node in both. This
+        gets as close as the discretisation allows; the residual offset is recorded in
+        `last_start_offset_px` and REPORTED rather than assumed away.
+
+        Distinct nodes are enforced: two IR2 robots can be closer together than one lattice cell,
+        and collapsing them onto the same node would spawn co-located agents — the degenerate case
+        `_spawn_degenerate` exists to reject, which stalls both at step 0.
+        """
+        dev = self.dev
+        gt = self.world.gt_torch[env_idx]                                # [H, W]
+        node_xy = self.graph.node_xy                                     # [N_max, 2] as (x, y)
+        nx = node_xy[:, 0].long().clamp(0, self.W - 1)
+        ny = node_xy[:, 1].long().clamp(0, self.H - 1)
+        node_free = gt[ny, nx] == GT_FREE                                # [N_max]
+        pts = torch.as_tensor(pts_xy, dtype=torch.float32, device=dev).view(-1, 2)
+        out = torch.zeros(self.M, 2, dtype=torch.float32, device=dev)
+        off = torch.zeros(self.M, dtype=torch.float32, device=dev)
+        taken: list[int] = []
+        for i in range(self.M):
+            d = (node_xy - pts[i].unsqueeze(0)).norm(dim=-1)
+            d = torch.where(node_free, d, torch.full_like(d, float("inf")))
+            for t in taken:
+                d[t] = float("inf")
+            j = int(d.argmin().item())
+            taken.append(j)
+            out[i] = node_xy[j]
+            off[i] = d[j]
+        self.last_start_offset_px = off
+        return out
+
+    def budget_px(self) -> torch.Tensor | None:
+        """Per-env travel budget in px, [N], or None when the episode is capped by steps alone.
+
+        ONE definition, consumed by all four places that used to re-derive it independently:
+        the truncation test, the actor's `travel_frac` observation, the comm-idle penalty ramp,
+        and the idle-bucket metric. They must agree — a policy whose observed budget disagrees
+        with the budget that actually truncates it is being evaluated off-distribution, and under
+        `rdv_urgency_mode="budget"` the rendezvous pull is driven by exactly that observation.
+
+        Precedence: explicit per-env override > max_travel_frac (per-map, training) > max_travel_px
+        (flat). Unchanged from the previous inline logic apart from the override.
+        """
+        if self.travel_budget_px is not None:
+            return self.travel_budget_px
+        if self.cfg.max_travel_frac > 0.0:
+            return (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0)
+        if self.cfg.max_travel_px > 0.0:
+            return torch.full((self.N,), max(1.0, float(self.cfg.max_travel_px)),
+                              dtype=torch.float32, device=self.dev)
+        return None
+
     def _spawn_degenerate(self, agent_pos: torch.Tensor) -> bool:
         """True if any two of the M start positions are co-located (< nr·0.5 apart) —
         i.e. `_spread_starts_graph` fell back to the anchor for lack of adjacent FREE nodes."""
@@ -1611,7 +1789,7 @@ class Explorer:
     def _reset_all(self) -> None:
         self._reset_envs(list(range(self.N)))
 
-    def reload_map(self, env_idx: int, map_idx: int) -> None:
+    def reload_map(self, env_idx: int, map_idx: int, start_override=None) -> None:
         """G.1 — load specific map into env slot `env_idx` and do a FULL reset.
 
         Used by eval scripts so all stale state (BF cache, comm timers, rendezvous φ cache,
@@ -1656,9 +1834,13 @@ class Explorer:
         self.last_action[idx_t]                       = -1
         self._collision_key[idx_t]                    = torch.rand((1, self.M), device=self.dev)
         self._resample_ss_noise(idx_t)
-        # Place agents using new map's start.
-        row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
-        agent_pos = self._spread_starts_graph(row0, col0, env_idx=env_idx)
+        # Place agents using new map's start, or pin them to externally supplied positions.
+        if start_override is not None:
+            # comparison v2 §6.2 — IR2's own per-robot start positions, snapped to our lattice.
+            agent_pos = self._snap_to_lattice(start_override, env_idx)
+        else:
+            row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
+            agent_pos = self._spread_starts_graph(row0, col0, env_idx=env_idx)
         self.pos[env_idx] = agent_pos
         for ag in range(self.M):
             self.last_known_pos[env_idx, :, ag] = agent_pos[ag]
@@ -1673,6 +1855,11 @@ class Explorer:
         self.own_node_mask_prev[idx_t] = free_node
         self.union_node_mask[idx_t]    = free_node.any(dim=1)
         self.novel_cells_ep[idx_t]     = 0.0
+        self.novel_cells_seq_ep[idx_t] = 0.0
+        self.novel_cells_ir2_ep[idx_t] = 0.0
+        self._seq_union[idx_t]         = False
+        self._attr_union[idx_t]        = False
+        self._attr_last_px[idx_t]      = 0.0
         self._rdv_phi_prev[idx_t]      = float("inf")
         self._stall_streak[idx_t]      = 0.0
         self._revisit_streak[idx_t]    = 0.0
@@ -1779,6 +1966,11 @@ class Explorer:
         self.own_node_mask_prev[idx_t] = free_node_reset
         self.union_node_mask[idx_t]    = free_node_reset.any(dim=1)
         self.novel_cells_ep[idx_t]     = 0.0
+        self.novel_cells_seq_ep[idx_t] = 0.0
+        self.novel_cells_ir2_ep[idx_t] = 0.0
+        self._seq_union[idx_t]         = False
+        self._attr_union[idx_t]        = False
+        self._attr_last_px[idx_t]      = 0.0
         self._rdv_phi_prev[idx_t]      = float("inf")
         self._stall_streak[idx_t]      = 0.0
         self._revisit_streak[idx_t]    = 0.0
@@ -1966,8 +2158,15 @@ class Explorer:
         # "was the target the agent walked 400 px to actually worth more than the one it left
         # behind" — the destination is outside the window by construction.
         self._utility_global = info["utility"].view(self.N, self.M, self.N_max)
+        # (re)set every refresh; see EnvCfg.div_overlap
         # ---- VALUE-FIELD [B, K]: discounted utility mass per first-step branch (see EnvCfg.vf_gamma).
-        vf = self.graph.value_field(info, gamma_vf=float(self.cfg.vf_gamma))
+        if self.cfg.div_overlap and self.M > 1:
+            vf, _vf_label, _vf_mass = self.graph.value_field(
+                info, gamma_vf=float(self.cfg.vf_gamma), return_branch=True)
+            self._div_ov = self._branch_overlap(_vf_label, _vf_mass)          # [N, M, M, K, K]
+        else:
+            vf = self.graph.value_field(info, gamma_vf=float(self.cfg.vf_gamma))
+            self._div_ov = None
         self._vf = vf.view(self.N, self.M, self.K)
         # ---- TEAMMATE BELIEF FILTER (Pass 1.5): advance the graph-native Bayesian estimate of
         # each teammate's node, then DERIVE feat[4] (potential) and the radar teammate_src from it.
@@ -2392,11 +2591,9 @@ class Explorer:
         # going straight" was. max() of the two ratios = progress toward whichever binds FIRST, so
         # this stays the honest signal under either criterion alone or both together.
         t_ratio = (self.t.float() / T_max).clamp(0.0, 1.0).view(self.N, 1).expand(self.N, self.M)
-        if self.cfg.max_travel_frac > 0.0:
-            budget_px = (self.cfg.max_travel_frac * self.free_total).clamp(min=1.0).unsqueeze(1)      # [N, 1]
-            travel_frac = (self.travel_px / budget_px).clamp(0.0, 1.0).maximum(t_ratio)               # [N, M]
-        elif self.cfg.max_travel_px > 0.0:
-            travel_frac = (self.travel_px / max(1.0, float(self.cfg.max_travel_px))).clamp(0.0, 1.0).maximum(t_ratio)
+        _budget_obs = self.budget_px()
+        if _budget_obs is not None:
+            travel_frac = (self.travel_px / _budget_obs.unsqueeze(1)).clamp(0.0, 1.0).maximum(t_ratio)
         else:
             travel_frac = t_ratio                                                                     # step cap only
         # ---- RENDEZVOUS RAW OBS + gate (per-agent scalars, execution-decentralized). Given to the
@@ -2536,6 +2733,12 @@ class Explorer:
             # Value-field: per-first-step discounted utility mass, max-normalized (actor input).
             "value_field":          self._vf,                      # [N, M, K] float ∈[0,1]
         }
+        # CTDE, TRAINING ONLY. Absent from the dict entirely when cfg.div_overlap is False, so the
+        # rollout buffer never allocates it, the update never looks for it, and every checkpoint
+        # made before this existed replays byte-identical. Privileged by construction: it is built
+        # from every agent's BF tree at once, which no single agent can see.
+        if self._div_ov is not None:
+            self._last_obs["div_overlap"] = self._div_ov           # [N, M, M, K, K]
 
     def _prev_action_onehot(self) -> torch.Tensor:
         """One-hot [N, M, K=8] of last_action. Zero everywhere when last_action == -1."""

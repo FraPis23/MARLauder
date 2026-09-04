@@ -38,6 +38,18 @@ class MAPPOCfg:
     # than the paper's benchmarks — intra-episode obs shift + dense evolving shaping → smaller
     # policy drift per update is safer). k_epochs stays low (4) for the same reason.
     clip_eps: float = 0.15
+    # ---- FRONTIER-DIVERSITY auxiliary loss. Weight on
+    #   E_{k~pi_i, l~pi_j} [ shared discounted frontier mass down i's exit k and j's exit l ]
+    # averaged over ordered agent pairs, using obs["div_overlap"] built by the env
+    # (EnvCfg.div_overlap — turn BOTH on or this is silently inert).
+    # It is an ACTOR loss, not a reward: the return, the advantage and the critic target are
+    # untouched, which is what v18 got wrong when it moved the reward budget at M=4.
+    # It is over FRONTIER mass, not action indices: two agents 300 px apart share no action index,
+    # which is why the v17/J.1/J.2 local-logit port was identically zero exactly when the
+    # duplication was being decided. The term is also self-extinguishing — when the reachable
+    # frontier sets are disjoint the overlap is 0 and the gradient vanishes, so it stops pushing
+    # once the team has actually split.
+    div_weight: float = 0.0
     ent_coef: float = 0.01
     # Once per iteration, backprop the policy-gradient term and the entropy bonus SEPARATELY and
     # log ||grad|| of each. Comparing the two loss VALUES is not enough to claim one dominates:
@@ -130,6 +142,7 @@ def ppo_update(
     mb_size = N // n_mb
 
     stats = {"pg_loss": 0.0, "v_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clipfrac": 0.0,
+             "div_loss": 0.0,
              "updates": 0, "nan_skips": 0}
     diag_done = False        # cfg.diag_grad: measure the two gradient norms once per iteration
 
@@ -166,7 +179,10 @@ def ppo_update(
                         nbr_embs_chunk = None
 
                     chunk_pg = 0.0; chunk_vl = 0.0; chunk_ent = 0.0
-                    chunk_clip = 0.0; chunk_kl = 0.0
+                    chunk_clip = 0.0; chunk_kl = 0.0; chunk_div = 0.0
+                    div_on = cfg.div_weight > 0.0 and "div_overlap" in chunk_obs and M > 1
+                    if div_on:
+                        _pair_off = ~torch.eye(M, dtype=torch.bool, device=device)
                     last_h_act = h_act
                     last_h_crit = h_crit
                     for tt in range(chunk_len):
@@ -214,6 +230,14 @@ def ppo_update(
                             huber_delta=cfg.huber_delta,
                         )
                         ent = new_ent.mean()
+                        if div_on:
+                            # ov[n,i,j] = sum_{k,l} pi_i(k) O[n,i,j,k,l] pi_j(l): the mass agents i
+                            # and j are both heading for, under their CURRENT policies. O carries no
+                            # gradient (it is a property of the state); both policies do.
+                            p_t = ev["probs"].to(torch.float32)                 # [Nmb, M, K]
+                            O_t = chunk_obs["div_overlap"][tt].to(torch.float32)
+                            ov = torch.einsum("nik,nijkl,njl->nij", p_t, O_t, p_t)
+                            chunk_div = chunk_div + ov[:, _pair_off].mean()
                         chunk_pg = chunk_pg + pg
                         chunk_vl = chunk_vl + vl
                         chunk_ent = chunk_ent + ent
@@ -227,6 +251,9 @@ def ppo_update(
                     chunk_kl /= chunk_len
 
                     actor_loss = chunk_pg - cfg.ent_coef * chunk_ent
+                    if div_on:
+                        chunk_div = chunk_div / chunk_len
+                        actor_loss = actor_loss + cfg.div_weight * chunk_div
                     if cfg.diag_grad and not diag_done:
                         # Separate backward for each actor-loss term. retain_graph keeps the graph
                         # alive for the real optimizer step below, so this only costs compute.
@@ -273,6 +300,8 @@ def ppo_update(
                     stats["nan_skips"] += 1
 
                 stats["pg_loss"] += float(chunk_pg.detach().item())
+                if div_on:
+                    stats["div_loss"] += float(chunk_div.detach().item())
                 stats["v_loss"] += float(chunk_vl.detach().item())
                 stats["entropy"] += float(chunk_ent.detach().item())
                 stats["kl"] += float(chunk_kl.detach().item())
@@ -283,7 +312,7 @@ def ppo_update(
                 h_crit = last_h_crit.detach()
 
     n = max(1, stats["updates"])
-    for k in ("pg_loss", "v_loss", "entropy", "kl", "clipfrac"):
+    for k in ("pg_loss", "v_loss", "entropy", "kl", "clipfrac", "div_loss"):
         stats[k] /= n
     # Computed once per rollout, before any gradient step — not an average over minibatches.
     stats["explained_var"] = explained_var

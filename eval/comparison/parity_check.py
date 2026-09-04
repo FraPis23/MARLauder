@@ -15,6 +15,8 @@ Exit code 0 = parity OK; non-zero = mismatch (comparison must NOT proceed).
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +25,8 @@ import imageio.v2 as imageio
 
 MARL_DATA = Path("/workspace/MARLauder/data")
 IR2_MAPS = Path("/workspace/IR2-Multi-Robot-RL-Exploration/DungeonMaps")
+IR2_COMPARISON_MAPS = Path("/workspace/IR2-Multi-Robot-RL-Exploration/comparison")
+_COMPARISON_DIR = Path(__file__).resolve().parent
 
 SPLITS = ["test/complex", "test/corridor", "test/hybrid", "train/easy", "train/difficult"]
 FREE_THRESHOLD = 150
@@ -83,11 +87,47 @@ def check_split(split: str, n_samples: int) -> list[str]:
     return errors
 
 
+def check_order(split: str) -> list[str]:
+    """map_indices_{split}.json must list maps in the order IR2 actually runs them.
+
+    THE GATE THIS FILE EXISTED WITHOUT UNTIL 2026-08-20. Verifying that the two systems see the
+    same MAPS is not enough — the comparison is PAIRED, so it also needs row i of the two CSVs to
+    be the same map, and that depends on the ORDER of IR2's map list:
+
+        self.map_list = os.listdir(self.map_dir)
+        self.map_list.sort(reverse=True)            # IR2 env.py:34-35
+        self.file_path = self.map_list[map_index]   # map_index == episode
+
+    The json was ASCENDING while IR2 iterates DESCENDING, so episode 0 was 99.png on their side and
+    1.png on ours. Per-cell means survived that (same 100 maps, different order); every paired
+    statistic did not. See ir2_comparison_export/PROTOCOL_V2_DISTANZA.md §9-bis.
+    """
+    idx_file = _COMPARISON_DIR / f"map_indices_{split.split('/')[-1]}.json"
+    map_dir = IR2_COMPARISON_MAPS / f"maps_{split.split('/')[-1]}"
+    if not idx_file.exists() or not map_dir.exists():
+        return []
+    entries = json.loads(idx_file.read_text())["entries"]
+    want = sorted(os.listdir(map_dir), reverse=True)          # exactly IR2 env.py:34-35
+    got = [e["file"] for e in entries]
+    if got == want:
+        print(f"[{split}] ordine mappe == ordine IR2 (discendente): OK")
+        return []
+    first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), 0)
+    hint = ""
+    if got == sorted(want):
+        hint = ("  <-- il json e' in ordine ASCENDENTE; IR2 usa sort(reverse=True). "
+                "Questo e' esattamente il bug del 2026-08-20.")
+    return [f"{split}: ordine mappe DIVERSO da IR2. Prima differenza a eps {first}: "
+            f"json={got[first]} vs IR2={want[first]}.{hint}"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-per-split", type=int, default=3)
     args = ap.parse_args()
     all_err: list[str] = []
+    for split in ("test/hybrid", "test/corridor", "test/complex"):
+        all_err += check_order(split)
     for split in SPLITS:
         if not (MARL_DATA / split / "maps.npy").exists():
             print(f"[{split}] SKIP (pack assente)")

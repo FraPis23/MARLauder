@@ -197,6 +197,8 @@ def main() -> None:
             rdv_clamp_pos=args.rdv_clamp_pos,
             rdv_urgency_T=args.rdv_urgency_T,
             comm_idle_pen=args.comm_idle_pen,
+            # The env only pays for the overlap tensor when the loss will actually consume it.
+            div_overlap=(args.div_weight > 0.0),
             rdv_urgency_mode=args.rdv_urgency_mode,
             rdv_urgency_start=args.rdv_urgency_start,
             completion_bonus=args.completion_bonus,
@@ -234,6 +236,7 @@ def main() -> None:
             vf_coef=args.vf_coef,
             tbptt_steps=args.tbptt_steps,
             diag_grad=args.diag_grad,
+            div_weight=args.div_weight,
         ),
     )
     train(cfg, log_every=1,

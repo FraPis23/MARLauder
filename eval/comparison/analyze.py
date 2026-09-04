@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import numpy as np
@@ -51,15 +52,59 @@ def _read(path: Path) -> dict[str, np.ndarray]:
     return out
 
 
+def _wilcoxon_numpy(d: np.ndarray) -> float:
+    """Two-sided Wilcoxon signed-rank p-value on the paired differences, without scipy.
+
+    The container this runs in is ephemeral and scipy is not part of the image, so relying on the
+    import meant every p-value in the table printed "scipy missing" — and the paired test is not
+    optional, it is what the frozen protocol asks for (PROTOCOL.md: "Wilcoxon signed-rank APPAIATO
+    per mappa"). This reproduces scipy.stats.wilcoxon's default path for our n: zero differences
+    dropped ("wilcox" handling), average ranks on |d|, tie-corrected normal approximation, and NO
+    continuity correction — scipy's mode="auto" already switches to the same normal approximation
+    above n=25 and correction defaults to False, so with n=100 maps the two agree to ~1e-12.
+
+    The tie correction matters here rather than being a formality: `success` and `connectivity` are
+    booleans, so their differences are all in {-1, 0, +1} and |d| is one enormous tie group. Without
+    the sum(t^3-t)/48 term sigma is overstated and every boolean p-value comes out too large — i.e.
+    the direction that silently hides a real effect.
+    """
+    n = d.size
+    if n == 0:
+        return float("nan")
+    absd = np.abs(d)
+    order = np.argsort(absd, kind="mergesort")
+    ranks = np.empty(n, dtype=float)
+    i = 0
+    tie_term = 0.0
+    while i < n:
+        j = i
+        while j + 1 < n and absd[order[j + 1]] == absd[order[i]]:
+            j += 1
+        avg = 0.5 * (i + j) + 1.0                      # average of ranks i+1..j+1
+        ranks[order[i:j + 1]] = avg
+        t = j - i + 1
+        if t > 1:
+            tie_term += t ** 3 - t
+        i = j + 1
+    w_plus = ranks[d > 0].sum()
+    mu = n * (n + 1) / 4.0
+    var = n * (n + 1) * (2 * n + 1) / 24.0 - tie_term / 48.0
+    if var <= 0:
+        return float("nan")
+    z = (w_plus - mu) / math.sqrt(var)
+    return float(math.erfc(abs(z) / math.sqrt(2.0)))   # two-sided
+
+
 def _wilcoxon(a: np.ndarray, b: np.ndarray) -> tuple[float, str]:
     """Paired signed-rank on a−b. Returns (p, note); note flags why a test could not run."""
     d = a - b
     if np.all(d == 0):
         return float("nan"), "identical"
+    d = d[d != 0]
     try:
         from scipy.stats import wilcoxon
     except ImportError:
-        return float("nan"), "scipy missing"
+        return _wilcoxon_numpy(d), ""
     return float(wilcoxon(a, b).pvalue), ""
 
 
@@ -103,7 +148,19 @@ def main() -> None:
             print(f"\n[{cell}]  n={n}")
             print(f"  {'metric':<16}{'IR2':>22}{'MARLauder':>22}{'Δ (MARL−IR2)':>16}{'Wilcoxon p':>14}")
             for key, prec in (("max_dist", 0), ("steps", 1), ("explored", 3),
-                              ("success", 2), ("connectivity", 2)):
+                              ("success", 2), ("connectivity", 2),
+                              # --- PROTOCOL v2 behaviour columns. Same formula on both sides
+                              # (PROTOCOL_V2_DISTANZA.md §7.2), so these ARE cross-system
+                              # comparable — unlike `steps`. They exist because `success` cannot
+                              # tell coordinated exploration (split up, then deliberately meet to
+                              # exchange) from the degenerate solution (never separate, so the two
+                              # maps coincide for free and no rendezvous is ever needed); the
+                              # degenerate one scores a perfect `success` while demonstrating none
+                              # of the coordination the thesis claims.
+                              ("contrib_imbalance", 3), ("own_gap_final", 3),
+                              ("comm_duty", 3), ("sensing_overlap", 3),
+                              ("pair_dist_mean_px", 1), ("pair_dist_max_px", 1),
+                              ("n_contacts", 1)):
                 if key not in mar:
                     continue
                 a, b = mar[key][:n], ir2[key][:n]

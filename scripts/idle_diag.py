@@ -35,6 +35,8 @@ the auto-reset never mixes two episodes into one bucket.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -44,10 +46,15 @@ if str(_REPO) not in sys.path:
 
 import torch  # noqa: E402
 
+import numpy as np  # noqa: E402
+
 from env.explorer import EnvCfg, Explorer  # noqa: E402
 from env.frontier import compute_frontier  # noqa: E402
 from env.maps import load_split  # noqa: E402
 from eval.ckpt_loader import load_model_from_ckpt  # noqa: E402
+# The v2 protocol loader lives with the generator that froze it; importing rather than copying it
+# keeps ONE definition of "IR2's budget on map k" and of the CSV/starts pairing rules.
+from scripts.eval_comparison import _load_ir2_reference  # noqa: E402
 
 # info["idle_bucket"] codes (env/explorer.py::_compute_metrics).
 PRODUCTIVE, REDUNDANT, TRANSIT = 0, 1, 2
@@ -118,6 +125,30 @@ class Acc:
         # progress-toward-the-nearest-frontier above, and both are directly comparable across M.
         self.run_steps: list[torch.Tensor] = []
         self.run_straight: list[torch.Tensor] = []
+        # ---- CONTRIBUTION RANK. contrib_imbalance is Sigma_i |share_i - 1/M| over union-new cells,
+        # and it is a per-EPISODE quantity, so a per-step bucket mean cannot explain it: `by_agent`
+        # above is keyed by SLOT, and a slot is not a role — the agent that carries the episode is
+        # a different index on every map, so averaging by slot washes the effect out. Ranking the
+        # agents WITHIN each episode by their own share and then averaging by RANK keeps it.
+        # rank 0 = the episode's top contributor, rank M-1 = its lowest.
+        self.rank_n = z()          # scalar: episodes closed (rank bins share it)
+        self.rank_share = z(M)
+        self.rank_bucket = z(M, 3)
+        self.rank_steps = z(M)
+        self.imb_sum = z()
+        self.ep_n = z()
+        # Episode headline, so this script can be gated against the comparison CSVs it is meant
+        # to explain: if max_dist and steps do not land on the CSV, it is running other episodes.
+        self.ep_dist = z()
+        self.ep_steps = z()
+        self.ep_bound = z()
+        # Per-rank RADIO and DELIVERY, to tell a relay apart from a straggler: a relay should sit
+        # in contact MORE than the agents it serves, and both roles must still end with the map.
+        self.rank_contact = z(M)
+        self.rank_owncov = z(M)
+        # Paid syncs per rank. `contact` says two radios could hear each other; `sync_paid` is the
+        # rising edge that actually DELIVERED map. A courier shows up here, a passenger does not.
+        self.rank_sync = z(M)
         # WAS THE LONG WALK NECESSARY, OR CHOSEN? Two explanations for the M=4 relocation tail have
         # opposite fixes, so they must be told apart before anything is trained:
         #   FORCED  d0 (distance to the agent's own nearest frontier at the moment the run STARTS)
@@ -143,7 +174,8 @@ class Acc:
 
 
 @torch.no_grad()
-def run(model, env: Explorer, cfg_steps: int, n_q: int, acc: Acc) -> int:
+def run(model, env: Explorer, cfg_steps: int, n_q: int, acc: Acc,
+        autocast: bool = True) -> int:
     """One batch of episodes (all N envs already loaded with their maps). Returns steps run."""
     dev = env.dev
     N, M, B = env.N, env.M, env.N * env.M
@@ -160,12 +192,21 @@ def run(model, env: Explorer, cfg_steps: int, n_q: int, acc: Acc) -> int:
     run_un = torch.zeros((N, M), device=dev)
     run_ub = torch.zeros((N, M), device=dev)
     run_db = torch.full((N, M), float("inf"), device=dev)
+    # Per-episode, per-agent bucket tally, closed at the agent's own done step (see acc.rank_*).
+    ep_bucket = torch.zeros((N, M, 3), dtype=torch.float64, device=dev)
+    ep_contact = torch.zeros((N, M), dtype=torch.float64, device=dev)
+    ep_sync = torch.zeros((N, M), dtype=torch.float64, device=dev)
     # Half-width of the actor's ego window in pixels: the node features stop here, and anything
     # further is only visible through the coarse radar channel.
     win_px = float(env.cfg.n_hops * env.graph.NR)
     t = 0
     for t in range(cfg_steps):
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=str(dev).startswith("cuda")):
+        # eval_comparison runs the actor in FULL precision. Under --ir2-dir this script has to
+        # reproduce those exact episodes, and bf16 autocast changes the argmax on near-ties often
+        # enough to move the trajectory (measured: 73.2 vs 78.0 steps/episode on the same 8 maps),
+        # which would diagnose a policy the CSVs never ran.
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                enabled=autocast and str(dev).startswith("cuda")):
             out = model.act(obs, h_act, h_crit, deterministic=True)
         h_act, h_crit = out["hidden_actor"], out["hidden_critic"]
 
@@ -230,20 +271,25 @@ def run(model, env: Explorer, cfg_steps: int, n_q: int, acc: Acc) -> int:
         onehot = onehot * w.unsqueeze(-1)
         acc.bucket += onehot.sum((0, 1))
         acc.by_agent += onehot.sum(0)
+        ep_bucket += onehot
 
         stalled = (flags & 1) > 0
         revisit = (flags & 2) > 0
         contact = ((flags & 4) > 0).long()                                          # [N, M]
+        ep_contact += (contact == 1).to(torch.float64) * w
+        if "sync_paid" in info:
+            ep_sync += info["sync_paid"].to(torch.float64) * w
         for c in (0, 1):
             acc.by_contact[c] += (onehot * (contact == c).unsqueeze(-1)).sum((0, 1))
 
         # Budget quartile — travel_frac is what actually truncates the episode. Falls back to the
         # step fraction when no travel budget is configured (then travel_frac is identically 0).
-        if env.cfg.max_travel_frac > 0.0:
-            bud = (env.cfg.max_travel_frac * env.free_total).clamp(min=1.0).unsqueeze(1)
-            frac = (info["travel_px"] / bud).clamp(0.0, 1.0)                        # [N, M]
-        elif env.cfg.max_travel_px > 0.0:
-            frac = (info["travel_px"] / max(1.0, float(env.cfg.max_travel_px))).clamp(0.0, 1.0)
+        # budget_px() is the SINGLE source of truth the env itself truncates on and feeds to the
+        # actor as travel_frac; re-deriving it here from cfg would silently ignore an explicit
+        # per-map budget (protocol v2 sets env.travel_budget_px, which no cfg field records).
+        bud_v = env.budget_px()
+        if bud_v is not None:
+            frac = (info["travel_px"] / bud_v.unsqueeze(1).clamp(min=1.0)).clamp(0.0, 1.0)
         else:
             frac = torch.full((N, M), t / max(1, cfg_steps), device=dev)
         q = (frac * n_q).long().clamp(0, n_q - 1)                                   # [N, M]
@@ -317,6 +363,39 @@ def run(model, env: Explorer, cfg_steps: int, n_q: int, acc: Acc) -> int:
         # episode boundary, so carry `alive` into the transit mask itself.
         prev = (d_front, disp, live)
 
+        # ---- close the finished episodes and bin their agents by contribution rank.
+        # info is pre-auto-reset (explorer.py), so novel_cells_ep here is the episode's final
+        # attribution, the same tensor eval_comparison turns into contrib_imbalance.
+        newly = alive & done
+        if bool(newly.any()):
+            nov = info["novel_cells_ep"].to(torch.float64)                          # [N, M]
+            share = nov / nov.sum(-1, keepdim=True).clamp(min=1.0)                  # [N, M]
+            idx = share.argsort(dim=-1, descending=True)                            # rank -> slot
+            sel = newly.nonzero(as_tuple=True)[0]
+            sh_r = share[sel].gather(1, idx[sel])                                   # [n, M] by rank
+            bk_r = ep_bucket[sel].gather(1, idx[sel].unsqueeze(-1).expand(-1, -1, 3))
+            ct_r = ep_contact[sel].gather(1, idx[sel])
+            oc_r = info["own_cov"].to(torch.float64)[sel].gather(1, idx[sel])
+            acc.rank_contact += ct_r.sum(0)
+            acc.rank_owncov += oc_r.sum(0)
+            acc.rank_sync += ep_sync[sel].gather(1, idx[sel]).sum(0)
+            acc.rank_n += float(sel.numel())
+            acc.rank_share += sh_r.sum(0)
+            acc.rank_bucket += bk_r.sum(0)
+            acc.rank_steps += bk_r.sum(-1).sum(0)
+            tp = info["travel_px"].to(torch.float64)[sel]                           # [n, M]
+            acc.ep_dist += tp.amax(-1).sum()
+            acc.ep_steps += bk_r.sum(-1).sum()
+            bud_e = env.budget_px()
+            if bud_e is not None:
+                acc.ep_bound += (tp.amax(-1) >= bud_e.to(torch.float64)[sel] - 22.63).sum()
+            if M > 1:
+                acc.imb_sum += (share[sel] - 1.0 / M).abs().sum(-1).sum()
+                acc.ep_n += float(sel.numel())
+        ep_bucket = torch.where(done.view(N, 1, 1), torch.zeros_like(ep_bucket), ep_bucket)
+        ep_contact = torch.where(done.view(N, 1), torch.zeros_like(ep_contact), ep_contact)
+        ep_sync = torch.where(done.view(N, 1), torch.zeros_like(ep_sync), ep_sync)
+
         alive = alive & ~done
         if not bool(alive.any()):
             break
@@ -345,6 +424,16 @@ def main() -> None:
                     help="force multi-hop relay ON (a pre-v20 ckpt carries comm_relay=False)")
     ap.add_argument("--no-comm-relay", dest="comm_relay", action="store_false")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ir2-dir", type=Path, default=None,
+                    help="PROTOCOL v2 conditions: run on the 100 comparison maps of --split, "
+                         "pinned to IR2's start positions and to IR2's OWN per-map distance as the "
+                         "budget. Use it when the question is about numbers produced by "
+                         "eval_comparison --ir2-dir; the budget drives travel_frac, travel_frac "
+                         "drives the rendezvous urgency, and urgency is what pulls the agents "
+                         "together — diagnosing under a different budget diagnoses a different "
+                         "policy. --split must then be one of hybrid/corridor/complex.")
+    ap.add_argument("--noise-seed", type=int, default=777,
+                    help="radio-shadowing stream; 777 is what the comparison CSVs were made with")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     assert args.n_envs > 1, "run with N>1: a batch-dim bug in the env is invisible at P=1"
@@ -357,6 +446,26 @@ def main() -> None:
     overrides = dict(n_envs=args.n_envs, n_agents=args.n_agents, map_seed=args.seed)
     if args.comm_relay is not None:
         overrides["comm_relay"] = bool(args.comm_relay)
+    v2_budgets = v2_starts = v2_maps = None
+    if args.ir2_dir is not None:
+        cmp_split = args.split.split("/")[-1]
+        idx_f = _REPO / "eval" / "comparison" / f"map_indices_{cmp_split}.json"
+        if not idx_f.is_file():
+            sys.exit(f"[idle_diag] --ir2-dir needs {idx_f}; --split must be hybrid/corridor/complex")
+        v2_maps = [int(e["pack_idx"]) for e in json.loads(idx_f.read_text())["entries"]]
+        v2_budgets, v2_starts = _load_ir2_reference(args.ir2_dir, cmp_split, args.n_agents,
+                                                    len(v2_maps))
+        # Same trap eval_comparison documents: from_ckpt_dict keeps every valid field found in the
+        # checkpoint, so the TRAINING budget (v20: max_travel_frac=0.03) comes back and wins over
+        # the explicit per-map budget at the truncation site. Must be zeroed.
+        overrides["max_travel_frac"] = 0.0
+        overrides["max_travel_px"] = 0.0
+        # max_episode_steps is NOT only a cap: explorer.py normalises the episode-time observation
+        # by it (T_max), so leaving the checkpoint's 768 here while eval_comparison ran the cell at
+        # its own safety-net cap feeds the actor a different clock and produces different
+        # trajectories. Measured on hybrid_M4: 72.1 steps / 1408 px against the CSV's 74.5 / 1456.
+        # Formula copied from eval_comparison (max over the WHOLE cell, not the chunk).
+        overrides["max_episode_steps"] = int(math.ceil(max(v2_budgets) / 16.0)) * 2
     cfg = EnvCfg.from_ckpt_dict(dict(env_peek or {}), **overrides)
     steps = args.steps or int(cfg.max_episode_steps)
     env = Explorer(split, cfg, seed=args.seed)
@@ -370,11 +479,47 @@ def main() -> None:
 
     acc = Acc(args.n_agents, args.quartiles, args.device)
     n_maps = int(getattr(split, "n", 0)) or args.n_envs
+
+    budgets, starts, map_idxs = v2_budgets, v2_starts, v2_maps
+    if args.ir2_dir is not None:
+        n_take = args.n_envs * args.n_batches
+        if n_take > len(map_idxs):
+            sys.exit(f"[idle_diag] asked for {n_take} episodes but the comparison cell has "
+                     f"{len(map_idxs)} maps — lower --n-batches")
+        print(f"    PROTOCOL v2 — {n_take}/{len(map_idxs)} comparison maps, IR2 starts, per-map "
+              f"budget mean {sum(budgets[:n_take]) / n_take:.0f} px "
+              f"[{min(budgets[:n_take]):.0f}, {max(budgets[:n_take]):.0f}]")
+
+    off_all = []
     for b in range(args.n_batches):
+        if args.ir2_dir is not None:
+            # Per CHUNK, exactly where eval_comparison reseeds it: the shadowing stream is drawn
+            # per env, so the realisation a given map meets depends on the chunk size and on where
+            # the stream stood. Same reseed point + same --n-envs as --batch = the same channel.
+            env.reseed_channel_noise(args.noise_seed)
         for i in range(args.n_envs):
-            env.reload_map(env_idx=i, map_idx=(b * args.n_envs + i) % n_maps)
-        ran = run(model, env, steps, args.quartiles, acc)
+            if map_idxs is None:
+                env.reload_map(env_idx=i, map_idx=(b * args.n_envs + i) % n_maps)
+                continue
+            k = b * args.n_envs + i
+            # Re-key the map RNG per MAP exactly as eval_comparison does, so a map always gets the
+            # same formation whatever --n-envs is and this run is comparable to the CSVs.
+            env.rng = np.random.default_rng(args.seed + map_idxs[k])
+            env.reload_map(env_idx=i, map_idx=map_idxs[k], start_override=starts[k])
+            off_all.append(env.last_start_offset_px.clone())
+        if budgets is not None:
+            k0 = b * args.n_envs
+            # Set AFTER the reloads: reload_map does a full reset.
+            env.travel_budget_px = torch.tensor(
+                [max(1.0, float(x)) for x in budgets[k0:k0 + args.n_envs]],
+                dtype=torch.float32, device=args.device)
+        ran = run(model, env, steps, args.quartiles, acc,
+                  autocast=(args.ir2_dir is None))
         print(f"    batch {b}: {ran} steps, cumulative agent-steps {int(acc.total)}")
+    if off_all:
+        o = torch.stack(off_all)
+        print(f"    start parity: offset from IR2 positions after lattice snap — "
+              f"mean {float(o.mean()):.2f} px, worst agent {float(o.max()):.2f} px")
 
     tot = acc.total
     print(f"\n-- overall  ({int(tot)} agent-steps)")
@@ -411,6 +556,36 @@ def main() -> None:
     n_out = acc.by_contact[0].sum()
     print(f"   redundant-while-out-of-comm = {float(acc.by_contact[0][REDUNDANT]) / float(tot):.3f} "
           f"of ALL agent-steps  <- the share the multi-hop relay can address")
+
+    if args.n_agents > 1 and float(acc.rank_n) > 0:
+        rn = float(acc.rank_n)
+        print(f"\n-- by CONTRIBUTION RANK within each episode  ({int(rn)} episodes closed)")
+        print(f"   episode headline (GATE vs the comparison CSV for the same maps): "
+              f"max_dist {float(acc.ep_dist) / rn:7.1f}   steps {float(acc.total) / rn / args.n_agents:6.2f}"
+              f"   budget-bound {int(acc.ep_bound)}/{int(rn)}")
+        # Cross-check: the rank bins must tile the same agent-steps acc.total counted. A gap means
+        # episodes were harvested with a stale per-episode tally, i.e. the rank shares are wrong.
+        _gap = float(acc.total) - float(acc.ep_steps)
+        if abs(_gap) > 0.5:
+            print(f"   !! rank bins hold {float(acc.ep_steps):.0f} agent-steps but the run counted "
+                  f"{float(acc.total):.0f}  (gap {_gap:+.0f}, {_gap / max(1.0, float(acc.total)):+.1%})")
+        print(f"   contrib_imbalance = {float(acc.imb_sum) / max(1.0, float(acc.ep_n)):6.3f}"
+              f"   (Sigma_i |share_i - 1/M|; even split = 0)")
+        print(f"   {'rank':<8s} {'share':>7s} {'productive':>10s} {'redundant':>10s} "
+              f"{'transit':>10s}  {'steps/ep':>9s} {'in-comm':>9s} {'own_cov':>8s} {'syncs/ep':>9s}")
+        for r in range(args.n_agents):
+            row = acc.rank_bucket[r]
+            print(f"   {('top' if r == 0 else 'low' if r == args.n_agents - 1 else f'#{r}'):<8s} "
+                  f"{float(acc.rank_share[r]) / rn:>7.3f} "
+                  + " ".join(f"{v:>10s}" for v in pct(row, row.sum()))
+                  + f"  {float(acc.rank_steps[r]) / rn:>9.1f}"
+                  + f" {float(acc.rank_contact[r]) / max(1.0, float(acc.rank_steps[r])):>9.3f}"
+                  + f" {float(acc.rank_owncov[r]) / rn:>8.4f}"
+                  + f" {float(acc.rank_sync[r]) / rn:>9.2f}")
+        print(f"   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a")
+        print(f"   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT")
+        print(f"   (it walked over ground it had already mapped itself -> assignment problem,")
+        print(f"   frontier-level diversity)? The two fixes are mutually exclusive.")
 
     print(f"\n-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)")
     for a in range(args.n_agents):

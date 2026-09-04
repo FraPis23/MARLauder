@@ -454,6 +454,11 @@ class MarlActorCritic(nn.Module):
             "logp": logp.view(N, M),
             "entropy": entropy.view(N, M),
             "value": value,
+            # Full action distribution, needed by the frontier-diversity loss
+            # (MAPPOCfg.div_weight): it is bilinear in TWO agents' policies, so logp of the
+            # sampled action cannot express it. A softmax of logits computed anyway; nothing
+            # else in this dict changes, and act()/evaluate() are untouched.
+            "probs": dist.probs.view(N, M, K),
             "hidden_actor": h_act_out.view(N, M, self.d),
             "hidden_critic": h_crit_out,
         }

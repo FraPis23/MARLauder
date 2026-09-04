@@ -129,6 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
     g_reward.add_argument("--rdv-offer-frac",  type=float, default=0.15, help="Rendezvous gate saturates (g→1) when the map gained since last sync reaches this fraction of the OWN map size AT that sync (relative growth, floored by scan_norm_nodes); also normalizes the ∆M actor obs")
     g_reward.add_argument("--rdv-clamp-pos", action="store_true",
                     help="Pay only the APPROACH half of the rdv term: Δφ clamped to ≥0, so moving AWAY from the teammate is never taxed. Measured on v15, reward/rdv was −0.20/episode — a standing tax on exactly the divergence exploration requires. This does break the telescoping property, but that property was already gone: g·(φ_prev−φ_now) with a state-dependent gate and no γ was never potential-based shaping. Safe while --rdv-weight < step_penalty_coef·scan_norm_nodes = 0.75, above which approach→retreat→approach becomes free money")
+    g_reward.add_argument("--div-weight", type=float, default=0.0,
+                help="FRONTIER-DIVERSITY auxiliary ACTOR loss (0 = off, exact no-op). Prices two "
+                     "agents committing to the same work: E[shared discounted frontier mass down "
+                     "the exits their policies pick], averaged over agent pairs. Not a reward — "
+                     "return, advantage and critic are untouched (v18 died moving the reward "
+                     "budget at M=4). Not on the local logits — two agents 300px apart share no "
+                     "action index, which is why the v17/J.1/J.2 port was zero exactly when the "
+                     "duplication was decided. Self-extinguishing: disjoint frontier sets give "
+                     "overlap 0 and no gradient. Turning it on makes the env emit a [M,M,K,K] "
+                     "tensor per step (33 MB of rollout buffer at N=32,T=256,M=4).")
     g_reward.add_argument("--comm-idle-pen", type=float, default=0.0,
                     help="Cost of STAYING in radio contact on a step that delivered no map. Free on the step a sync is actually PAID, and free near the deadline (same budget ramp as --rdv-urgency-mode budget) so the terminal rendezvous is never taxed. Measured on v16: after the first sync the pair closes 472->342 px and sensor overlap goes 0.089->0.247, because contact fuses the maps, identical maps give identical utility fields, and identical fields pick the same frontier — a self-reinforcing loop that nothing priced. 81.8%% of contact steps are sustained rather than paying. Gated on sync_paid and NOT on the g gate: `offer` is computed after fusion resets its baseline, so g is ~0 on every contact step by construction and would punish the legitimate meeting just as hard. Training-time shaping only — the radio physics stays exactly IR2's. 0 disables")
     g_reward.add_argument("--rdv-urgency-mode", choices=["time", "budget"], default="time",

@@ -916,6 +916,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
                   f"ent={stats['entropy']:.3f}  kl={stats['kl']:+.4f}  "
                   f"clip={stats['clipfrac']*100:.1f}%  ev={stats.get('explained_var', 0.0):+.2f}  "
                   + (f"gEnt/gPg={stats['g_ent_over_pg']:.2f}  " if "g_ent_over_pg" in stats else "")
+                  + (f"div={stats['div_loss']:.4f}  " if cfg.ppo.div_weight > 0.0 else "")
                   + f""
                   f"redun={redun_norm:.2f} stall={stall_rate*100:.0f}% "
                   f"pair={agg.get('metric/mean_pair_dist', 0.0):.2f} "
@@ -1023,6 +1024,7 @@ def train(cfg: TrainCfg, log_every: int = 1, ckpt_pct: tuple[int, ...] = (20, 40
         log = {
             "train/pg_loss": stats["pg_loss"], "train/v_loss": stats["v_loss"],
             "train/entropy": stats["entropy"], "train/kl": stats["kl"],
+            "train/div_loss": stats.get("div_loss", 0.0),
             "train/clipfrac": stats["clipfrac"], "train/nan_skips": stats.get("nan_skips", 0),
             # 1 = the critic explains the returns, 0 = no better than their mean, <0 = worse.
             # Unlike v_loss this is scale-free, so it IS comparable between M=2 and M=4 runs.

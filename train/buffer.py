@@ -43,6 +43,11 @@ class Rollout:
             # [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance].
             "critic_global":      _z((T, N, sample_obs["critic_global"].shape[-1]), torch.float32),
         }
+        # CTDE frontier-diversity overlap [M, M, K, K], present only when EnvCfg.div_overlap is on.
+        # Keyed off sample_obs so a run without it allocates nothing and store() (which iterates
+        # self.obs) never looks for it. 33 MB at T=256, N=32, M=4, K=8.
+        if "div_overlap" in sample_obs:
+            self.obs["div_overlap"] = _z((T, N, M, M, K, K), torch.float32)
         self.actions       = _z((T, N, M), torch.long)
         self.logp          = _z((T, N, M), torch.float32)
         self.values    = _z((T, N),    torch.float32)        # denormalized

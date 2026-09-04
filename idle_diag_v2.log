@@ -1,0 +1,1165 @@
+################ v20 hybrid M=2
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v20-hybrid-M2  M=2  N=25 envs  split=test/hybrid  steps<=734  batches=4
+    ckpt=runs/v20_syncM_20260816_000500/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 3421 px [1645, 5859]
+    batch 0: 157 steps, cumulative agent-steps 4692
+    batch 1: 128 steps, cumulative agent-steps 9594
+    batch 2: 185 steps, cumulative agent-steps 14498
+    batch 3: 135 steps, cumulative agent-steps 19056
+    start parity: offset from IR2 positions after lattice snap — mean 6.69 px, worst agent 17.49 px
+
+-- overall  (19056 agent-steps)
+   productive   0.434
+   redundant    0.090
+   transit      0.477
+   idle_frac    0.566   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.001   idle&stalled  0.001   idle&revisit  0.091
+
+-- connectivity   direct duty  0.184   group duty  0.184   delta +0.000   whole-team-one-flock  0.184
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.598      0.058      0.343       8646
+   25-50%        0.323      0.112      0.565       7541
+   50-75%        0.234      0.127      0.639       2569
+   75-100%       0.177      0.107      0.717        300
+
+-- by contact (share WITHIN the group)
+   in-comm           0.345      0.050      0.605       3778
+   out-of-comm       0.456      0.099      0.445      15278
+   redundant-while-out-of-comm = 0.080 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  1859.7   steps  95.28   budget-bound 3/100
+   contrib_imbalance =  0.307   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.653      0.549      0.023      0.428       95.3
+   low        0.347      0.318      0.156      0.526       95.3
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.468      0.068      0.464
+   a1                0.399      0.111      0.490
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.999 of transit steps
+   p10    38.6   p50   112.0   p90   311.8   p99   651.6   mean   151.9
+   NO reachable frontier on 0.001 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.654   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.181   <- moved, closed no distance
+   away    (<-0.5)   0.165
+   mean progress     0.132   (8927 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.603   (3703 steps)
+      1-2x window (96-192)        0.612   (2896 steps)
+      beyond 2x   (>192)          0.702   (2328 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.672   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.059   (cos < 0)
+   backtracks     0.059   (cos < -0.7)   (7821 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 965   steps/run  mean   7.80  p50     4  p90    20  p99    40
+   straightness |net|/path   mean  0.833   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.289 of runs, 0.713 of all transit steps, straightness  0.658
+
+   LONG RUNS (>=10 steps), 279 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    16.0  p50    61.3  p75   144.6
+      path walked over the run (px)                        p25   235.9  p50   307.9  p75   417.7
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   6.74
+      d_end dist to nearest frontier when the run ENDED    p50    45.3
+      long runs that STARTED with a frontier <    80 px away: 0.674  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.760  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.103     u(best)  p50  0.707
+         d(best) px  p50   337.1   vs path walked p50   307.9
+         nearest frontier was >=90% as good as the best: 0.004
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v20 hybrid M=4
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v20-hybrid-M4  M=4  N=25 envs  split=test/hybrid  steps<=462  batches=4
+    ckpt=runs/v20_syncM_20260816_000500/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 2371 px [1570, 3696]
+    batch 0: 113 steps, cumulative agent-steps 7476
+    batch 1: 124 steps, cumulative agent-steps 14796
+    batch 2: 142 steps, cumulative agent-steps 22596
+    batch 3: 145 steps, cumulative agent-steps 30060
+    start parity: offset from IR2 positions after lattice snap — mean 9.10 px, worst agent 25.63 px
+
+-- overall  (30060 agent-steps)
+   productive   0.286
+   redundant    0.092
+   transit      0.622
+   idle_frac    0.714   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.012   idle&stalled  0.010   idle&revisit  0.096
+
+-- connectivity   direct duty  0.282   group duty  0.334   delta +0.051   whole-team-one-flock  0.138
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.446      0.053      0.501      12275
+   25-50%        0.221      0.128      0.651      11647
+   50-75%        0.095      0.103      0.803       5345
+   75-100%       0.038      0.111      0.851        793
+
+-- by contact (share WITHIN the group)
+   in-comm           0.214      0.065      0.721      16401
+   out-of-comm       0.372      0.124      0.504      13659
+   redundant-while-out-of-comm = 0.056 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  1467.2   steps  75.15   budget-bound 4/100
+   contrib_imbalance =  0.577   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.489      0.526      0.024      0.450       75.2
+   #1         0.285      0.328      0.064      0.608       75.2
+   #2         0.162      0.196      0.117      0.687       75.2
+   low        0.064      0.093      0.164      0.743       75.2
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.346      0.075      0.579
+   a1                0.268      0.096      0.635
+   a2                0.252      0.106      0.642
+   a3                0.277      0.091      0.632
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.969 of transit steps
+   p10    38.6   p50   115.9   p90   321.1   p99   597.0   mean   152.8
+   NO reachable frontier on 0.031 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.586   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.207   <- moved, closed no distance
+   away    (<-0.5)   0.208
+   mean progress     0.002   (17490 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.536   (7041 steps)
+      1-2x window (96-192)        0.245   (5981 steps)
+      beyond 2x   (>192)          0.525   (4468 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.645   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.069   (cos < 0)
+   backtracks     0.069   (cos < -0.7)   (16238 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 1282   steps/run  mean   8.86  p50     5  p90    24  p99    46
+   straightness |net|/path   mean  0.817   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.317 of runs, 0.761 of all transit steps, straightness  0.605
+
+   LONG RUNS (>=10 steps), 407 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    32.0  p50    61.3  p75    99.9
+      path walked over the run (px)                        p25   238.4  p50   338.3  p75   472.9
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   5.59
+      d_end dist to nearest frontier when the run ENDED    p50    38.6
+      long runs that STARTED with a frontier <    80 px away: 0.688  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.850  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.128     u(best)  p50  0.736
+         d(best) px  p50   211.9   vs path walked p50   338.3
+         nearest frontier was >=90% as good as the best: 0.007
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v20 corridor M=2
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v20-corridor-M2  M=2  N=25 envs  split=test/corridor  steps<=1660  batches=4
+    ckpt=runs/v20_syncM_20260816_000500/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 7087 px [3841, 13277]
+    batch 0: 353 steps, cumulative agent-steps 10962
+    batch 1: 314 steps, cumulative agent-steps 22134
+    batch 2: 352 steps, cumulative agent-steps 32740
+    batch 3: 286 steps, cumulative agent-steps 43218
+    start parity: offset from IR2 positions after lattice snap — mean 5.74 px, worst agent 23.09 px
+
+-- overall  (43218 agent-steps)
+   productive   0.401
+   redundant    0.166
+   transit      0.433
+   idle_frac    0.599   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.002   idle&stalled  0.002   idle&revisit  0.073
+
+-- connectivity   direct duty  0.117   group duty  0.117   delta +0.000   whole-team-one-flock  0.117
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.570      0.130      0.300      20435
+   25-50%        0.273      0.205      0.523      15624
+   50-75%        0.212      0.198      0.591       6162
+   75-100%       0.108      0.099      0.792        997
+
+-- by contact (share WITHIN the group)
+   in-comm           0.239      0.044      0.717       5674
+   out-of-comm       0.425      0.184      0.390      37544
+   redundant-while-out-of-comm = 0.160 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  3748.1   steps 216.09   budget-bound 3/100
+   contrib_imbalance =  0.343   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.672      0.539      0.040      0.421      216.1
+   low        0.328      0.263      0.292      0.445      216.1
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.377      0.193      0.430
+   a1                0.425      0.139      0.436
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 1.000 of transit steps
+   p10    48.0   p50   205.3   p90   719.5   p99  1528.3   mean   312.5
+   NO reachable frontier on 0.000 of transit steps, of which:
+      no frontier AT ALL in own map     0.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       0.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.719   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.093   <- moved, closed no distance
+   away    (<-0.5)   0.188
+   mean progress     0.137   (18540 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -1.177   (4298 steps)
+      1-2x window (96-192)        0.396   (4546 steps)
+      beyond 2x   (>192)          0.597   (9696 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.826   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.039   (cos < 0)
+   backtracks     0.039   (cos < -0.7)   (16323 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 2039   steps/run  mean   7.69  p50     1  p90    25  p99    76
+   straightness |net|/path   mean  0.900   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.204 of runs, 0.832 of all transit steps, straightness  0.579
+
+   LONG RUNS (>=10 steps), 416 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    64.0  p50    64.0  p75   144.0
+      path walked over the run (px)                        p25   266.5  p50   413.3  p75   671.8
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   5.32
+      d_end dist to nearest frontier when the run ENDED    p50    54.6
+      long runs that STARTED with a frontier <    80 px away: 0.683  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.767  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.019     u(best)  p50  0.515
+         d(best) px  p50   555.9   vs path walked p50   413.3
+         nearest frontier was >=90% as good as the best: 0.070
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v20 corridor M=4
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v20-corridor-M4  M=4  N=25 envs  split=test/corridor  steps<=1636  batches=4
+    ckpt=runs/v20_syncM_20260816_000500/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 5531 px [3499, 13075]
+    batch 0: 216 steps, cumulative agent-steps 17772
+    batch 1: 241 steps, cumulative agent-steps 36184
+    batch 2: 235 steps, cumulative agent-steps 54160
+    batch 3: 283 steps, cumulative agent-steps 72672
+    start parity: offset from IR2 positions after lattice snap — mean 8.15 px, worst agent 23.35 px
+
+-- overall  (72672 agent-steps)
+   productive   0.242
+   redundant    0.206
+   transit      0.552
+   idle_frac    0.758   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.007   idle&stalled  0.007   idle&revisit  0.080
+
+-- connectivity   direct duty  0.212   group duty  0.232   delta +0.020   whole-team-one-flock  0.061
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.364      0.151      0.485      31925
+   25-50%        0.199      0.263      0.537      24031
+   50-75%        0.081      0.236      0.682      14415
+   75-100%       0.009      0.181      0.811       2301
+
+-- by contact (share WITHIN the group)
+   in-comm           0.128      0.134      0.738      32015
+   out-of-comm       0.332      0.263      0.405      40657
+   redundant-while-out-of-comm = 0.147 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  3161.6   steps 181.68   budget-bound 4/100
+   contrib_imbalance =  0.704   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.537      0.516      0.039      0.445      181.7
+   #1         0.298      0.287      0.173      0.540      181.7
+   #2         0.126      0.126      0.297      0.577      181.7
+   low        0.039      0.040      0.315      0.644      181.7
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.271      0.199      0.530
+   a1                0.232      0.191      0.578
+   a2                0.203      0.227      0.570
+   a3                0.263      0.208      0.529
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.993 of transit steps
+   p10    45.3   p50   166.6   p90   743.8   p99  1670.0   mean   305.6
+   NO reachable frontier on 0.007 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.677   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.153   <- moved, closed no distance
+   away    (<-0.5)   0.170
+   mean progress     0.136   (39050 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.491   (10109 steps)
+      1-2x window (96-192)        0.190   (11217 steps)
+      beyond 2x   (>192)          0.460   (17724 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.794   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.053   (cos < 0)
+   backtracks     0.053   (cos < -0.7)   (35247 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 3401   steps/run  mean   8.42  p50     1  p90    25  p99    70
+   straightness |net|/path   mean  0.892   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.261 of runs, 0.828 of all transit steps, straightness  0.654
+
+   LONG RUNS (>=10 steps), 888 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    64.0  p50    96.0  p75   160.0
+      path walked over the run (px)                        p25   246.6  p50   349.3  p75   550.9
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   3.47
+      d_end dist to nearest frontier when the run ENDED    p50    16.0
+      long runs that STARTED with a frontier <    80 px away: 0.411  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.743  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.153     u(best)  p50  0.485
+         d(best) px  p50   259.9   vs path walked p50   349.3
+         nearest frontier was >=90% as good as the best: 0.224
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v20 complex M=2
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v20-complex-M2  M=2  N=25 envs  split=test/complex  steps<=3410  batches=4
+    ckpt=runs/v20_syncM_20260816_000500/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 17608 px [8469, 27266]
+    batch 0: 889 steps, cumulative agent-steps 31710
+    batch 1: 1059 steps, cumulative agent-steps 63022
+    batch 2: 925 steps, cumulative agent-steps 93182
+    batch 3: 1254 steps, cumulative agent-steps 123426
+    start parity: offset from IR2 positions after lattice snap — mean 6.48 px, worst agent 15.52 px
+
+-- overall  (123426 agent-steps)
+   productive   0.344
+   redundant    0.116
+   transit      0.539
+   idle_frac    0.656   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.001   idle&stalled  0.001   idle&revisit  0.085
+
+-- connectivity   direct duty  0.097   group duty  0.097   delta +0.000   whole-team-one-flock  0.097
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.524      0.073      0.404      47455
+   25-50%        0.300      0.144      0.556      42439
+   50-75%        0.176      0.148      0.676      24652
+   75-100%       0.069      0.124      0.806       8880
+
+-- by contact (share WITHIN the group)
+   in-comm           0.162      0.020      0.818      14522
+   out-of-comm       0.369      0.129      0.502     108904
+   redundant-while-out-of-comm = 0.114 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist 11412.6   steps 617.13   budget-bound 15/100
+   contrib_imbalance =  0.199   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.599      0.402      0.062      0.536      617.1
+   low        0.401      0.287      0.170      0.543      617.1
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.354      0.108      0.538
+   a1                0.335      0.124      0.540
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 1.000 of transit steps
+   p10    61.3   p50   173.3   p90   486.2   p99  1108.1   mean   236.5
+   NO reachable frontier on 0.000 of transit steps, of which:
+      no frontier AT ALL in own map     0.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       0.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.617   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.176   <- moved, closed no distance
+   away    (<-0.5)   0.206
+   mean progress     0.143   (66354 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.899   (15621 steps)
+      1-2x window (96-192)        0.414   (20875 steps)
+      beyond 2x   (>192)          0.498   (29858 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.733   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.059   (cos < 0)
+   backtracks     0.059   (cos < -0.7)   (61718 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 4412   steps/run  mean  13.56  p50     6  p90    34  p99   103
+   straightness |net|/path   mean  0.820   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.383 of runs, 0.865 of all transit steps, straightness  0.663
+
+   LONG RUNS (>=10 steps), 1689 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    48.0  p50    61.3  p75    96.0
+      path walked over the run (px)                        p25   259.9  p50   390.6  p75   627.4
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   6.13
+      d_end dist to nearest frontier when the run ENDED    p50    54.6
+      long runs that STARTED with a frontier <    80 px away: 0.732  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.792  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.083     u(best)  p50  0.732
+         d(best) px  p50   642.3   vs path walked p50   390.6
+         nearest frontier was >=90% as good as the best: 0.005
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v20 complex M=4
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v20-complex-M4  M=4  N=25 envs  split=test/complex  steps<=3182  batches=4
+    ckpt=runs/v20_syncM_20260816_000500/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 13723 px [5516, 25447]
+    batch 0: 670 steps, cumulative agent-steps 45528
+    batch 1: 753 steps, cumulative agent-steps 91588
+    batch 2: 919 steps, cumulative agent-steps 138520
+    batch 3: 786 steps, cumulative agent-steps 181232
+    start parity: offset from IR2 positions after lattice snap — mean 6.62 px, worst agent 18.11 px
+
+-- overall  (181232 agent-steps)
+   productive   0.238
+   redundant    0.166
+   transit      0.595
+   idle_frac    0.762   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.003   idle&stalled  0.002   idle&revisit  0.080
+
+-- connectivity   direct duty  0.126   group duty  0.141   delta +0.014   whole-team-one-flock  0.033
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.391      0.147      0.462      74065
+   25-50%        0.174      0.202      0.624      62462
+   50-75%        0.087      0.164      0.748      32671
+   75-100%       0.043      0.104      0.853      12034
+
+-- by contact (share WITHIN the group)
+   in-comm           0.111      0.077      0.812      53038
+   out-of-comm       0.291      0.203      0.505     128194
+   redundant-while-out-of-comm = 0.144 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  8455.2   steps 453.08   budget-bound 17/100
+   contrib_imbalance =  0.388   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.401      0.366      0.065      0.569      453.1
+   #1         0.282      0.270      0.128      0.602      453.1
+   #2         0.198      0.196      0.204      0.600      453.1
+   low        0.119      0.122      0.269      0.609      453.1
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.261      0.154      0.585
+   a1                0.207      0.183      0.609
+   a2                0.233      0.174      0.593
+   a3                0.252      0.154      0.593
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 1.000 of transit steps
+   p10    64.0   p50   182.6   p90   543.5   p99  1174.2   mean   256.9
+   NO reachable frontier on 0.000 of transit steps, of which:
+      no frontier AT ALL in own map     0.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       0.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.590   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.200   <- moved, closed no distance
+   away    (<-0.5)   0.210
+   mean progress     0.107   (107089 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.753   (23614 steps)
+      1-2x window (96-192)        0.265   (31926 steps)
+      beyond 2x   (>192)          0.402   (51549 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.745   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.048   (cos < 0)
+   backtracks     0.048   (cos < -0.7)   (100371 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 6025   steps/run  mean  13.38  p50     5  p90    35  p99   101
+   straightness |net|/path   mean  0.817   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.374 of runs, 0.863 of all transit steps, straightness  0.645
+
+   LONG RUNS (>=10 steps), 2252 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    48.0  p50    64.0  p75   131.9
+      path walked over the run (px)                        p25   263.8  p50   407.2  p75   662.2
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   6.02
+      d_end dist to nearest frontier when the run ENDED    p50    48.0
+      long runs that STARTED with a frontier <    80 px away: 0.678  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.775  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.092     u(best)  p50  0.749
+         d(best) px  p50   538.5   vs path walked p50   407.2
+         nearest frontier was >=90% as good as the best: 0.011
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v16 hybrid M=2
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v16-hybrid-M2  M=2  N=25 envs  split=test/hybrid  steps<=734  batches=4
+    ckpt=runs/v16_difficult_20260803_135950/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 3421 px [1645, 5859]
+    batch 0: 149 steps, cumulative agent-steps 4768
+    batch 1: 130 steps, cumulative agent-steps 9428
+    batch 2: 130 steps, cumulative agent-steps 14482
+    batch 3: 128 steps, cumulative agent-steps 19128
+    start parity: offset from IR2 positions after lattice snap — mean 6.69 px, worst agent 17.49 px
+
+-- overall  (19128 agent-steps)
+   productive   0.440
+   redundant    0.091
+   transit      0.470
+   idle_frac    0.560   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.001   idle&stalled  0.001   idle&revisit  0.104
+
+-- connectivity   direct duty  0.192   group duty  0.192   delta +0.000   whole-team-one-flock  0.192
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.604      0.049      0.347       8686
+   25-50%        0.357      0.114      0.529       7479
+   50-75%        0.168      0.147      0.685       2558
+   75-100%       0.141      0.195      0.664        405
+
+-- by contact (share WITHIN the group)
+   in-comm           0.426      0.053      0.521       3502
+   out-of-comm       0.443      0.099      0.458      15626
+   redundant-while-out-of-comm = 0.081 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  1859.2   steps  95.64   budget-bound 4/100
+   contrib_imbalance =  0.254   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.627      0.532      0.040      0.427       95.6
+   low        0.373      0.347      0.141      0.512       95.6
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.464      0.075      0.461
+   a1                0.415      0.106      0.478
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.998 of transit steps
+   p10    38.6   p50   109.3   p90   305.1   p99   590.4   mean   146.6
+   NO reachable frontier on 0.002 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.642   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.172   <- moved, closed no distance
+   away    (<-0.5)   0.186
+   mean progress     0.121   (8816 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.519   (3748 steps)
+      1-2x window (96-192)        0.542   (2972 steps)
+      beyond 2x   (>192)          0.669   (2096 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.692   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.063   (cos < 0)
+   backtracks     0.063   (cos < -0.7)   (7669 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 1029   steps/run  mean   6.81  p50     4  p90    17  p99    33
+   straightness |net|/path   mean  0.853   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.251 of runs, 0.660 of all transit steps, straightness  0.691
+
+   LONG RUNS (>=10 steps), 258 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    16.0  p50    61.3  p75   128.9
+      path walked over the run (px)                        p25   237.3  p50   289.1  p75   401.3
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   5.83
+      d_end dist to nearest frontier when the run ENDED    p50    38.6
+      long runs that STARTED with a frontier <    80 px away: 0.686  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.771  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.114     u(best)  p50  0.730
+         d(best) px  p50   351.8   vs path walked p50   289.1
+         nearest frontier was >=90% as good as the best: 0.012
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v16 hybrid M=4
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v16-hybrid-M4  M=4  N=25 envs  split=test/hybrid  steps<=462  batches=4
+    ckpt=runs/v16_difficult_20260803_135950/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 2371 px [1570, 3696]
+    batch 0: 124 steps, cumulative agent-steps 8192
+    batch 1: 101 steps, cumulative agent-steps 15864
+    batch 2: 103 steps, cumulative agent-steps 23924
+    batch 3: 134 steps, cumulative agent-steps 31408
+    start parity: offset from IR2 positions after lattice snap — mean 9.10 px, worst agent 25.63 px
+
+-- overall  (31408 agent-steps)
+   productive   0.282
+   redundant    0.082
+   transit      0.637
+   idle_frac    0.718   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.012   idle&stalled  0.010   idle&revisit  0.114
+
+-- connectivity   direct duty  0.293   group duty  0.343   delta +0.050   whole-team-one-flock  0.154
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.444      0.050      0.506      12316
+   25-50%        0.237      0.113      0.650      11822
+   50-75%        0.086      0.087      0.827       6045
+   75-100%       0.042      0.076      0.882       1225
+
+-- by contact (share WITHIN the group)
+   in-comm           0.236      0.060      0.704      16909
+   out-of-comm       0.335      0.107      0.558      14499
+   redundant-while-out-of-comm = 0.050 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  1526.2   steps  78.52   budget-bound 6/100
+   contrib_imbalance =  0.524   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.474      0.497      0.017      0.486       78.5
+   #1         0.268      0.309      0.080      0.610       78.5
+   #2         0.175      0.207      0.092      0.701       78.5
+   low        0.083      0.114      0.136      0.749       78.5
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.302      0.081      0.617
+   a1                0.278      0.074      0.648
+   a2                0.235      0.090      0.675
+   a3                0.313      0.082      0.605
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.962 of transit steps
+   p10    38.6   p50   109.3   p90   347.6   p99   623.2   mean   155.5
+   NO reachable frontier on 0.038 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.579   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.201   <- moved, closed no distance
+   away    (<-0.5)   0.220
+   mean progress     0.007   (18584 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.508   (7850 steps)
+      1-2x window (96-192)        0.327   (5940 steps)
+      beyond 2x   (>192)          0.454   (4794 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.639   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.075   (cos < 0)
+   backtracks     0.075   (cos < -0.7)   (17340 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 1492   steps/run  mean   7.95  p50     4  p90    21  p99    43
+   straightness |net|/path   mean  0.819   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.294 of runs, 0.727 of all transit steps, straightness  0.614
+
+   LONG RUNS (>=10 steps), 439 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    32.0  p50    61.3  p75   102.6
+      path walked over the run (px)                        p25   231.8  p50   311.8  p75   437.0
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   5.71
+      d_end dist to nearest frontier when the run ENDED    p50    38.6
+      long runs that STARTED with a frontier <    80 px away: 0.702  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.852  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.132     u(best)  p50  0.788
+         d(best) px  p50   234.5   vs path walked p50   311.8
+         nearest frontier was >=90% as good as the best: 0.000
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v16 corridor M=2
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v16-corridor-M2  M=2  N=25 envs  split=test/corridor  steps<=1660  batches=4
+    ckpt=runs/v16_difficult_20260803_135950/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 7087 px [3841, 13277]
+    batch 0: 334 steps, cumulative agent-steps 11264
+    batch 1: 376 steps, cumulative agent-steps 22782
+    batch 2: 371 steps, cumulative agent-steps 33800
+    batch 3: 351 steps, cumulative agent-steps 45508
+    start parity: offset from IR2 positions after lattice snap — mean 5.74 px, worst agent 23.09 px
+
+-- overall  (45508 agent-steps)
+   productive   0.383
+   redundant    0.160
+   transit      0.458
+   idle_frac    0.617   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.001   idle&stalled  0.000   idle&revisit  0.073
+
+-- connectivity   direct duty  0.108   group duty  0.108   delta +0.000   whole-team-one-flock  0.108
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.568      0.115      0.317      20429
+   25-50%        0.272      0.201      0.527      16090
+   50-75%        0.167      0.186      0.646       6917
+   75-100%       0.127      0.187      0.686       2072
+
+-- by contact (share WITHIN the group)
+   in-comm           0.276      0.042      0.681       5908
+   out-of-comm       0.398      0.177      0.425      39600
+   redundant-while-out-of-comm = 0.154 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  3948.0   steps 227.54   budget-bound 8/100
+   contrib_imbalance =  0.328   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.664      0.505      0.044      0.451      227.5
+   low        0.336      0.260      0.275      0.464      227.5
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.371      0.165      0.464
+   a1                0.394      0.154      0.452
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.999 of transit steps
+   p10    48.0   p50   237.3   p90   871.8   p99  1890.8   mean   371.9
+   NO reachable frontier on 0.001 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.784   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.072   <- moved, closed no distance
+   away    (<-0.5)   0.144
+   mean progress     0.148   (20674 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -1.854   (4328 steps)
+      1-2x window (96-192)        0.519   (4423 steps)
+      beyond 2x   (>192)          0.737   (11923 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.842   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.036   (cos < 0)
+   backtracks     0.036   (cos < -0.7)   (18355 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 2202   steps/run  mean   7.63  p50     1  p90    24  p99    77
+   straightness |net|/path   mean  0.899   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.199 of runs, 0.831 of all transit steps, straightness  0.562
+
+   LONG RUNS (>=10 steps), 439 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    64.0  p50    64.0  p75   129.9
+      path walked over the run (px)                        p25   267.9  p50   406.6  p75   720.3
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   5.14
+      d_end dist to nearest frontier when the run ENDED    p50    54.6
+      long runs that STARTED with a frontier <    80 px away: 0.683  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.763  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.019     u(best)  p50  0.478
+         d(best) px  p50   557.3   vs path walked p50   406.6
+         nearest frontier was >=90% as good as the best: 0.116
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v16 corridor M=4
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v16-corridor-M4  M=4  N=25 envs  split=test/corridor  steps<=1636  batches=4
+    ckpt=runs/v16_difficult_20260803_135950/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 5531 px [3499, 13075]
+    batch 0: 231 steps, cumulative agent-steps 17904
+    batch 1: 220 steps, cumulative agent-steps 36484
+    batch 2: 296 steps, cumulative agent-steps 56168
+    batch 3: 263 steps, cumulative agent-steps 74992
+    start parity: offset from IR2 positions after lattice snap — mean 8.15 px, worst agent 23.35 px
+
+-- overall  (74992 agent-steps)
+   productive   0.238
+   redundant    0.188
+   transit      0.574
+   idle_frac    0.762   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.006   idle&stalled  0.005   idle&revisit  0.082
+
+-- connectivity   direct duty  0.198   group duty  0.219   delta +0.021   whole-team-one-flock  0.063
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.366      0.143      0.491      31812
+   25-50%        0.193      0.239      0.568      25251
+   50-75%        0.084      0.213      0.703      15038
+   75-100%       0.020      0.109      0.871       2891
+
+-- by contact (share WITHIN the group)
+   in-comm           0.154      0.118      0.728      30936
+   out-of-comm       0.296      0.237      0.467      44056
+   redundant-while-out-of-comm = 0.139 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  3266.7   steps 187.48   budget-bound 3/100
+   contrib_imbalance =  0.688   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.545      0.514      0.038      0.448      187.5
+   #1         0.279      0.266      0.166      0.568      187.5
+   #2         0.137      0.131      0.246      0.623      187.5
+   low        0.039      0.040      0.301      0.659      187.5
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.272      0.166      0.561
+   a1                0.244      0.198      0.558
+   a2                0.194      0.197      0.609
+   a3                0.241      0.190      0.570
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 0.987 of transit steps
+   p10    48.0   p50   182.6   p90   801.1   p99  1641.8   mean   330.4
+   NO reachable frontier on 0.013 of transit steps, of which:
+      no frontier AT ALL in own map     1.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       1.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.693   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.138   <- moved, closed no distance
+   away    (<-0.5)   0.169
+   mean progress     0.071   (41814 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.858   (9854 steps)
+      1-2x window (96-192)        0.134   (11547 steps)
+      beyond 2x   (>192)          0.483   (20413 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.814   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.042   (cos < 0)
+   backtracks     0.042   (cos < -0.7)   (38336 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 3415   steps/run  mean   8.71  p50     1  p90    26  p99    69
+   straightness |net|/path   mean  0.887   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.259 of runs, 0.830 of all transit steps, straightness  0.629
+
+   LONG RUNS (>=10 steps), 884 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    64.0  p50    86.6  p75   160.0
+      path walked over the run (px)                        p25   246.6  p50   365.3  p75   605.0
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   3.73
+      d_end dist to nearest frontier when the run ENDED    p50    22.6
+      long runs that STARTED with a frontier <    80 px away: 0.412  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.731  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.156     u(best)  p50  0.471
+         d(best) px  p50   269.3   vs path walked p50   365.3
+         nearest frontier was >=90% as good as the best: 0.232
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v16 complex M=2
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=2 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v16-complex-M2  M=2  N=25 envs  split=test/complex  steps<=3410  batches=4
+    ckpt=runs/v16_difficult_20260803_135950/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 17608 px [8469, 27266]
+    batch 0: 1378 steps, cumulative agent-steps 32788
+    batch 1: 937 steps, cumulative agent-steps 66326
+    batch 2: 1143 steps, cumulative agent-steps 98762
+    batch 3: 1260 steps, cumulative agent-steps 130368
+    start parity: offset from IR2 positions after lattice snap — mean 6.48 px, worst agent 15.52 px
+
+-- overall  (130368 agent-steps)
+   productive   0.334
+   redundant    0.110
+   transit      0.556
+   idle_frac    0.666   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.000   idle&stalled  0.000   idle&revisit  0.106
+
+-- connectivity   direct duty  0.081   group duty  0.081   delta +0.000   whole-team-one-flock  0.081
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.516      0.073      0.411      47542
+   25-50%        0.287      0.121      0.592      44928
+   50-75%        0.189      0.155      0.656      26875
+   75-100%       0.098      0.112      0.790      11023
+
+-- by contact (share WITHIN the group)
+   in-comm           0.229      0.027      0.744       9972
+   out-of-comm       0.343      0.117      0.540     120396
+   redundant-while-out-of-comm = 0.108 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist 12058.4   steps 651.84   budget-bound 16/100
+   contrib_imbalance =  0.188   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.594      0.389      0.069      0.542      651.8
+   low        0.406      0.280      0.150      0.570      651.8
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.347      0.099      0.554
+   a1                0.322      0.120      0.558
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 1.000 of transit steps
+   p10    54.6   p50   170.5   p90   539.6   p99  1368.6   mean   255.1
+   NO reachable frontier on 0.000 of transit steps, of which:
+      no frontier AT ALL in own map     0.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       0.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.609   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.179   <- moved, closed no distance
+   away    (<-0.5)   0.212
+   mean progress     0.135   (72300 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.825   (18580 steps)
+      1-2x window (96-192)        0.394   (21225 steps)
+      beyond 2x   (>192)          0.515   (32495 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.704   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.081   (cos < 0)
+   backtracks     0.081   (cos < -0.7)   (67234 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 4907   steps/run  mean  12.95  p50     4  p90    34  p99   111
+   straightness |net|/path   mean  0.819   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.347 of runs, 0.857 of all transit steps, straightness  0.645
+
+   LONG RUNS (>=10 steps), 1705 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    38.6  p50    61.3  p75    80.0
+      path walked over the run (px)                        p25   267.6  p50   403.9  p75   663.8
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   6.57
+      d_end dist to nearest frontier when the run ENDED    p50    54.6
+      long runs that STARTED with a frontier <    80 px away: 0.746  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.798  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.085     u(best)  p50  0.736
+         d(best) px  p50   622.4   vs path walked p50   403.9
+         nearest frontier was >=90% as good as the best: 0.006
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+################ v16 complex M=4
+[ckpt] arch: n_layers=6 d=128 n_heads=4 n_agents=4 use_gru=False (detected layers=6, d=128)
+
+=== idle_diag  label=v16-complex-M4  M=4  N=25 envs  split=test/complex  steps<=3182  batches=4
+    ckpt=runs/v16_difficult_20260803_135950/ckpt_best.pt
+    max_travel_frac=0.0  comm_model=signal_strength  comm_relay=True  done_mode=own
+    PROTOCOL v2 — 100/100 comparison maps, IR2 starts, per-map budget mean 13723 px [5516, 25447]
+    batch 0: 1100 steps, cumulative agent-steps 46232
+    batch 1: 876 steps, cumulative agent-steps 97408
+    batch 2: 845 steps, cumulative agent-steps 146132
+    batch 3: 640 steps, cumulative agent-steps 189100
+    start parity: offset from IR2 positions after lattice snap — mean 6.62 px, worst agent 18.11 px
+
+-- overall  (189100 agent-steps)
+   productive   0.234
+   redundant    0.143
+   transit      0.623
+   idle_frac    0.766   (= redundant + transit; compare to the run's metric/idle_frac)
+   stall_rate   0.003   idle&stalled  0.003   idle&revisit  0.092
+
+-- connectivity   direct duty  0.128   group duty  0.142   delta +0.014   whole-team-one-flock  0.030
+   the delta is how often the relay has anything to relay: 0 means the team is never in a chain,
+   so the fix is correctness rather than performance.
+
+-- by budget quartile (share WITHIN the quartile)
+   q        productive  redundant    transit          n
+   0-25%         0.374      0.139      0.486      74265
+   25-50%        0.184      0.163      0.653      64467
+   50-75%        0.116      0.139      0.746      34271
+   75-100%       0.044      0.085      0.871      16097
+
+-- by contact (share WITHIN the group)
+   in-comm           0.128      0.083      0.789      56192
+   out-of-comm       0.279      0.168      0.552     132908
+   redundant-while-out-of-comm = 0.118 of ALL agent-steps  <- the share the multi-hop relay can address
+
+-- by CONTRIBUTION RANK within each episode  (100 episodes closed)
+   episode headline (GATE vs the comparison CSV for the same maps): max_dist  8777.3   steps 472.75   budget-bound 22/100
+   contrib_imbalance =  0.362   (Sigma_i |share_i - 1/M|; even split = 0)
+   rank       share productive  redundant    transit   steps/ep
+   top        0.395      0.357      0.060      0.583      472.8
+   #1         0.276      0.256      0.118      0.626      472.8
+   #2         0.202      0.200      0.163      0.637      472.8
+   low        0.128      0.125      0.231      0.644      472.8
+   THE QUESTION: for the LOW rank, is the idle REDUNDANT (it scanned real ground a
+   teammate already held -> information/symmetry problem, comm_idle_pen) or TRANSIT
+   (it walked over ground it had already mapped itself -> assignment problem,
+   frontier-level diversity)? The two fixes are mutually exclusive.
+
+-- by agent slot (share WITHIN the agent; flat = the idle is shared, not carried)
+   a0                0.241      0.145      0.613
+   a1                0.224      0.150      0.626
+   a2                0.237      0.141      0.621
+   a3                0.235      0.134      0.631
+
+-- TRANSIT steps: BF path length to the agent's OWN nearest frontier (PIXELS)
+   reachable frontier on 1.000 of transit steps
+   p10    64.0   p50   192.0   p90   691.9   p99  1791.5   mean   314.6
+   NO reachable frontier on 0.000 of transit steps, of which:
+      no frontier AT ALL in own map     0.000   <- locally finished
+      frontiers exist but DISCONNECTED  0.000   <- fused-in region across an unexplored gap
+      mean own_cov on those steps       0.000   <- if far below 1.0 the agent is stranded, not done
+
+-- is TRANSIT going anywhere? progress = -d(dist to own nearest frontier)/displacement
+   toward  (>+0.5)   0.585   <- the step went down the path to the frontier
+   sideways(|.|<=.5) 0.189   <- moved, closed no distance
+   away    (<-0.5)   0.226
+   mean progress     0.092   (116913 scored transit steps)
+   NOTE the nearest frontier can change identity between steps, which shows up as noise in both tails; the MEAN is the number to read.
+
+   mean progress by distance to that frontier (ego window half-width = 96 px)
+      inside window (<96)        -0.775   (25675 steps)
+      1-2x window (96-192)        0.269   (32330 steps)
+      beyond 2x   (>192)          0.374   (58908 steps)
+
+-- does TRANSIT hold a heading? cos(turn) between consecutive transit steps
+   mean cos       0.745   (+1 = committed walk, 0 = random turn, <0 = reversing)
+   reversals      0.054   (cos < 0)
+   backtracks     0.054   (cos < -0.7)   (109695 scored pairs)
+
+-- TRANSIT RUNS (one uninterrupted commute between two pieces of real work)
+   runs 6525   steps/run  mean  13.33  p50     4  p90    36  p99   105
+   straightness |net|/path   mean  0.811   (1 = a straight route, 0 = ended where it started)
+   runs >=10 steps: 0.356 of runs, 0.867 of all transit steps, straightness  0.627
+
+   LONG RUNS (>=10 steps), 2320 of them — WAS THE WALK FORCED?
+      d0  dist to own nearest frontier AT RUN START (px)   p25    48.0  p50    64.0  p75   128.0
+      path walked over the run (px)                        p25   263.8  p50   421.0  p75   699.3
+      path / d0   (~1 = went straight to the nearest, >>1 = went elsewhere)  p50   5.98
+      d_end dist to nearest frontier when the run ENDED    p50    48.0
+      long runs that STARTED with a frontier <    80 px away: 0.673  <- had work in reach
+      long runs that STARTED with a frontier <   160 px away: 0.781  <- had work in reach
+
+      IS THE LONG WALK RATIONAL? utility of the nearest vs the best frontier
+         u(nearest)  p50  0.100     u(best)  p50  0.745
+         d(best) px  p50   477.8   vs path walked p50   421.0
+         nearest frontier was >=90% as good as the best: 0.015
+         -> high share + long walk = the detour bought nothing; low share = utility genuinely sits far and the lever is vf_gamma
+
+SWEEP DONE

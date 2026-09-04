@@ -1,0 +1,406 @@
+{
+ "split": "test/corridor",
+ "n_total": 400,
+ "entries": [
+  {
+   "pack_idx": 0,
+   "file": "1.png"
+  },
+  {
+   "pack_idx": 4,
+   "file": "102.png"
+  },
+  {
+   "pack_idx": 8,
+   "file": "106.png"
+  },
+  {
+   "pack_idx": 12,
+   "file": "11.png"
+  },
+  {
+   "pack_idx": 16,
+   "file": "113.png"
+  },
+  {
+   "pack_idx": 20,
+   "file": "117.png"
+  },
+  {
+   "pack_idx": 24,
+   "file": "120.png"
+  },
+  {
+   "pack_idx": 28,
+   "file": "124.png"
+  },
+  {
+   "pack_idx": 32,
+   "file": "128.png"
+  },
+  {
+   "pack_idx": 36,
+   "file": "131.png"
+  },
+  {
+   "pack_idx": 40,
+   "file": "135.png"
+  },
+  {
+   "pack_idx": 44,
+   "file": "139.png"
+  },
+  {
+   "pack_idx": 48,
+   "file": "142.png"
+  },
+  {
+   "pack_idx": 52,
+   "file": "146.png"
+  },
+  {
+   "pack_idx": 56,
+   "file": "15.png"
+  },
+  {
+   "pack_idx": 60,
+   "file": "153.png"
+  },
+  {
+   "pack_idx": 64,
+   "file": "157.png"
+  },
+  {
+   "pack_idx": 69,
+   "file": "161.png"
+  },
+  {
+   "pack_idx": 73,
+   "file": "165.png"
+  },
+  {
+   "pack_idx": 77,
+   "file": "169.png"
+  },
+  {
+   "pack_idx": 81,
+   "file": "172.png"
+  },
+  {
+   "pack_idx": 85,
+   "file": "176.png"
+  },
+  {
+   "pack_idx": 89,
+   "file": "18.png"
+  },
+  {
+   "pack_idx": 93,
+   "file": "183.png"
+  },
+  {
+   "pack_idx": 97,
+   "file": "187.png"
+  },
+  {
+   "pack_idx": 101,
+   "file": "190.png"
+  },
+  {
+   "pack_idx": 105,
+   "file": "194.png"
+  },
+  {
+   "pack_idx": 109,
+   "file": "198.png"
+  },
+  {
+   "pack_idx": 113,
+   "file": "200.png"
+  },
+  {
+   "pack_idx": 117,
+   "file": "204.png"
+  },
+  {
+   "pack_idx": 121,
+   "file": "208.png"
+  },
+  {
+   "pack_idx": 125,
+   "file": "211.png"
+  },
+  {
+   "pack_idx": 129,
+   "file": "215.png"
+  },
+  {
+   "pack_idx": 133,
+   "file": "219.png"
+  },
+  {
+   "pack_idx": 137,
+   "file": "222.png"
+  },
+  {
+   "pack_idx": 141,
+   "file": "226.png"
+  },
+  {
+   "pack_idx": 145,
+   "file": "23.png"
+  },
+  {
+   "pack_idx": 149,
+   "file": "233.png"
+  },
+  {
+   "pack_idx": 153,
+   "file": "237.png"
+  },
+  {
+   "pack_idx": 157,
+   "file": "240.png"
+  },
+  {
+   "pack_idx": 161,
+   "file": "244.png"
+  },
+  {
+   "pack_idx": 165,
+   "file": "248.png"
+  },
+  {
+   "pack_idx": 169,
+   "file": "251.png"
+  },
+  {
+   "pack_idx": 173,
+   "file": "255.png"
+  },
+  {
+   "pack_idx": 177,
+   "file": "259.png"
+  },
+  {
+   "pack_idx": 181,
+   "file": "262.png"
+  },
+  {
+   "pack_idx": 185,
+   "file": "266.png"
+  },
+  {
+   "pack_idx": 189,
+   "file": "27.png"
+  },
+  {
+   "pack_idx": 193,
+   "file": "273.png"
+  },
+  {
+   "pack_idx": 197,
+   "file": "277.png"
+  },
+  {
+   "pack_idx": 202,
+   "file": "281.png"
+  },
+  {
+   "pack_idx": 206,
+   "file": "285.png"
+  },
+  {
+   "pack_idx": 210,
+   "file": "289.png"
+  },
+  {
+   "pack_idx": 214,
+   "file": "292.png"
+  },
+  {
+   "pack_idx": 218,
+   "file": "296.png"
+  },
+  {
+   "pack_idx": 222,
+   "file": "3.png"
+  },
+  {
+   "pack_idx": 226,
+   "file": "302.png"
+  },
+  {
+   "pack_idx": 230,
+   "file": "306.png"
+  },
+  {
+   "pack_idx": 234,
+   "file": "31.png"
+  },
+  {
+   "pack_idx": 238,
+   "file": "313.png"
+  },
+  {
+   "pack_idx": 242,
+   "file": "317.png"
+  },
+  {
+   "pack_idx": 246,
+   "file": "320.png"
+  },
+  {
+   "pack_idx": 250,
+   "file": "324.png"
+  },
+  {
+   "pack_idx": 254,
+   "file": "328.png"
+  },
+  {
+   "pack_idx": 258,
+   "file": "331.png"
+  },
+  {
+   "pack_idx": 262,
+   "file": "335.png"
+  },
+  {
+   "pack_idx": 266,
+   "file": "339.png"
+  },
+  {
+   "pack_idx": 270,
+   "file": "342.png"
+  },
+  {
+   "pack_idx": 274,
+   "file": "346.png"
+  },
+  {
+   "pack_idx": 278,
+   "file": "35.png"
+  },
+  {
+   "pack_idx": 282,
+   "file": "353.png"
+  },
+  {
+   "pack_idx": 286,
+   "file": "357.png"
+  },
+  {
+   "pack_idx": 290,
+   "file": "360.png"
+  },
+  {
+   "pack_idx": 294,
+   "file": "364.png"
+  },
+  {
+   "pack_idx": 298,
+   "file": "368.png"
+  },
+  {
+   "pack_idx": 302,
+   "file": "371.png"
+  },
+  {
+   "pack_idx": 306,
+   "file": "375.png"
+  },
+  {
+   "pack_idx": 310,
+   "file": "379.png"
+  },
+  {
+   "pack_idx": 314,
+   "file": "382.png"
+  },
+  {
+   "pack_idx": 318,
+   "file": "386.png"
+  },
+  {
+   "pack_idx": 322,
+   "file": "39.png"
+  },
+  {
+   "pack_idx": 326,
+   "file": "393.png"
+  },
+  {
+   "pack_idx": 330,
+   "file": "397.png"
+  },
+  {
+   "pack_idx": 335,
+   "file": "400.png"
+  },
+  {
+   "pack_idx": 339,
+   "file": "44.png"
+  },
+  {
+   "pack_idx": 343,
+   "file": "48.png"
+  },
+  {
+   "pack_idx": 347,
+   "file": "51.png"
+  },
+  {
+   "pack_idx": 351,
+   "file": "55.png"
+  },
+  {
+   "pack_idx": 355,
+   "file": "59.png"
+  },
+  {
+   "pack_idx": 359,
+   "file": "62.png"
+  },
+  {
+   "pack_idx": 363,
+   "file": "66.png"
+  },
+  {
+   "pack_idx": 367,
+   "file": "7.png"
+  },
+  {
+   "pack_idx": 371,
+   "file": "73.png"
+  },
+  {
+   "pack_idx": 375,
+   "file": "77.png"
+  },
+  {
+   "pack_idx": 379,
+   "file": "80.png"
+  },
+  {
+   "pack_idx": 383,
+   "file": "84.png"
+  },
+  {
+   "pack_idx": 387,
+   "file": "88.png"
+  },
+  {
+   "pack_idx": 391,
+   "file": "91.png"
+  },
+  {
+   "pack_idx": 395,
+   "file": "95.png"
+  },
+  {
+   "pack_idx": 399,
+   "file": "99.png"
+  }
+ ]
+}

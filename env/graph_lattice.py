@@ -519,7 +519,8 @@ class GraphLattice:
         info: dict[str, torch.Tensor],
         gamma_vf: float = 0.97,
         max_iters: int | None = None,
-    ) -> torch.Tensor:
+        return_branch: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-FIRST-STEP discounted utility mass over the BF shortest-path tree from curr.
 
         V_k = Σ_{v : shortest path curr→v leaves through neighbor k} gamma_vf^{hops(v)} · utility(v)
@@ -535,6 +536,13 @@ class GraphLattice:
 
         Returns vf [N, K] ∈ [0,1]: V normalized by its max over k (relative branch value,
         utility-scale-free; all-zero when no reachable utility — the "desert" signal).
+
+        With return_branch=True also returns the two intermediate fields the scatter throws away:
+            label [N, N_max] long : first-step branch each node hangs off, -1 = unreachable
+            mass  [N, N_max] float: gamma_vf^hops · utility, zeroed where label < 0
+        They are what turns "how much value lies down exit k" into "WHICH nodes exit k leads to",
+        which is the shared space two agents' choices can be compared in — the branch index itself
+        is ego-relative and means nothing across agents. Costs nothing: both already exist.
         """
         dist   = info["bf_dist_from_curr"]                                   # [N, N_max] px
         parent = info["bf_parent_from_curr"]                                 # [N, N_max]
@@ -570,7 +578,10 @@ class GraphLattice:
         mass = torch.where(torch.isfinite(dist) & (label >= 0), mass, torch.zeros_like(mass))
         V = torch.zeros((N, K), dtype=torch.float32, device=dev)
         V.scatter_add_(1, label.clamp(min=0), mass)                          # -1 rows carry 0 mass
-        return V / V.max(dim=1, keepdim=True).values.clamp(min=1e-6)
+        vf = V / V.max(dim=1, keepdim=True).values.clamp(min=1e-6)
+        if return_branch:
+            return vf, label, mass
+        return vf
 
     @torch.no_grad()
     def build_radar(
