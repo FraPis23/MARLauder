@@ -16,6 +16,7 @@ if str(_REPO) not in sys.path:
 import imageio.v2 as imageio
 import torch
 
+from paths import RUNS_ROOT
 from env.explorer import EnvCfg, Explorer
 from env.maps import load_split
 from eval.rollout import EvalCfg, EvalRollout
@@ -39,7 +40,7 @@ def main() -> None:
     ap.add_argument("--force-full-pos-sharing", action="store_true",
                     help="I.2: force persistent teammate-pos awareness at eval (override ckpt)")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--out", type=Path, default=Path("/workspace/MARLauder/runs/eval.gif"))
+    ap.add_argument("--out", type=Path, default=RUNS_ROOT / "eval.gif")
     args = ap.parse_args()
 
     # Peek at ckpt to recover FULL env cfg (n_hops, top_k, force flags, ...).

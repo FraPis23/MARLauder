@@ -20,12 +20,18 @@ import os
 import sys
 from pathlib import Path
 
+_REPO = Path(__file__).resolve().parents[2]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
 import numpy as np
 import imageio.v2 as imageio
 
-MARL_DATA = Path("/workspace/MARLauder/data")
-IR2_MAPS = Path("/workspace/IR2-Multi-Robot-RL-Exploration/DungeonMaps")
-IR2_COMPARISON_MAPS = Path("/workspace/IR2-Multi-Robot-RL-Exploration/comparison")
+from paths import DATA_ROOT, IR2_ROOT
+
+MARL_DATA = DATA_ROOT
+IR2_MAPS = IR2_ROOT / "DungeonMaps"
+IR2_COMPARISON_MAPS = IR2_ROOT / "comparison"
 _COMPARISON_DIR = Path(__file__).resolve().parent
 
 SPLITS = ["test/complex", "test/corridor", "test/hybrid", "train/easy", "train/difficult"]
@@ -59,38 +65,38 @@ def check_split(split: str, n_samples: int) -> list[str]:
         fname = str(files[i])
         png = IR2_MAPS / split / fname
         if not png.exists():
-            errors.append(f"{split}[{i}] PNG mancante: {png}")
+            errors.append(f"{split}[{i}] PNG missing: {png}")
             continue
         free_png, blob = png_to_gt(png)
         h, w = int(shapes[i][0]), int(shapes[i][1])
         if free_png.shape != (h, w):
-            errors.append(f"{split}[{i}] {fname}: shape PNG {free_png.shape} != valid_shape ({h},{w})")
+            errors.append(f"{split}[{i}] {fname}: PNG shape {free_png.shape} != valid_shape ({h},{w})")
             continue
         pack_region = np.asarray(maps[i, :h, :w])
         # NOTE: the 208 start blob is > 150, so it is FREE in both conversions.
         if not np.array_equal(pack_region, free_png):
             diff = int((pack_region != free_png).sum())
-            errors.append(f"{split}[{i}] {fname}: mask mismatch su {diff} px")
+            errors.append(f"{split}[{i}] {fname}: mask mismatch on {diff} px")
         # padding beyond valid region must be obstacle
         if maps[i, h:, :].any() or maps[i, :, w:].any():
-            errors.append(f"{split}[{i}] {fname}: padding non-ostacolo")
+            errors.append(f"{split}[{i}] {fname}: padding is not obstacle")
         # start: pack start (row,col) inside the PNG 208 blob
         r, c = int(starts[i][0]), int(starts[i][1])
         if r >= 0:
             if not blob.any():
-                errors.append(f"{split}[{i}] {fname}: pack ha start ma PNG senza pixel 208")
+                errors.append(f"{split}[{i}] {fname}: pack has a start but the PNG has no 208 pixel")
             elif not blob[r, c]:
-                errors.append(f"{split}[{i}] {fname}: start pack ({r},{c}) fuori dal blob 208")
+                errors.append(f"{split}[{i}] {fname}: pack start ({r},{c}) is outside the 208 blob")
         elif blob.any():
-            errors.append(f"{split}[{i}] {fname}: PNG ha blob 208 ma pack start=(-1,-1)")
-    print(f"[{split}] {len(idxs)} mappe controllate: " + ("OK" if not errors else f"{len(errors)} ERRORI"))
+            errors.append(f"{split}[{i}] {fname}: PNG has a 208 blob but pack start=(-1,-1)")
+    print(f"[{split}] {len(idxs)} maps checked: " + ("OK" if not errors else f"{len(errors)} ERRORS"))
     return errors
 
 
 def check_order(split: str) -> list[str]:
     """map_indices_{split}.json must list maps in the order IR2 actually runs them.
 
-    THE GATE THIS FILE EXISTED WITHOUT UNTIL 2026-08-20. Verifying that the two systems see the
+    THE GATE THIS FILE ORIGINALLY LACKED. Verifying that the two systems see the
     same MAPS is not enough — the comparison is PAIRED, so it also needs row i of the two CSVs to
     be the same map, and that depends on the ORDER of IR2's map list:
 
@@ -100,7 +106,7 @@ def check_order(split: str) -> list[str]:
 
     The json was ASCENDING while IR2 iterates DESCENDING, so episode 0 was 99.png on their side and
     1.png on ours. Per-cell means survived that (same 100 maps, different order); every paired
-    statistic did not. See ir2_comparison_export/PROTOCOL_V2_DISTANZA.md §9-bis.
+    statistic did not. See eval/comparison/PROTOCOL.md, section "Map order".
     """
     idx_file = _COMPARISON_DIR / f"map_indices_{split.split('/')[-1]}.json"
     map_dir = IR2_COMPARISON_MAPS / f"maps_{split.split('/')[-1]}"
@@ -110,14 +116,14 @@ def check_order(split: str) -> list[str]:
     want = sorted(os.listdir(map_dir), reverse=True)          # exactly IR2 env.py:34-35
     got = [e["file"] for e in entries]
     if got == want:
-        print(f"[{split}] ordine mappe == ordine IR2 (discendente): OK")
+        print(f"[{split}] map order matches IR2 (descending): OK")
         return []
     first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), 0)
     hint = ""
     if got == sorted(want):
-        hint = ("  <-- il json e' in ordine ASCENDENTE; IR2 usa sort(reverse=True). "
-                "Questo e' esattamente il bug del 2026-08-20.")
-    return [f"{split}: ordine mappe DIVERSO da IR2. Prima differenza a eps {first}: "
+        hint = ("  <-- the json is in ASCENDING order; IR2 uses sort(reverse=True). "
+                "This is exactly the pairing bug this check exists to catch.")
+    return [f"{split}: map order DIFFERS from IR2. First difference at eps {first}: "
             f"json={got[first]} vs IR2={want[first]}.{hint}"]
 
 
@@ -130,7 +136,7 @@ def main() -> None:
         all_err += check_order(split)
     for split in SPLITS:
         if not (MARL_DATA / split / "maps.npy").exists():
-            print(f"[{split}] SKIP (pack assente)")
+            print(f"[{split}] SKIP (pack absent)")
             continue
         all_err += check_split(split, args.n_per_split)
     if all_err:
@@ -138,7 +144,7 @@ def main() -> None:
         for e in all_err:
             print(" -", e)
         sys.exit(1)
-    print("\nPARITY OK — dataset identici, comparison può procedere.")
+    print("\nPARITY OK — datasets are identical, the comparison may proceed.")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Apre una shell bash nel container in esecuzione.
-# Eseguibile piu volte in parallelo => piu terminali sullo stesso container.
-# Avvia prima il container se non e attivo.
+# Open a bash shell in the running container.
+# Can be run several times in parallel => several terminals on the same container.
+# Starts the container first if it is not already up.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ -z "$(docker compose ps -q marlauder 2>/dev/null)" ]; then
-  echo "Container non attivo, lo avvio..."
+  echo "Container not running, starting it..."
   docker compose up -d
 fi
 # GPU passthrough injects the host's render/video group GIDs as supplementary groups;

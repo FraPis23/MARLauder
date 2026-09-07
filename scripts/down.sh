@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ferma e rimuove il container.
+# Stop and remove the container.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 docker compose down

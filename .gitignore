@@ -1,18 +1,37 @@
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
-# Mappe preprocessate (~9GB) — rigenerabili con scripts/preprocess_maps.py dai PNG IR2
+.ipynb_checkpoints/
+
+# --- Datasets (regenerate with scripts/preprocess_maps.py from the DungeonMaps PNGs) ---
 data/
 *.npy
 *.npz
+
+# --- Training / evaluation outputs ---
 runs/
 logs/
 checkpoints/
-*.pth
 *.pt
+*.pth
 wandb/
-.ipynb_checkpoints/
+metrics.jsonl
+status.json
+params.json
+control.json
+traces/
+
+# --- Rendered media ---
 *.gif
 *.mp4
+# (PNG deliberately NOT ignored: doc/paper figures are tracked; generated
+# images all live under runs/ or traces/, which are ignored above.)
+
+# --- Scratch ---
+*.log
+*.tgz
+*.tar.gz
+.DS_Store

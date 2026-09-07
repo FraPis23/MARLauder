@@ -7,18 +7,17 @@ Occupancy is shaded by probability (sigmoid(log-odds)):
 
 Walls are NOT red, so they cannot be confused with frontiers.
 Frontier cells appear as a soft red tint on top of the FREE-shaded background.
-Guidepost target = amber ring; the path leading to it = amber polyline.
 
 Public API
 ----------
     shade_occupancy_prob(prob_np) -> RGB uint8 [H, W, 3]
     overlay_gt_hint(rgb, gt, prob) -> RGB uint8 (faint outline of true walls under UNK)
     paint_frontier(rgb, frontier_np)
-    paint_path(im, path_xy, path_valid, color, width)
-    paint_target(im, target_xy, color, ring)
     paint_graph(im, nxy, nv, util, curr, draw_edges=False, eidx=None, evalid=None)
     paint_agent(im, xy, trail)
+    paint_comm_link(im, xy0, xy1)
     composite_frame(...) -> Image
+    hstack_frames(frames) -> ndarray
 """
 from __future__ import annotations
 
@@ -43,8 +42,6 @@ C_UTIL_HI = np.array([255, 210, 60], dtype=np.float32)
 C_WIN = (255, 255, 255)          # ego-window highlight (box + node rings)
 C_EDGE = (90, 100, 115)
 C_TRAIL = (150, 200, 255)
-C_PATH = (255, 180, 40)        # amber polyline
-C_TARGET = (255, 230, 60)      # bright amber ring
 C_COMM_LINK = (80, 240, 120)   # green comm line between agents
 # Per-agent colors (index into this list)
 C_AGENTS = [(90, 160, 255), (90, 220, 100), (255, 140, 60), (220, 90, 255)]
@@ -80,38 +77,6 @@ def paint_frontier(rgb: np.ndarray, frontier: np.ndarray, alpha: float = 0.55) -
     mask = frontier[..., None].astype(np.float32)
     rgb = rgb * (1 - mask * alpha) + tint * (mask * alpha)
     return rgb.clip(0, 255).astype(np.uint8)
-
-
-def paint_path(
-    im: Image.Image,
-    path_xy: np.ndarray | None,
-    path_valid: np.ndarray | None,
-    color: tuple[int, int, int] = C_PATH,
-    width: int = 3,
-) -> Image.Image:
-    """Draw an optional route polyline. path_xy [P, 2], path_valid [P] bool.
-    Valid entries are drawn as a polyline (None → nothing drawn)."""
-    if path_xy is None or path_valid is None:
-        return im
-    pts = [(float(path_xy[p, 0]), float(path_xy[p, 1])) for p in range(path_xy.shape[0]) if bool(path_valid[p])]
-    if len(pts) >= 2:
-        ImageDraw.Draw(im).line(pts, fill=color, width=width)
-    return im
-
-
-def paint_target(
-    im: Image.Image,
-    target_xy: tuple[float, float] | None,
-    color: tuple[int, int, int] = C_TARGET,
-    ring: int = 9,
-) -> Image.Image:
-    if target_xy is None:
-        return im
-    x, y = target_xy
-    dr = ImageDraw.Draw(im)
-    dr.ellipse([x - ring, y - ring, x + ring, y + ring], outline=color, width=3)
-    dr.ellipse([x - 2, y - 2, x + 2, y + 2], fill=color)
-    return im
 
 
 def paint_graph(
@@ -216,9 +181,6 @@ def composite_frame(
     evalid: np.ndarray | None = None,
     win_node_mask: np.ndarray | None = None,
     win_bbox: tuple[float, float, float, float] | None = None,
-    path_xy: np.ndarray | None = None,
-    path_valid: np.ndarray | None = None,
-    target_xy: tuple[float, float] | None = None,
     # Multi-agent extras (optional)
     extra_agents_xy: list[tuple[float, float]] | None = None,
     extra_agents_trails: list[list[tuple[float, float]]] | None = None,
@@ -230,14 +192,12 @@ def composite_frame(
     rgb = shade_occupancy_prob(prob)
     rgb = paint_frontier(rgb, frontier)
     im = Image.fromarray(rgb)
-    # draw order: edges → comm links → path → nodes → target → agents → text
+    # draw order: edges → comm links → nodes → agents → text
     paint_graph(im, nxy, nv, util, curr, draw_edges, eidx, evalid,
                 win_node_mask=win_node_mask, win_bbox=win_bbox)
     if comm_links:
         for xy0, xy1 in comm_links:
             paint_comm_link(im, xy0, xy1)
-    paint_path(im, path_xy, path_valid)
-    paint_target(im, target_xy)
     # Extra agents drawn first (behind main agent)
     if extra_agents_xy:
         for ag_i, axy in enumerate(extra_agents_xy):
@@ -260,7 +220,3 @@ def composite_frame(
 def hstack_frames(frames: list[np.ndarray]) -> np.ndarray:
     """Concatenate per-agent frames horizontally into one wide image."""
     return np.concatenate(frames, axis=1)
-
-
-# Back-compat alias for old callers.
-shade_belief_prob = shade_occupancy_prob

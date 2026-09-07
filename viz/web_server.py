@@ -2,7 +2,7 @@
 """MARLauder web interface server.
 
 Serves runs/ as static files + GET /api/runs for run discovery.
-Run from the repo root (working_dir = /workspace/MARLauder):
+Run from the repository root:
     python viz/web_server.py [--port 8080]
 """
 from __future__ import annotations

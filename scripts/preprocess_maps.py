@@ -1,32 +1,42 @@
-"""Preprocessing una-tantum delle DungeonMaps IR2 -> tensori GPU-ready.
+"""One-off preprocessing of the IR2 DungeonMaps PNGs into GPU-ready tensors.
 
-Per ogni split (train/easy, train/difficult, test/*):
-  - normalizza canali (RGBA/RGB -> grayscale L)
-  - binarizza  raw > 150  ->  1 = free, 0 = ostacolo  (convenzione IR2 import_ground_truth)
-  - estrae lo start (pixel == 208); se assente -> (-1,-1), l'env scegliera una cella free a runtime
-  - pad a canvas comune (max H, max W dello split) col bordo = ostacolo (0), mappa ancorata in alto-sx
+For each split (train/easy, train/difficult, test/*):
+  - normalise channels (RGBA/RGB -> grayscale L)
+  - binarise  raw > 150  ->  1 = free, 0 = obstacle  (IR2's import_ground_truth convention)
+  - extract the start pixel (value == 208); if absent -> (-1, -1) and the env picks a free cell
+    at runtime
+  - pad to a common canvas (the split's max H, max W) with obstacle (0) at the border, map
+    anchored top-left
 
-Output in  MARLauder/data/<split>/ :
-  maps.npy        uint8  [N, Hc, Wc]   (0=ostacolo, 1=free)   -> memmap, niente PNG-decode nel training
-  meta.npz        starts[N,2] int16, valid_shapes[N,2] int16, free_counts[N] int32,
-                  canvas[2] int32, files (lista nomi)
+Output in  data/<split>/ :
+  maps.npy   uint8  [N, Hc, Wc]   (0 = obstacle, 1 = free)   memmapped, so no PNG decode in training
+  meta.npz   starts[N,2] int16, valid_shapes[N,2] int16, free_counts[N] int32,
+             canvas[2] int32, files (list of source filenames)
 
-A runtime: np.load(mmap_mode='r') + torch.from_numpy(slice).to(cuda). Nessun numpy nel loop di training.
+At runtime: np.load(mmap_mode='r') + torch.from_numpy(slice).to(cuda). No numpy in the training loop.
 """
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+from paths import DATA_ROOT, IR2_ROOT
+
 FREE_THRESHOLD = 150  # raw > 150 => free  (cfr env.py import_ground_truth)
 START_VALUE = 208     # pixel marcatore start
 
-DEFAULT_SRC = Path("/workspace/IR2-Multi-Robot-RL-Exploration/DungeonMaps")
-DEFAULT_OUT = Path("/workspace/MARLauder/data")
+DEFAULT_SRC = IR2_ROOT / "DungeonMaps"
+DEFAULT_OUT = DATA_ROOT
 SPLITS = ["train/easy", "train/difficult", "test/complex", "test/corridor", "test/hybrid"]
 
 
@@ -53,7 +63,7 @@ def process_split(src: Path, out: Path, split: str) -> None:
     split_dir = src / split
     files = list_pngs(split_dir)
     if not files:
-        print(f"[skip] {split}: nessun png in {split_dir}")
+        print(f"[skip] {split}: no PNG found in {split_dir}")
         return
 
     hc, wc = canvas_size(files)
@@ -91,7 +101,7 @@ def process_split(src: Path, out: Path, split: str) -> None:
         files=np.array([f.name for f in files]),
     )
     with_start = int((starts[:, 0] >= 0).sum())
-    print(f"[ok] {split}: {n} mappe | canvas {hc}x{wc} | start trovato {with_start}/{n} "
+    print(f"[ok] {split}: {n} maps | canvas {hc}x{wc} | start found {with_start}/{n} "
           f"| maps.npy ~{maps.nbytes/1e9:.2f} GB")
 
 

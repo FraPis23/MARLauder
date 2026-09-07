@@ -14,6 +14,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from env.explorer import EnvCfg
+from paths import RUNS_ROOT
 from scripts.train_args import build_parser
 from jsonio import jsonable
 from train.driver import TrainCfg, train
@@ -62,7 +63,7 @@ def main() -> None:
         import time as _time
         _stamp = _time.strftime("%Y%m%d_%H%M%S")
         _base = (args.wandb_run_name or "run").strip().replace("/", "_") or "run"
-        args.out = _unique_dir(Path("/workspace/MARLauder/runs") / f"{_base}_{_stamp}")
+        args.out = _unique_dir(RUNS_ROOT / f"{_base}_{_stamp}")
         print(f"[out] auto run dir → {args.out}")
     else:
         args.out = Path(args.out)

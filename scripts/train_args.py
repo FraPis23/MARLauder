@@ -246,7 +246,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Disable the automatic 20/40/60/80/100%% checkpoints. Use with the web "
                          "dashboard's on-demand 'checkpoint + eval' button to avoid useless ckpts.")
     g_flags.add_argument("--eval-on-ckpt", action="store_true",
-                    help="Emit 2 eval GIFs at each milestone (25/50/75/100%%)")
+                    help="Emit eval GIFs + inspector traces at each milestone checkpoint "
+                         "(20/40/60/80/100%%; --eval-n-maps per milestone)")
     g_flags.add_argument("--eval-every", type=int, default=10,
                     help="Iterations between eval-suite ticks. The suite is 32 maps x full episodes "
                          "on ONE env and renders nothing: measured on v19 (M=4, 768 steps) it costs "

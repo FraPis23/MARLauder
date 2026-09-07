@@ -20,6 +20,7 @@ if str(_REPO) not in sys.path:
 
 import torch
 
+from paths import RUNS_ROOT
 from env.maps import load_split
 from eval.ckpt_loader import load_model_from_ckpt
 from eval.trace import capture_trace
@@ -39,7 +40,7 @@ def main() -> None:
     ap.add_argument("--n-heads", type=int, default=None, help="default: from ckpt")
     ap.add_argument("--n-layers", type=int, default=None, help="default: from ckpt")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--out", type=Path, default=Path("/workspace/MARLauder/runs/trace_run"))
+    ap.add_argument("--out", type=Path, default=RUNS_ROOT / "trace_run")
     ap.add_argument("--tag", default=None, help="trace name (default ckpt+map)")
     ap.add_argument("--comm-gated-pos", action="store_true",
                     help="Override force_full_pos_sharing=False so teammate last-known pos freezes "

@@ -15,6 +15,7 @@ from env.explorer import EnvCfg, Explorer
 from env.maps import MultiSplit, load_split
 from jsonio import jsonable
 from models.actor_critic import MarlActorCritic
+from paths import RUNS_ROOT
 from models.value_normalizer import ValueNormalizer
 from train.buffer import Rollout
 from train.mappo import AMP_DTYPE, MAPPOCfg, ppo_update
@@ -118,7 +119,7 @@ def _save_ckpt(out_dir: Path, model, vnorm, cfg, it: int, tag: str) -> Path:
 @dataclass
 class TrainCfg:
     split: str = "train/easy"
-    out_dir: Path = Path("/workspace/MARLauder/runs/train_default")
+    out_dir: Path = RUNS_ROOT / "train_default"
     total_steps: int = 500_000
     n_envs: int = 8
     n_agents: int = 1

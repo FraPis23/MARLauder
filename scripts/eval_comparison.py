@@ -1,6 +1,6 @@
 """MARLauder side of the MARLauder-vs-IR2 comparison — emits IR2's own CSV, map for map.
 
-The protocol is frozen in eval/comparison/README.md: the metrics are IR2's NATIVE ones, measured
+The protocol is frozen in eval/comparison/PROTOCOL.md: the metrics are IR2's NATIVE ones, measured
 on the SAME 100 maps per split (eval/comparison/map_indices_{split}.json, dataset parity verified
 bit-for-bit by parity_check.py), for M=2 and M=4, never averaged across splits.
 
@@ -68,7 +68,7 @@ CSV_FIELDS = ["eps", "num_robots", "max_dist", "steps", "explored", "success", "
               # reached per-agent 99% the intended way (split the map, then deliberately meet to
               # exchange) or degenerately (never separate, so both maps are identical for free and
               # no rendezvous is ever needed). The degenerate solution scores a perfect `success`
-              # while demonstrating none of the coordination the thesis claims.
+              # while demonstrating none of the coordination being claimed.
               "pair_dist_mean",      # mean inter-agent distance / canvas diagonal, time-averaged
               "pair_dist_max",       # the furthest they ever got apart (same normalisation)
               "comm_duty",           # fraction of steps the pair was in contact. →1.0 = glued
@@ -83,7 +83,7 @@ CSV_FIELDS = ["eps", "num_robots", "max_dist", "steps", "explored", "success", "
               # claimant at IR2's per-map stride. See EnvCfg.attr_ir2_parity.
               "contrib_imbalance_seq",
               "contrib_imbalance_ir2",
-              # --- comparison v2 §6.2: how far our agents ended up from IR2's actual start
+              # --- PROTOCOL.md §4 (v2): how far our agents ended up from IR2's actual start
               # positions after snapping to the lattice. 0 only if IR2 happened to start on one of
               # our nodes. Reported per episode so the claim "same starting positions" carries its
               # own error bar instead of being an assertion.
@@ -135,7 +135,7 @@ def _run_chunk(model, env: Explorer, map_idxs: list[int], cap: int, device: str,
         # formation: the same checkpoint re-run agrees with itself, and the per-map pairing against
         # IR2 stays honest. (Measured drift when unpinned: max_dist 2021 vs 2016 on hybrid_M2.)
         env.rng = np.random.default_rng(map_seed + int(midx))
-        # comparison v2 §6.2: pin the agents to IR2's own start positions when supplied, so the two
+        # PROTOCOL.md §4 (v2): pin the agents to IR2's own start positions when supplied, so the two
         # systems answer the same question from the same place. reload_map snaps each to the
         # nearest free lattice node and records the residual in env.last_start_offset_px.
         env.reload_map(env_idx=i, map_idx=int(midx),
@@ -143,7 +143,7 @@ def _run_chunk(model, env: Explorer, map_idxs: list[int], cap: int, device: str,
         if starts is not None:
             start_off.append(env.last_start_offset_px.clone())
 
-    # comparison v2 §7.1: PER-MAP travel budget = the distance IR2 spent on that same map. Set
+    # PROTOCOL.md §4 (v2): PER-MAP travel budget = the distance IR2 spent on that same map. Set
     # after the reloads because reload_map does a full reset. This drives BOTH truncation and the
     # actor's travel_frac observation (Explorer.budget_px), which is what keeps the policy
     # on-distribution: v20 trains with rdv_urgency_mode="budget", so the rendezvous pull ramps on
@@ -374,7 +374,7 @@ def _run_cell(ckpt: Path, split_name: str, M: int, entries: list[dict], cap: int
             # truncated the evaluation — a per-map ceiling of 3840 px on corridor where IR2 spends
             # 7204, i.e. our own training handicap carried into their test. It also takes
             # precedence over max_travel_px, so setting the flat budget alone did nothing.
-            # See PROTOCOL_V2_DISTANZA.md §2.
+            # See PROTOCOL.md §2, "Dataset".
             max_travel_frac=0.0,
             done_mode="own",                 # <- the IR2 stopping rule; see the module docstring
             map_seed=map_seed,               # constructor draw; _run_chunk re-keys it per map
@@ -442,7 +442,7 @@ def main() -> None:
                          "up to 160 px while ours is a lattice hop of at most 22.63, so equal step "
                          "caps hand us ~45%% of their metres on complex — the cap is written in the "
                          "one unit the protocol itself calls incomparable. See "
-                         "ir2_comparison_export/PROTOCOL_V2_DISTANZA.md.")
+                         "eval/comparison/PROTOCOL.md.")
     ap.add_argument("--vf-gamma", type=float, default=None,
                     help="ABLATION: per-hop discount of the VALUE-FIELD actor input (EnvCfg."
                          "vf_gamma, trained at 0.97). It sets how far down the BF tree utility "

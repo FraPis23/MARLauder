@@ -35,12 +35,13 @@ class Rollout:
             "pos":                _z((T, N, M, 2),             torch.float32),
             # Previous-action one-hot per agent.
             "prev_action":        _z((T, N, M, K),             torch.float32),
-            # Rendezvous raw actor obs [∆M surplus-gate, staleness] per agent.
+            # Per-agent actor scalars. See AGENT_SCALAR_DIM in models/actor_critic.py for the
+            # authoritative order: [g, staleness, travel_frac, contact, offer_frac].
             "agent_scalars":      _z((T, N, M, sample_obs["agent_scalars"].shape[-1]), torch.float32),
             # Value-field: per-first-step discounted utility mass [K], actor input.
             "value_field":        _z((T, N, M, K),             torch.float32),
             # CTDE critic-only global state (value head only): shape from sample_obs.
-            # [explored_frac, t/T, geo_pair, coverage_rate, redundancy, idle_frac, imbalance].
+            # [explored_frac, t/T, geo_pair, coverage_rate, redundancy, sync_surplus, sync_staleness].
             "critic_global":      _z((T, N, sample_obs["critic_global"].shape[-1]), torch.float32),
         }
         # CTDE frontier-diversity overlap [M, M, K, K], present only when EnvCfg.div_overlap is on.

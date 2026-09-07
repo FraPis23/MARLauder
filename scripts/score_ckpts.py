@@ -41,7 +41,7 @@ from train.driver import TrainCfg, _eval_map_idxs, _run_eval_suite
 # difference can be ATTRIBUTED instead of guessed: two checkpoints can trade a better AUC for a
 # worse imbalance and land at the same score, which is a completely different result from a tie.
 # The equity terms carry weight 0.5+0.25 of the composite and appear NOWHERE in the IR2 comparison
-# CSV (eval_comparison.py:63-75 = steps/explored/success/connectivity/max_dist), so for the thesis
+# CSV (eval_comparison.py:63-75 = steps/explored/success/connectivity/max_dist), so for the paper
 # endpoint the outcome block below is what decides — read both, never the composite alone.
 REPORT = ["eval/score",
           "eval/coverage_auc", "eval/contrib_imbalance_norm", "eval/sensing_overlap",

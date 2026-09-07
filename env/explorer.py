@@ -1,29 +1,47 @@
-"""Vectorized exploration environment, GPU-resident. v0.3: per-agent maps + comm.
+"""Vectorized, GPU-resident multi-agent exploration environment.
 
-State (all torch tensors on device):
-    gt[N, H, W]                   uint8 — ground truth (0=obst, 1=free)
-    occupancy[N, M, H, W]         uint8 — per-agent local map (v0.3: per-agent)
-    occupancy_logodds[N, M, H, W] f32   — Bayesian log-odds per agent
-    pos[N, M, 2]                  f32   — (x, y) world coords
-    last_known_pos[N, M, M, 2]    f32   — agent i's last known position of agent j
-    comm_mask[N, M, M]            bool  — who can communicate this step
-    visited_step[N, M, N_max]     long  — last step node was curr, -1 if never
-    t[N]                          long  — current step
+Every tensor lives on the device; there is no host round-trip inside a step. The M agents are
+folded into the batch dimension (B = N·M) for the graph, Bellman-Ford and window-extraction
+passes, so those run once per step rather than once per agent.
 
-Communication (v0.3):
-    comm_range_px: Euclidean range threshold (pixels).
-    LOS: sampled Bresenham check on gt (no comm through walls).
-    On comm: fuse log-odds maps via elementwise max (idempotent).
-    Positions exchanged: last_known_pos updated for visible agents.
+State
+-----
+    gt[N, H, W]                    uint8 — ground truth (0 = obstacle, 1 = free)
+    occupancy[N, M, H, W]          uint8 — each agent's OWN map (0 unknown, 1 free, 2 obstacle)
+    occupancy_logodds[N, M, H, W]  f32   — the Bayesian log-odds it is derived from
+    pos[N, M, 2]                   f32   — (x, y) world coordinates
+    last_known_pos[N, M, M, 2]     f32   — agent i's last known position of agent j
+    t_last_comm[N, M, M]           long  — step of the last contact between i and j
+    visited_step[N, M, N_max]      long  — step a node was last occupied, -1 if never
+    travel_px[N, M]                f32   — cumulative distance travelled this episode
+    t[N]                           long  — current step
 
-step(action[N, M]):
-    1. Move agents (linear interp + collision clamp).
-    2. LiDAR scan (per-agent).
-    3. Communication check + map fusion + last_known_pos update.
-    4. Graph rebuild per agent + radar boundary summary.
-    5. Team reward = Δ(union of FREE across M agents) / total_free.
+Communication
+-------------
+Two models, selected by `EnvCfg.comm_model`:
+  * `signal_strength` (default for new runs) — a log-distance path-loss radio. Walls ATTENUATE
+    rather than block; per-episode shadowing noise is resampled at every reset. Two agents connect
+    iff the received power exceeds `ss_thresh`.
+  * `los` — a hard Euclidean cutoff plus a Bresenham line-of-sight test on the ground truth.
 
-reset(indices): reload map, reset all per-agent state.
+With `comm_relay` on, the pairwise mask is closed transitively, so A-B-C exchange maps, positions
+and staleness clocks through B in a single step. On contact the per-agent log-odds maps are fused
+by max-magnitude (which preserves OBSTACLE evidence a plain max would drop).
+
+step(action[N, M])
+------------------
+    1. decode the K=8 slot into a target node; arbitrate two agents picking the same node
+    2. sub-step motion with LiDAR rescans, wall reverts and asymmetric agent-agent collision
+    3. comm check → sync-event reward (PRE-fusion, so the set difference is not yet empty)
+       → map fusion → last_known_pos / staleness update
+    4. per-agent reward: novel_scan − revisit − stall + sync + completion − step_penalty
+    5. _refresh_obs: frontier, graph, Bellman-Ford, teammate belief, radar, value field, ego window
+    6. the dense rendezvous term, which needs the geodesic field step 5 produces
+
+Episodes truncate on whichever binds first, the step cap or the travel budget, and terminate when
+the coverage criterion selected by `done_mode` ("union" or per-robot "own") is met. Finished
+environments auto-reset at the tail of `step`, so anything measured afterwards must be read from
+the returned `info`, not from the live tensors.
 """
 from __future__ import annotations
 
@@ -411,15 +429,15 @@ class EnvCfg:
     # absorbs on them forever. Measured on test/hybrid #1 at t=60: 29 of the 32 nodes flagged as
     # frontiers had util_boundary = 0.000, i.e. a PRE-DIFFUSION seed of exactly 0.0 — no ribbon at
     # all — and they were holding 0.2442 of the belief. `util_raw` (= f_ind, the seed, nonzero only
-    # on true frontier nodes) is the honest test, and it also removes what the user called "la punta
-    # dell'angolo di una stanza": a corner tip has a negligible ribbon, so a negligible seed. The
+    # on true frontier nodes) is the honest test, and it also removes the
+    # "tip of a room corner" case: a corner tip has a negligible ribbon, so a negligible seed. The
     # DIFFUSED utility is NOT usable here — a corner tip next to a real opening inherits its value.
     # STRICTLY POSITIVE, not a tuned threshold. The bug is nodes with EXACTLY zero ribbon, and
     # `> 0` is the whole fix. A threshold of 0.10 was calibrated on one test/hybrid episode, where
     # genuine openings scored 0.14-0.90 — it does NOT generalise: on train/easy the same gate cut
     # the openings from ~20 per step to ~5 and, because a hypothesis needs a frontier target, took
     # the belief's own liveness with it. Measured with a fixed policy over 4 easy maps, 1600 steps
-    # (scripts/pf_obs_diag.py), against the v13 belief as control — frontier nodes · belief alive
+    # with a fixed-policy observation probe, against the v13 belief as control — frontier nodes · belief alive
     # while out of comm · feat[4] teammate_pot nonzero · mass on real openings:
     #   v13 belief, no gate   21.1 · 99.4% · 24.7% · 0.184
     #   gate 0.10 (shipped)    5.5 · 81.0% ·  5.6% · 0.542   <- v14's 60-iteration regression
@@ -536,7 +554,7 @@ class Explorer:
         # Cumulative px travelled per robot this episode (EnvCfg.max_travel_px budget + the
         # max_dist column of the IR2 comparison). Reset with self.t at every episode boundary.
         self.travel_px    = torch.zeros((self.N, self.M),              dtype=torch.float32, device=self.dev)
-        # PER-ENV travel budget override, [N] px (comparison v2, PROTOCOL_V2_DISTANZA.md §7.1).
+        # PER-ENV travel budget override, [N] px (eval/comparison/PROTOCOL.md §4, "v2").
         # None = fall back to the cfg-level budgets, so every existing run and eval is unchanged.
         # Set by eval_comparison.py to IR2's per-map distance D_k, which is a DIFFERENT number for
         # every map in the batch and therefore cannot be expressed as an EnvCfg scalar.
@@ -592,8 +610,8 @@ class Explorer:
         # [N, M, M, N_max] (the old mobile/reservoir/cleared triple is gone with the diffusion model).
         self.belief_reached = torch.zeros((self.N, self.M, self.M, self.N_max), dtype=torch.float32, device=self.dev)
         # Orthogonal-neighbour mask over the K lattice slots (|dr|+|dc|==1). The known→unknown FRONTIER
-        # crossing is restricted to these ("archi generabili" — a diagonal free→unknown cuts a corner and
-        # is not a path a robot could generate); known-zone and unknown-interior stay fully 8-connected.
+        # crossing is restricted to these (a "generatable" edge: a diagonal free→unknown cuts a corner
+        # and is not a path a robot could take); known-zone and unknown-interior stay 8-connected.
         self._orth_k = torch.tensor([abs(dr) + abs(dc) == 1 for (dr, dc) in NBR_OFFSETS],
                                     dtype=torch.bool, device=self.dev)         # [K]
         # ---- PATHFRONT belief state (EnvCfg.belief_mode == "pathfront"; env/teammate_belief_pathfront.py).
@@ -1073,7 +1091,7 @@ class Explorer:
             "sync_paid":     sync_paid,
             # Per-agent idle regime this step [N, M] int8: 0=productive, 1=redundant, 2=transit.
             # info["metrics"] carries the same split already reduced to scalars over N and M, which
-            # cannot answer "is ONE agent carrying the idle" — scripts/idle_diag.py needs the raw
+            # cannot answer "is ONE agent carrying the idle" — tools/idle_diag.py needs the raw
             # per-agent codes to cross them with contact / travel_frac / episode phase.
             "idle_bucket":   self._idle_bucket.clone(),
             "idle_flags":    self._idle_flags.clone(),   # bit0 stalled, bit1 revisit, bit2 contact
@@ -1724,8 +1742,8 @@ class Explorer:
     def _snap_to_lattice(self, pts_xy, env_idx: int) -> torch.Tensor:
         """Map M arbitrary (x, y) pixel positions onto the nearest FREE lattice nodes → [M, 2].
 
-        Used to pin MARLauder's agents to IR2's actual start positions (PROTOCOL_V2_DISTANZA.md
-        §6.2). The two systems discretise space differently — IR2 puts robot i on the i-th node of
+        Used to pin MARLauder's agents to IR2's actual start positions
+        (eval/comparison/PROTOCOL.md §4, "v2"). The two systems discretise space differently — IR2 puts robot i on the i-th node of
         its own k-NN graph, we move on a fixed lattice — so NO pixel is a valid node in both. This
         gets as close as the discretisation allows; the residual offset is recorded in
         `last_start_offset_px` and REPORTED rather than assumed away.
@@ -1836,7 +1854,7 @@ class Explorer:
         self._resample_ss_noise(idx_t)
         # Place agents using new map's start, or pin them to externally supplied positions.
         if start_override is not None:
-            # comparison v2 §6.2 — IR2's own per-robot start positions, snapped to our lattice.
+            # PROTOCOL.md §4 (v2) — IR2's own per-robot start positions, snapped to our lattice.
             agent_pos = self._snap_to_lattice(start_override, env_idx)
         else:
             row0, col0 = int(starts_new[0, 0]), int(starts_new[0, 1])
@@ -2189,7 +2207,7 @@ class Explorer:
             # reachability gate — the belief BFS's from the SEED, so it must also fill known-free pockets
             # that are disconnected from the robot in the free graph yet re-entered from the unknown) ∪
             # OPTIMISTIC edges touching an unknown node, split by zone: the known→unknown FRONTIER crossing
-            # (exactly one endpoint unknown) uses ONLY orthogonal edges ("archi generabili" — a diagonal
+            # (exactly one endpoint unknown) uses ONLY orthogonal edges (a "generatable" edge — a diagonal
             # free→unknown cuts a corner, not a generatable path), while the unknown INTERIOR (both endpoints
             # unknown) stays 8-connected (walls invisible → all neighbours reachable). So: known respects
             # walls, exit only through real frontier edges, spread freely in the unknown, AND re-enter known
@@ -2408,7 +2426,7 @@ class Explorer:
                 # Inspector: per-first-step value-field (what the actor sees as obs["value_field"]).
                 "value_field":    self._vf.clone(),                                              # [N, M, K]
                 # Teammate belief posterior p[N, a, j, N_max] (Σ=1 per (a,j) where alive) + alive
-                # mask — for the belief heatmap viz (scripts/viz_belief.py). None when filter off.
+                # mask — consumed by eval/trace.py for the inspector's belief heatmap. None when filter off.
                 "belief_p": (self._belief_p.view(self.N, self.M, self.M, self.N_max).clone()
                              if self._belief_p is not None else None),
                 # Pathfront transit dots (uniform 1.0 markers, viz only) — all Kf travelling hypotheses,

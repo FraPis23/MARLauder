@@ -57,8 +57,8 @@ def _wilcoxon_numpy(d: np.ndarray) -> float:
 
     The container this runs in is ephemeral and scipy is not part of the image, so relying on the
     import meant every p-value in the table printed "scipy missing" — and the paired test is not
-    optional, it is what the frozen protocol asks for (PROTOCOL.md: "Wilcoxon signed-rank APPAIATO
-    per mappa"). This reproduces scipy.stats.wilcoxon's default path for our n: zero differences
+    optional, it is what the frozen protocol asks for (PROTOCOL.md §8: a paired
+    Wilcoxon signed-rank test, per map). This reproduces scipy.stats.wilcoxon's default path for our n: zero differences
     dropped ("wilcox" handling), average ranks on |d|, tie-corrected normal approximation, and NO
     continuity correction — scipy's mode="auto" already switches to the same normal approximation
     above n=25 and correction defaults to False, so with n=100 maps the two agree to ~1e-12.
@@ -150,13 +150,13 @@ def main() -> None:
             for key, prec in (("max_dist", 0), ("steps", 1), ("explored", 3),
                               ("success", 2), ("connectivity", 2),
                               # --- PROTOCOL v2 behaviour columns. Same formula on both sides
-                              # (PROTOCOL_V2_DISTANZA.md §7.2), so these ARE cross-system
+                              # (PROTOCOL.md §6, "Appendix columns"), so these ARE cross-system
                               # comparable — unlike `steps`. They exist because `success` cannot
                               # tell coordinated exploration (split up, then deliberately meet to
                               # exchange) from the degenerate solution (never separate, so the two
                               # maps coincide for free and no rendezvous is ever needed); the
                               # degenerate one scores a perfect `success` while demonstrating none
-                              # of the coordination the thesis claims.
+                              # of the coordination being claimed.
                               ("contrib_imbalance", 3), ("own_gap_final", 3),
                               ("comm_duty", 3), ("sensing_overlap", 3),
                               ("pair_dist_mean_px", 1), ("pair_dist_max_px", 1),

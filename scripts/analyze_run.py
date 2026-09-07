@@ -62,8 +62,8 @@ def load(run_dir: Path) -> dict:
     a truncated curve."""
     path = run_dir / "metrics.jsonl"
     if not path.exists():
-        raise SystemExit(f"{path} not found. Runs started before the metrics writer landed can be "
-                         f"backfilled with scripts/parse_train_log.py.")
+        raise SystemExit(f"{path} not found — this run predates the metrics writer, or was "
+                         f"killed before its first iteration completed.")
     meta, iters, ondemand, events, bad = {}, [], [], [], 0
     with open(path, encoding="utf-8") as fh:
         for line in fh:

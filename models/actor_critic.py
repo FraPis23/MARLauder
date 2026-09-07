@@ -425,7 +425,7 @@ class MarlActorCritic(nn.Module):
         hidden_actor: torch.Tensor,    # [N, M, d]
         hidden_critic: torch.Tensor,   # [N, d]
         prev_action: torch.Tensor,     # [N, M, K=8] one-hot
-        agent_scalars: torch.Tensor,   # [N, M, 2] [∆M-gate, staleness]
+        agent_scalars: torch.Tensor,   # [N, M, AGENT_SCALAR_DIM] — see the constant above
         value_field: torch.Tensor,     # [N, M, K] per-first-step discounted utility ∈[0,1]
         critic_global: torch.Tensor | None = None,       # [N, CRITIC_GLOBAL_DIM] CTDE value-only state
     ) -> dict:

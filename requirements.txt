@@ -1,15 +1,18 @@
-# Core GPU stack (torch provided by base image cu128; warp compiles kernels
-# at runtime for the present GPU -> same image works on 4080 and 5080).
-torch>=2.7
-warp-lang>=1.7
+# Core GPU stack. torch is already provided by the Docker base image
+# (pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime); pip sees the requirement as satisfied there.
+# Warp compiles its kernels at runtime for whichever GPU is present, so one image serves
+# Ada (sm_89) and Blackwell (sm_120) alike.
+torch==2.7.1
+warp-lang==1.15.0
 
-# Map I/O & host-side prep
-numpy
-Pillow
-imageio
+# Map I/O and host-side preprocessing
+numpy>=1.26,<3
+Pillow>=10.0
+imageio>=2.31
 
-# Utils
-tqdm
+# Utilities
+tqdm>=4.66
 
-# Experiment tracking + hyperparameter sweeps
-wandb
+# Optional — experiment tracking. Logging is OFF unless --wandb is passed; every metric is
+# written to runs/<run>/metrics.jsonl regardless.
+wandb>=0.16

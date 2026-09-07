@@ -5,8 +5,8 @@ services:
       dockerfile: docker/Dockerfile
     image: marlauder:latest
     container_name: marlauder
-    # Monta l'intero Thesis_Project: il container vede sia MARLauder
-    # sia IR2-Multi-Robot-RL-Exploration (per le DungeonMaps / benchmark).
+    # Mount the PARENT directory: the container then sees both MARLauder and the sibling
+    # IR2-Multi-Robot-RL-Exploration checkout (the DungeonMaps source and the baseline CSVs).
     volumes:
       - ..:/workspace
       - warp-cache:/root/.cache/warp
@@ -19,7 +19,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    # shared memory ampia per torch dataloader / multiprocessing
+    # Generous shared memory for torch dataloader / multiprocessing
     ipc: host
     shm_size: "8gb"
     ports:

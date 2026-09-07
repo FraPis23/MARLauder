@@ -21,7 +21,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-DEFAULT_ROOT = Path("/workspace/MARLauder/data")
+from paths import DATA_ROOT
+
+DEFAULT_ROOT = DATA_ROOT
 FREE = 1
 OBSTACLE = 0
 

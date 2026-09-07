@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Avvia il container in background (detached). Resta vivo per attach multipli.
+# Start the container detached. It stays alive so several shells can attach.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 docker compose up -d
-echo "Container 'marlauder' attivo. Apri un terminale con: scripts/shell.sh"
+echo "Container 'marlauder' is up. Open a shell with: scripts/shell.sh"

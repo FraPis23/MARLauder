@@ -106,7 +106,7 @@ class GraphLattice:
         self.guidepost_iters = int(guidepost_iters) if guidepost_iters else int(self.N_max)
         # Path-reconstruction length cap (number of edges on a path). Drives a Python loop, so it
         # stays bounded well below N_max. Only consumer left is the pathfront belief's particle
-        # paths (env/teammate_belief_pathfront.py, via scripts/viz_belief_pathfront.py's Lmax).
+        # paths (env/teammate_belief_pathfront.py, which reads it as its Lmax path cap).
         # Doubled vs the old LH+LW+4 so long corridor paths are not truncated.
         self.guidepost_path_max = (
             int(guidepost_path_max) if guidepost_path_max

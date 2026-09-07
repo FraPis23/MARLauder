@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: "MARLauder: GPU-resident multi-agent RL for cooperative exploration under intermittent communication"
+message: "If you use this software, please cite the accompanying paper."
+type: software
+# Authors are withheld for double-blind review. Fill in before a public release.
+authors:
+  - name: "Anonymous"
+license: MIT
+repository-code: "https://example.org/marlauder"
+abstract: >-
+  A GPU-resident multi-agent reinforcement learning system for cooperative exploration of unknown
+  occupancy maps under intermittent, signal-strength-limited communication. Robots maintain private
+  maps and a learned belief over teammate positions, and are trained with MAPPO using a
+  count-invariant CTDE critic, a privileged team-union exploration reward, and a sync-event reward
+  that pays for the map actually exchanged at a rendezvous.
+keywords:
+  - multi-agent reinforcement learning
+  - robotic exploration
+  - graph neural networks
+  - MAPPO
